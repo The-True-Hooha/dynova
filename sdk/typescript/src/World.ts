@@ -1,6 +1,6 @@
 import { TransformView } from './TransformView.js';
-import { CommandRing, SpawnDesc, ForceDesc } from './CommandRing.js';
-import { EntityIdAllocator } from './EntityIdAllocator.js';
+import { CommandRing, SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
+import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import { createMemory, MemoryMode } from './memory.js';
 
 export interface WorldConfig {
@@ -18,6 +18,7 @@ export interface WorldLayout {
     ringHeadByteOffset: number;
     ringTailByteOffset: number;
     idCounterByteOffset: number;
+    generationsByteOffset: number;
 }
 
 export interface SpawnOptions {
@@ -55,7 +56,12 @@ export class World {
             layout.ringTailByteOffset,
             config.ringCapacity,
         );
-        this.ids = new EntityIdAllocator(memory, layout.idCounterByteOffset);
+        this.ids = new EntityIdAllocator(
+            memory,
+            layout.idCounterByteOffset,
+            layout.generationsByteOffset,
+            config.capacity,
+        );
     }
 
     static create(config: WorldConfig): World {
@@ -71,13 +77,14 @@ export class World {
         let offset = 0;
         const align = (n: number) => { offset = Math.ceil(offset / n) * n; };
 
-        align(4); const transformAByteOffset = offset; offset += transformBufBytes;
-        align(4); const transformBByteOffset = offset; offset += transformBufBytes;
-        align(4); const writeIndexByteOffset = offset; offset += 4;
-        align(4); const ringSlotsByteOffset  = offset; offset += ringBytes;
-        align(4); const ringHeadByteOffset   = offset; offset += 4;
-        align(4); const ringTailByteOffset   = offset; offset += 4;
-        align(4); const idCounterByteOffset  = offset;
+        align(4); const transformAByteOffset    = offset; offset += transformBufBytes;
+        align(4); const transformBByteOffset    = offset; offset += transformBufBytes;
+        align(4); const writeIndexByteOffset    = offset; offset += 4;
+        align(4); const ringSlotsByteOffset     = offset; offset += ringBytes;
+        align(4); const ringHeadByteOffset      = offset; offset += 4;
+        align(4); const ringTailByteOffset      = offset; offset += 4;
+        align(4); const idCounterByteOffset     = offset; offset += 4;
+        const generationsByteOffset             = offset;
 
         const layout: WorldLayout = {
             transformAByteOffset,
@@ -87,53 +94,56 @@ export class World {
             ringHeadByteOffset,
             ringTailByteOffset,
             idCounterByteOffset,
+            generationsByteOffset,
         };
 
         return new World(config, memory, mode, layout);
     }
 
-    spawn(opts: SpawnOptions = {}): number {
-        const id = this.ids.alloc();
+    spawn(opts: SpawnOptions = {}): EntityHandle {
+        const handle = this.ids.alloc();
         const desc: SpawnDesc = {
-            id,
+            id: handle.id, gen: handle.gen,
             x: opts.x ?? 0, y: opts.y ?? 0, z: opts.z ?? 0,
             qx: opts.qx ?? 0, qy: opts.qy ?? 0, qz: opts.qz ?? 0, qw: opts.qw ?? 1,
         };
         if (!this.ring.spawn(desc)) {
-            this.ids.free(id);
+            this.ids.free(handle);
             throw new Error(`CommandRing full — increase ringCapacity (current: ${this.ring.pendingCount})`);
         }
-        return id;
+        return handle;
     }
 
-    destroy(id: number): void {
-        if (!this.ring.destroy(id)) throw new Error('CommandRing full');
-        this.ids.free(id);
+    destroy(handle: EntityHandle): void {
+        const desc: DestroyDesc = { id: handle.id, gen: handle.gen };
+        if (!this.ring.destroy(desc)) throw new Error('CommandRing full');
+        this.ids.free(handle);
     }
 
-    force(id: number, x: number, y: number, z: number): void {
-        const desc: ForceDesc = { id, x, y, z };
+    force(handle: EntityHandle, x: number, y: number, z: number): void {
+        const desc: ForceDesc = { id: handle.id, gen: handle.gen, x, y, z };
         if (!this.ring.force(desc)) throw new Error('CommandRing full');
+    }
+
+    grow(pages: number): number {
+        let prev: number;
+        try { prev = this.memory.grow(pages); } catch (e) {
+            if (e instanceof RangeError) return -1;
+            throw e;
+        }
+        if (prev === -1) return -1;
+        const { layout, capacity } = this;
+        this.transforms.reacquire(this.memory, layout.transformAByteOffset, layout.transformBByteOffset, layout.writeIndexByteOffset, capacity);
+        this.ring.reacquire(this.memory, layout.ringSlotsByteOffset, layout.ringHeadByteOffset, layout.ringTailByteOffset);
+        this.ids.reacquire(this.memory, layout.idCounterByteOffset, layout.generationsByteOffset);
+        return prev;
     }
 
     readTransforms(): Float32Array {
         return this.transforms.read();
     }
 
-    writeTransformDirect(entityId: number, x: number, y: number, z: number, qx = 0, qy = 0, qz = 0, qw = 1): void {
-        const view = new DataView(this.memory.buffer);
-        const writeIndex = view.getUint32(this.layout.writeIndexByteOffset, true);
-        const base = writeIndex === 0 ? this.layout.transformBByteOffset : this.layout.transformAByteOffset;
-        const off = base + entityId * 7 * 4;
-        view.setFloat32(off,      x,  true);
-        view.setFloat32(off + 4,  y,  true);
-        view.setFloat32(off + 8,  z,  true);
-        view.setFloat32(off + 12, qx, true);
-        view.setFloat32(off + 16, qy, true);
-        view.setFloat32(off + 20, qz, true);
-        view.setFloat32(off + 24, qw, true);
-    }
-
     get pendingCommands(): number { return this.ring.pendingCount; }
+    get backpressureDrops(): number { return this.ring.backpressureDrops; }
     get allocatedEntities(): number { return this.ids.allocated; }
 }

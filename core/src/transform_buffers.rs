@@ -5,8 +5,8 @@ pub const FLOATS_PER_TRANSFORM: usize = 7;
 
 #[wasm_bindgen]
 pub struct TransformBuffers {
-    buf_a: Vec<f32>,
-    buf_b: Vec<f32>,
+    pub(crate) buf_a: Vec<f32>,
+    pub(crate) buf_b: Vec<f32>,
     write_index: AtomicU32,
     capacity: u32,
 }

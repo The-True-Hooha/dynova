@@ -1,4 +1,4 @@
-export type MemoryMode = 'shared' | 'fallback';
+export type MemoryMode = 'shared' | 'fallback' | 'headers-missing';
 
 export interface MemoryResult {
     memory: WebAssembly.Memory;
@@ -11,7 +11,7 @@ export function detectMode(): MemoryMode {
         new SharedArrayBuffer(4);
         return 'shared';
     } catch {
-        return 'fallback';
+        return 'headers-missing';
     }
 }
 
