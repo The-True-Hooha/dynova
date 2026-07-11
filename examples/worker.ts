@@ -1,63 +1,31 @@
-import init, { Runtime } from '../sdk/typescript/wasm/dynova_core.js';
+import { CommandRing, SLOT_BYTES } from '@dynova/sdk';
 
 interface InitMessage {
     type: 'init';
-    wasmUrl: string;
-    capacity: number;
-    ringCapacity: number;
-}
-
-interface ReadyMessage {
-    type: 'ready';
     buffer: SharedArrayBuffer;
-    transformAOffset: number;
-    transformBOffset: number;
-    writeIndexOffset: number;
-    ringSlotsOffset: number;
-    ringHeadOffset: number;
-    ringTailOffset: number;
+    ringCapacity: number;
+    entityCount: number;
+    halfW: number;
+    halfH: number;
 }
 
-let runtime: Runtime | null = null;
+// Shared ring layout: [slots: ringCapacity*SLOT_BYTES][head: 4][tail: 4]
+self.onmessage = (e: MessageEvent<InitMessage>) => {
+    if (e.data.type !== 'init') return;
+    const { buffer, ringCapacity, entityCount, halfW, halfH } = e.data;
 
-self.onmessage = async (e: MessageEvent<InitMessage>) => {
-    const msg = e.data;
-    if (msg.type !== 'init') return;
+    const slotsOffset = 0;
+    const headOffset  = ringCapacity * SLOT_BYTES;
+    const tailOffset  = headOffset + 4;
 
-    try {
-        const wasmExports = await init(msg.wasmUrl) as unknown as { memory: WebAssembly.Memory };
-        const wasmMemory = wasmExports.memory;
+    const memory = { buffer } as Pick<WebAssembly.Memory, 'buffer'> as WebAssembly.Memory;
+    const ring = new CommandRing(memory, slotsOffset, headOffset, tailOffset, ringCapacity);
 
-        console.log('[worker] memory shared?', wasmMemory.buffer instanceof SharedArrayBuffer);
-
-        if (!(wasmMemory.buffer instanceof SharedArrayBuffer)) {
-            self.postMessage({ type: 'error', message: 'WASM memory is not shared — rebuild with --shared-memory flag' });
-            return;
-        }
-
-        runtime = new Runtime(msg.capacity, msg.ringCapacity);
-
-        const ready: ReadyMessage = {
-            type: 'ready',
-            buffer:            wasmMemory.buffer as SharedArrayBuffer,
-            transformAOffset:  runtime.transforms_buf_a_ptr(),
-            transformBOffset:  runtime.transforms_buf_b_ptr(),
-            writeIndexOffset:  runtime.transforms_write_index_ptr(),
-            ringSlotsOffset:   runtime.ring_slots_ptr(),
-            ringHeadOffset:    runtime.ring_head_ptr(),
-            ringTailOffset:    runtime.ring_tail_ptr(),
-        };
-
-        self.postMessage(ready);
-        loop();
-    } catch (err) {
-        console.error('[worker] error:', err);
-        self.postMessage({ type: 'error', message: String(err) });
+    for (let i = 0; i < entityCount; i++) {
+        const x = (Math.random() * 2 - 1) * halfW;
+        const y = (Math.random() * 2 - 1) * halfH;
+        ring.spawn({ id: i, gen: 0, x, y, z: 0, qx: 0, qy: 0, qz: 0, qw: 1 });
     }
-};
 
-function loop() {
-    if (!runtime) return;
-    runtime.step();
-    setTimeout(loop, 16);
-}
+    self.postMessage({ type: 'ready' });
+};
