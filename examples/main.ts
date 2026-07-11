@@ -50,8 +50,8 @@ async function main() {
 
     // ids 1..BOX_COUNT: dynamic boxes stacked in a column
     for (let i = 1; i <= BOX_COUNT; i++) {
-        const x = (Math.random() - 0.5) * 4;
-        const y = -13 + (i - 1) * 1.1; // stack upward, start just above floor
+        const x = (Math.random() - 0.5) * 24;   // ±12 units wide
+        const y = -10 + (i - 1) * 1.2;           // stack upward
         runtime.spawn_box(i, x, y, 0,  0.5, 0.5, 0.5,  1.0, 0.3);
     }
 
@@ -112,7 +112,7 @@ async function main() {
             const o = i * FLOATS_PER_TRANSFORM;
             const sx = buf[o]    * SCALE + cx;
             const sy = -buf[o+1] * SCALE + cy;
-            ctx.fillRect(sx - 5, sy - 5, 10, 10);
+            ctx.fillRect(sx - 0.5 * SCALE, sy - 0.5 * SCALE, SCALE, SCALE);
         }
 
         countEl.textContent   = `Boxes: ${BOX_COUNT}  frame: ${frameCount}`;
