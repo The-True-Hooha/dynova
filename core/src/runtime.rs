@@ -162,6 +162,31 @@ impl Runtime {
             .write_transform(id as u32, x, y, z, 0.0, 0.0, 0.0, 1.0);
     }
 
+    pub fn spawn_sphere(
+        &mut self,
+        id: u32,
+        x: f32,
+        y: f32,
+        z: f32,
+        radius: f32,
+        inv_mass: f32,
+        restitution: f32,
+    ) {
+        let id = id as usize;
+        self.physics
+            .spawn_sphere(id, x, y, z, radius, inv_mass, restitution);
+        self.transforms
+            .write_transform(id as u32, x, y, z, 0.0, 0.0, 0.0, 1.0);
+    }
+
+    pub fn bucket_counts_ptr(&self) -> *const u32 {
+        self.physics.bucket_counts.as_ptr()
+    }
+
+    pub fn sleeping_count(&self) -> u32 {
+        self.physics.sleeping.iter().filter(|&&s| s).count() as u32
+    }
+
     pub fn step(&mut self) {
         let commands = self.ring.drain_commands(&self.generationerations, 4096);
         for cmd in commands {
