@@ -1,8 +1,10 @@
 import wasmInit, { Runtime } from '../sdk/typescript/wasm/dynova_core.js';
 import { FLOATS_PER_TRANSFORM, SLOT_BYTES } from '@dynova/sdk';
 
-const ENTITY_COUNT  = 500;
+const BOX_COUNT     = 30;
+const SPHERE_COUNT  = 20;
 const RING_CAPACITY = 1024;
+const CAPACITY      = BOX_COUNT + SPHERE_COUNT + 3; // floor + left wall + right wall
 
 const canvas    = document.getElementById('canvas') as HTMLCanvasElement;
 const ctx       = canvas.getContext('2d')!;
@@ -13,12 +15,10 @@ const pendingEl = document.getElementById('pending')!;
 canvas.width  = window.innerWidth;
 canvas.height = window.innerHeight;
 
+// Physics world is centred at canvas centre, 1 unit = 20px
+const SCALE = 20;
 const cx = canvas.width  / 2;
 const cy = canvas.height / 2;
-
-const useWorker = typeof SharedArrayBuffer !== 'undefined' && (() => {
-    try { new SharedArrayBuffer(4); return true; } catch { return false; }
-})();
 
 async function main() {
     const exports = await wasmInit(
@@ -26,72 +26,65 @@ async function main() {
     ) as unknown as { memory: WebAssembly.Memory };
 
     const memory  = exports.memory;
-    const runtime = new Runtime(ENTITY_COUNT, RING_CAPACITY);
+    const runtime = new Runtime(CAPACITY, RING_CAPACITY);
 
-    const aOffset         = runtime.transforms_buf_a_ptr();
-    const bOffset         = runtime.transforms_buf_b_ptr();
-    const writeIdxOffset  = runtime.transforms_write_index_ptr();
-    const ringSlotsOffset = runtime.ring_slots_ptr();
-    const ringHeadOffset  = runtime.ring_head_ptr();
-    const ringTailOffset  = runtime.ring_tail_ptr();
+    runtime.enable_physics();
+    runtime.set_gravity(0, -9.81, 0);
 
-    const writeIndex    = new Uint32Array(memory.buffer, writeIdxOffset, 1);
-    const bufA          = new Float32Array(memory.buffer, aOffset, ENTITY_COUNT * FLOATS_PER_TRANSFORM);
-    const bufB          = new Float32Array(memory.buffer, bOffset, ENTITY_COUNT * FLOATS_PER_TRANSFORM);
-    const wasmRingTail  = new Uint32Array(memory.buffer, ringTailOffset, 1);
-    const wasmRingView  = new DataView(memory.buffer, ringSlotsOffset, RING_CAPACITY * SLOT_BYTES);
-    const wasmMask      = RING_CAPACITY - 1;
+    const aOffset        = runtime.transforms_buf_a_ptr();
+    const bOffset        = runtime.transforms_buf_b_ptr();
+    const writeIdxOffset = runtime.transforms_write_index_ptr();
+    const ringHeadOffset = runtime.ring_head_ptr();
+    const ringTailOffset = runtime.ring_tail_ptr();
+    const ringSlotsOffset= runtime.ring_slots_ptr();
 
-    // Shared ring: separate SAB, layout [slots | head(4) | tail(4)]
-    const SHARED_BYTES  = RING_CAPACITY * SLOT_BYTES + 8;
-    const sharedBuf     = useWorker ? new SharedArrayBuffer(SHARED_BYTES) : null;
-    const sharedHead    = sharedBuf ? new Int32Array(sharedBuf, RING_CAPACITY * SLOT_BYTES,     1) : null;
-    const sharedTail    = sharedBuf ? new Int32Array(sharedBuf, RING_CAPACITY * SLOT_BYTES + 4, 1) : null;
-    const sharedSlots   = sharedBuf ? new Uint8Array(sharedBuf, 0, RING_CAPACITY * SLOT_BYTES)  : null;
+    const writeIndex  = new Uint32Array(memory.buffer, writeIdxOffset, 1);
+    const bufA        = new Float32Array(memory.buffer, aOffset, CAPACITY * FLOATS_PER_TRANSFORM);
+    const bufB        = new Float32Array(memory.buffer, bOffset, CAPACITY * FLOATS_PER_TRANSFORM);
+    const ringHeadView= new Uint32Array(memory.buffer, ringHeadOffset, 1);
+    const wasmRingTail= new Uint32Array(memory.buffer, ringTailOffset, 1);
+    const wasmRingView= new DataView(memory.buffer, ringSlotsOffset, RING_CAPACITY * SLOT_BYTES);
+    const wasmMask    = RING_CAPACITY - 1;
 
-    modeEl.textContent = useWorker
-        ? 'Memory mode: SharedArrayBuffer worker ring (Stage 1B)'
-        : 'Memory mode: main-thread WASM (Stage 1A fallback)';
+    // id=0: static floor; id=51,52: left/right walls
+    const WALL_ID_L = BOX_COUNT + SPHERE_COUNT + 1;
+    const WALL_ID_R = BOX_COUNT + SPHERE_COUNT + 2;
+    runtime.spawn_box(0,          0,   -15, 0,  40, 0.5, 40,  0.0, 0.1);
+    runtime.spawn_box(WALL_ID_L, -18,   0,  0,  0.5, 20, 40,  0.0, 0.1);
+    runtime.spawn_box(WALL_ID_R,  18,   0,  0,  0.5, 20, 40,  0.0, 0.1);
 
-    if (useWorker && sharedBuf) {
-        const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
-        await new Promise<void>((resolve, reject) => {
-            worker.onmessage = (e: MessageEvent<{ type: string }>) => {
-                if (e.data.type === 'ready') resolve();
-                else reject(new Error(JSON.stringify(e.data)));
-            };
-            worker.postMessage({
-                type: 'init',
-                buffer: sharedBuf,
-                ringCapacity: RING_CAPACITY,
-                entityCount: ENTITY_COUNT,
-                halfW: cx * 0.9,
-                halfH: cy * 0.9,
-            });
-        });
-    } else {
-        for (let i = 0; i < ENTITY_COUNT; i++) {
-            const tail = wasmRingTail[0];
-            const off  = (tail & wasmMask) * SLOT_BYTES;
-            const x = (Math.random() * 2 - 1) * cx * 0.9;
-            const y = (Math.random() * 2 - 1) * cy * 0.9;
-            wasmRingView.setUint8(off,        0);
-            wasmRingView.setUint32(off + 1,   i, true);
-            wasmRingView.setUint8(off + 5,    0);
-            wasmRingView.setFloat32(off + 6,  x,  true);
-            wasmRingView.setFloat32(off + 10, y,  true);
-            wasmRingView.setFloat32(off + 14, 0,  true);
-            wasmRingView.setFloat32(off + 18, 0,  true);
-            wasmRingView.setFloat32(off + 22, 0,  true);
-            wasmRingView.setFloat32(off + 26, 0,  true);
-            wasmRingView.setFloat32(off + 30, 1,  true);
-            wasmRingTail[0] = tail + 1;
-        }
+    // ids 1..BOX_COUNT: boxes in a grid, no overlaps
+    const COLS = 6;
+    for (let i = 1; i <= BOX_COUNT; i++) {
+        const col = (i - 1) % COLS;
+        const row = Math.floor((i - 1) / COLS);
+        const x = (col - COLS / 2 + 0.5) * 1.2;
+        const y = -12 + row * 1.2;
+        runtime.spawn_box(i, x, y, 0,  0.5, 0.5, 0.5,  1.0, 0.3);
+    }
+
+    // ids BOX_COUNT+1..BOX_COUNT+SPHERE_COUNT: spheres offset to the right
+    for (let i = 1; i <= SPHERE_COUNT; i++) {
+        const col = (i - 1) % 4;
+        const row = Math.floor((i - 1) / 4);
+        const x = 8 + col * 1.0;
+        const y = -12 + row * 1.0;
+        runtime.spawn_sphere(BOX_COUNT + i, x, y, 0,  0.4,  1.0, 0.2);
     }
 
     runtime.step();
 
-    const ringHeadView = new Uint32Array(memory.buffer, ringHeadOffset, 1);
+    const useWorker = false; // physics demo: main-thread sim only for now
+    modeEl.textContent = 'Physics: Stage 2B — 30 boxes + 20 spheres, warm start, sleeping';
+
+    // Shared ring for future worker use (kept alive but unused this demo)
+    const SHARED_BYTES = RING_CAPACITY * SLOT_BYTES + 8;
+    const sharedBuf = typeof SharedArrayBuffer !== 'undefined'
+        ? (() => { try { return new SharedArrayBuffer(SHARED_BYTES); } catch { return null; } })()
+        : null;
+    const sharedHead  = sharedBuf ? new Int32Array(sharedBuf, RING_CAPACITY * SLOT_BYTES,     1) : null;
+    const sharedTail  = sharedBuf ? new Int32Array(sharedBuf, RING_CAPACITY * SLOT_BYTES + 4, 1) : null;
+    const sharedSlots = sharedBuf ? new Uint8Array(sharedBuf, 0, RING_CAPACITY * SLOT_BYTES)  : null;
 
     function bridgeSharedRing() {
         if (!sharedHead || !sharedTail || !sharedSlots) return;
@@ -110,23 +103,50 @@ async function main() {
         if (pending > 0) Atomics.store(sharedHead, 0, tail);
     }
 
+    let frameCount = 0;
+
     function frame() {
         bridgeSharedRing();
         runtime.step();
+        frameCount++;
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
+
         const buf = writeIndex[0] === 0 ? bufB : bufA;
 
+        // Draw floor (id=0) as a rectangle
+        {
+            const o = 0 * FLOATS_PER_TRANSFORM;
+            const sx = buf[o]     * SCALE + cx;
+            const sy = -buf[o+1]  * SCALE + cy;
+            ctx.fillStyle = '#445544';
+            ctx.fillRect(sx - 40 * SCALE, sy - 0.5 * SCALE, 80 * SCALE, 1 * SCALE);
+        }
+
+        // Draw dynamic boxes
         ctx.fillStyle = '#00ff88';
-        for (let i = 0; i < ENTITY_COUNT; i++) {
+        for (let i = 1; i <= BOX_COUNT; i++) {
             const o = i * FLOATS_PER_TRANSFORM;
+            const sx = buf[o]    * SCALE + cx;
+            const sy = -buf[o+1] * SCALE + cy;
+            ctx.fillRect(sx - 0.5 * SCALE, sy - 0.5 * SCALE, SCALE, SCALE);
+        }
+
+        // Draw spheres
+        ctx.fillStyle = '#ff8844';
+        for (let i = 1; i <= SPHERE_COUNT; i++) {
+            const id = BOX_COUNT + i;
+            const o = id * FLOATS_PER_TRANSFORM;
+            const sx = buf[o]    * SCALE + cx;
+            const sy = -buf[o+1] * SCALE + cy;
+            const r  = 0.4 * SCALE;
             ctx.beginPath();
-            ctx.arc(buf[o] + cx, buf[o + 1] + cy, 3, 0, Math.PI * 2);
+            ctx.arc(sx, sy, r, 0, Math.PI * 2);
             ctx.fill();
         }
 
-        countEl.textContent   = `Entities: ${ENTITY_COUNT}`;
-        pendingEl.textContent = `Ring head: ${Atomics.load(ringHeadView, 0)}`;
+        countEl.textContent   = `Bodies: ${BOX_COUNT + SPHERE_COUNT}  frame: ${frameCount}  sleeping: ${runtime.sleeping_count()}`;
+        pendingEl.textContent = `Contacts: ${runtime.contact_count()}`;
         requestAnimationFrame(frame);
     }
 
