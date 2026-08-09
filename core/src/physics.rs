@@ -2,12 +2,14 @@ const BUCKET_COUNT: usize = 4096;
 const BUCKET_MASK:  usize = BUCKET_COUNT - 1;
 const MAX_CONTACTS: usize = 16384;
 const SOLVER_ITERS: u32   = 8;
-const BAUMGARTE:    f32   = 0.2;
+const BAUMGARTE:    f32   = 0.8;
 const SLOP:         f32   = 0.005;
 const LIN_DAMP:     f32   = 0.99;
 const ANG_DAMP:     f32   = 0.97;
-const SLEEP_VEL_SQ: f32   = 0.01 * 0.01;   // |v|² threshold
-const SLEEP_TIME:   f32   = 0.5;            // seconds before sleeping
+const SLEEP_VEL_SQ: f32   = 0.3 * 0.3;
+const WAKE_VEL_SQ:  f32   = 0.6 * 0.6;
+const MICRO_VEL_SQ: f32   = 0.02 * 0.02;
+const SLEEP_TIME:   f32   = 0.2;
 
 pub const SHAPE_BOX:    u8 = 0;
 pub const SHAPE_SPHERE: u8 = 1;
@@ -129,6 +131,22 @@ impl PhysicsWorld {
 
         for i in 0..cap {
             if !self.active[i] || self.inv_mass[i] == 0.0 || self.sleeping[i] { continue; }
+            let vsq = self.vel_x[i]*self.vel_x[i] + self.vel_y[i]*self.vel_y[i] + self.vel_z[i]*self.vel_z[i];
+            if vsq < SLEEP_VEL_SQ {
+                self.sleep_timer[i] += dt;
+                if self.sleep_timer[i] >= SLEEP_TIME {
+                    self.sleeping[i] = true;
+                    self.vel_x[i] = 0.0; self.vel_y[i] = 0.0; self.vel_z[i] = 0.0;
+                    self.ang_x[i] = 0.0; self.ang_y[i] = 0.0; self.ang_z[i] = 0.0;
+                    continue;
+                }
+            } else {
+                self.sleep_timer[i] = 0.0;
+            }
+        }
+
+        for i in 0..cap {
+            if !self.active[i] || self.inv_mass[i] == 0.0 || self.sleeping[i] { continue; }
             self.vel_x[i] += self.gx * dt;
             self.vel_y[i] += self.gy * dt;
             self.vel_z[i] += self.gz * dt;
@@ -161,8 +179,12 @@ impl PhysicsWorld {
         for i in 0..cap {
             if !self.active[i] || self.inv_mass[i] == 0.0 || self.sleeping[i] { continue; }
 
+            // vs statics AND sleeping bodies (treated as fixed reference)
             for s in 0..cap {
-                if !self.active[s] || self.inv_mass[s] != 0.0 { continue; }
+                if !self.active[s] { continue; }
+                let is_fixed = self.inv_mass[s] == 0.0 || self.sleeping[s];
+                if !is_fixed { continue; }
+                if s == i { continue; }
                 if let Some(mut c) = collide(i, s, self) {
                     c.lambda = warm_lookup(&self.warm_cache, c.a, c.b);
                     if self.contacts.len() < MAX_CONTACTS { self.contacts.push(c); }
@@ -185,16 +207,27 @@ impl PhysicsWorld {
             }
         }
 
+        // only wake sleeping bodies disturbed by a moving dynamic body, not by statics/floor
         for ci in 0..self.contacts.len() {
             let (a, b) = (self.contacts[ci].a as usize, self.contacts[ci].b as usize);
-            if self.sleeping[a] { self.sleeping[a] = false; self.sleep_timer[a] = 0.0; }
-            if self.sleeping[b] { self.sleeping[b] = false; self.sleep_timer[b] = 0.0; }
+            let vsq_a = self.vel_x[a]*self.vel_x[a] + self.vel_y[a]*self.vel_y[a] + self.vel_z[a]*self.vel_z[a];
+            let vsq_b = self.vel_x[b]*self.vel_x[b] + self.vel_y[b]*self.vel_y[b] + self.vel_z[b]*self.vel_z[b];
+            let a_moving = self.inv_mass[a] > 0.0 && !self.sleeping[a] && vsq_a >= WAKE_VEL_SQ;
+            let b_moving = self.inv_mass[b] > 0.0 && !self.sleeping[b] && vsq_b >= WAKE_VEL_SQ;
+            if self.sleeping[a] && b_moving { self.sleeping[a] = false; self.sleep_timer[a] = 0.0; }
+            if self.sleeping[b] && a_moving { self.sleeping[b] = false; self.sleep_timer[b] = -SLEEP_TIME; }
         }
+
+        // sleeping bodies treated as fixed (inv_mass=0) during solve
+        let mut eff_mass = self.inv_mass.clone();
+        for i in 0..cap { if self.sleeping[i] { eff_mass[i] = 0.0; } }
 
         for ci in 0..self.contacts.len() {
             let lambda = self.contacts[ci].lambda;
             if lambda == 0.0 { continue; }
-            apply_impulse_pair(&mut self.contacts[ci], lambda, self.inv_mass.as_mut_slice(),
+            let (wa, wb) = (self.contacts[ci].a as usize, self.contacts[ci].b as usize);
+            if eff_mass[wa] == 0.0 || eff_mass[wb] == 0.0 { continue; }
+            apply_impulse_pair(&mut self.contacts[ci], lambda, eff_mass.as_mut_slice(),
                 self.vel_x.as_mut_slice(), self.vel_y.as_mut_slice(), self.vel_z.as_mut_slice(),
                 self.ang_x.as_mut_slice(), self.ang_y.as_mut_slice(), self.ang_z.as_mut_slice(),
                 self.inv_inertia.as_slice());
@@ -203,7 +236,7 @@ impl PhysicsWorld {
         for _ in 0..SOLVER_ITERS {
             for ci in 0..self.contacts.len() {
                 solve_contact(&mut self.contacts[ci],
-                    self.inv_mass.as_slice(),
+                    eff_mass.as_slice(),
                     self.vel_x.as_mut_slice(), self.vel_y.as_mut_slice(), self.vel_z.as_mut_slice(),
                     self.ang_x.as_mut_slice(), self.ang_y.as_mut_slice(), self.ang_z.as_mut_slice(),
                     self.inv_inertia.as_slice(),
@@ -211,13 +244,26 @@ impl PhysicsWorld {
             }
         }
 
+        // clamp micro-residuals on bodies resting against static/sleeping supports
+        for ci in 0..self.contacts.len() {
+            let (a, b) = (self.contacts[ci].a as usize, self.contacts[ci].b as usize);
+            if eff_mass[b] == 0.0 {
+                let vsq = self.vel_x[a]*self.vel_x[a] + self.vel_y[a]*self.vel_y[a] + self.vel_z[a]*self.vel_z[a];
+                if vsq < MICRO_VEL_SQ { self.vel_x[a]=0.0; self.vel_y[a]=0.0; self.vel_z[a]=0.0; }
+            }
+            if eff_mass[a] == 0.0 {
+                let vsq = self.vel_x[b]*self.vel_x[b] + self.vel_y[b]*self.vel_y[b] + self.vel_z[b]*self.vel_z[b];
+                if vsq < MICRO_VEL_SQ { self.vel_x[b]=0.0; self.vel_y[b]=0.0; self.vel_z[b]=0.0; }
+            }
+        }
+
         for ci in 0..self.contacts.len() {
             let c = &self.contacts[ci];
             let corr = BAUMGARTE * (c.depth - SLOP).max(0.0)
-                / (self.inv_mass[c.a as usize] + self.inv_mass[c.b as usize]).max(1e-10);
+                / (eff_mass[c.a as usize] + eff_mass[c.b as usize]).max(1e-10);
             let (a, b) = (c.a as usize, c.b as usize);
             let (nx, ny, nz) = (c.nx, c.ny, c.nz);
-            let ima = self.inv_mass[a]; let imb = self.inv_mass[b];
+            let ima = eff_mass[a]; let imb = eff_mass[b];
             self.pos_x[a] += corr * ima * nx; self.pos_y[a] += corr * ima * ny; self.pos_z[a] += corr * ima * nz;
             self.pos_x[b] -= corr * imb * nx; self.pos_y[b] -= corr * imb * ny; self.pos_z[b] -= corr * imb * nz;
         }
@@ -225,26 +271,11 @@ impl PhysicsWorld {
         self.warm_cache.clear();
         for c in &self.contacts {
             if c.lambda.abs() > 1e-6 {
-                self.warm_cache.push(WarmEntry { a: c.a, b: c.b, lambda: c.lambda });
+                self.warm_cache.push(WarmEntry { a: c.a.min(c.b), b: c.a.max(c.b), lambda: c.lambda });
             }
         }
         self.warm_cache.sort_unstable_by_key(|e| (e.a, e.b));
 
-        for i in 0..cap {
-            if !self.active[i] || self.inv_mass[i] == 0.0 { continue; }
-            let vsq = self.vel_x[i]*self.vel_x[i] + self.vel_y[i]*self.vel_y[i] + self.vel_z[i]*self.vel_z[i]
-                    + self.ang_x[i]*self.ang_x[i] + self.ang_y[i]*self.ang_y[i] + self.ang_z[i]*self.ang_z[i];
-            if vsq < SLEEP_VEL_SQ {
-                self.sleep_timer[i] += dt;
-                if self.sleep_timer[i] >= SLEEP_TIME {
-                    self.sleeping[i] = true;
-                    self.vel_x[i] = 0.0; self.vel_y[i] = 0.0; self.vel_z[i] = 0.0;
-                    self.ang_x[i] = 0.0; self.ang_y[i] = 0.0; self.ang_z[i] = 0.0;
-                }
-            } else {
-                self.sleep_timer[i] = 0.0;
-            }
-        }
     }
 
     fn cell_hash(&self, x: f32, y: f32, z: f32) -> usize {
@@ -371,13 +402,18 @@ fn sphere_sphere(a: usize, b: usize, w: &PhysicsWorld) -> Option<Contact> {
     if dist_sq >= r_sum * r_sum { return None; }
 
     let dist = dist_sq.sqrt().max(1e-10);
-    let nx = dx / dist; let ny = dy / dist; let nz = dz / dist;
+    // unit vector from a toward b (used for contact arms)
+    let ax = dx / dist; let ay = dy / dist; let az = dz / dist;
     let depth = r_sum - dist;
     let ra = w.radius[a];
     Some(Contact {
-        a: a as u32, b: b as u32, nx, ny, nz, depth, lambda: 0.0,
-        rax:  nx * ra, ray:  ny * ra, raz:  nz * ra,
-        rbx: -nx * w.radius[b], rby: -ny * w.radius[b], rbz: -nz * w.radius[b],
+        a: a as u32, b: b as u32,
+        // normal must point b→a for solve_contact convention
+        nx: -ax, ny: -ay, nz: -az,
+        depth, lambda: 0.0,
+        // arms: from each body center toward the contact point (a→b direction for a, b→a for b)
+        rax:  ax * ra,              ray:  ay * ra,              raz:  az * ra,
+        rbx: -ax * w.radius[b],    rby: -ay * w.radius[b],    rbz: -az * w.radius[b],
     })
 }
 
@@ -385,12 +421,35 @@ fn sphere_box(s: usize, bx: usize, w: &PhysicsWorld) -> Option<Contact> {
     let cx = w.pos_x[s] - w.pos_x[bx];
     let cy = w.pos_y[s] - w.pos_y[bx];
     let cz = w.pos_z[s] - w.pos_z[bx];
-    let px = cx.clamp(-w.half_x[bx], w.half_x[bx]);
-    let py = cy.clamp(-w.half_y[bx], w.half_y[bx]);
-    let pz = cz.clamp(-w.half_z[bx], w.half_z[bx]);
+    let hx = w.half_x[bx]; let hy = w.half_y[bx]; let hz = w.half_z[bx];
+    let r = w.radius[s];
+
+    // sphere center inside box — find closest face and push out
+    if cx.abs() < hx && cy.abs() < hy && cz.abs() < hz {
+        let faces = [
+            (hx - cx,  1.0f32, 0.0f32, 0.0f32),
+            (hx + cx, -1.0f32, 0.0f32, 0.0f32),
+            (hy - cy,  0.0f32, 1.0f32, 0.0f32),
+            (hy + cy,  0.0f32,-1.0f32, 0.0f32),
+            (hz - cz,  0.0f32, 0.0f32, 1.0f32),
+            (hz + cz,  0.0f32, 0.0f32,-1.0f32),
+        ];
+        let (fd, fnx, fny, fnz) = faces.iter().copied()
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal))
+            .unwrap();
+        return Some(Contact {
+            a: s as u32, b: bx as u32, nx: fnx, ny: fny, nz: fnz,
+            depth: r + fd, lambda: 0.0,
+            rax: -fnx * r, ray: -fny * r, raz: -fnz * r,
+            rbx: fnx * hx, rby: fny * hy, rbz: fnz * hz,
+        });
+    }
+
+    let px = cx.clamp(-hx, hx);
+    let py = cy.clamp(-hy, hy);
+    let pz = cz.clamp(-hz, hz);
     let dx = cx - px; let dy = cy - py; let dz = cz - pz;
     let dist_sq = dx*dx + dy*dy + dz*dz;
-    let r = w.radius[s];
     if dist_sq >= r * r { return None; }
 
     let dist = dist_sq.sqrt().max(1e-10);
@@ -398,7 +457,7 @@ fn sphere_box(s: usize, bx: usize, w: &PhysicsWorld) -> Option<Contact> {
     let depth = r - dist;
     Some(Contact {
         a: s as u32, b: bx as u32, nx, ny, nz, depth, lambda: 0.0,
-        rax:  nx * r, ray:  ny * r, raz:  nz * r,
+        rax: -nx * r, ray: -ny * r, raz: -nz * r,
         rbx: px, rby: py, rbz: pz,
     })
 }
@@ -434,7 +493,8 @@ fn aabb_contact(a: usize, b: usize, w: &PhysicsWorld) -> Option<Contact> {
 }
 
 fn warm_lookup(cache: &[WarmEntry], a: u32, b: u32) -> f32 {
-    match cache.binary_search_by_key(&(a, b), |e| (e.a, e.b)) {
+    let key = (a.min(b), a.max(b));
+    match cache.binary_search_by_key(&key, |e| (e.a, e.b)) {
         Ok(i)  => cache[i].lambda,
         Err(_) => 0.0,
     }

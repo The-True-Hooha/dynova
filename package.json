@@ -5,7 +5,7 @@
   "scripts": {
     "build:core": "wasm-pack build core --target web --out-dir ../sdk-typescript/wasm",
     "build:core:release": "wasm-pack build core --target web --out-dir ../sdk-typescript/wasm --release",
-    "dev": "vite examples --port 5173"
+    "dev": "node api.js && vite examples --port 5173"
   },
   "devDependencies": {
     "vite": "^8.1.3",
