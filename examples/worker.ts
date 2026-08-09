@@ -14,12 +14,14 @@ self.onmessage = (e: MessageEvent<InitMessage>) => {
     if (e.data.type !== 'init') return;
     const { buffer, ringCapacity, entityCount, halfW, halfH } = e.data;
 
-    const slotsOffset = 0;
-    const headOffset  = ringCapacity * SLOT_BYTES;
-    const tailOffset  = headOffset + 4;
-
     const memory = { buffer } as Pick<WebAssembly.Memory, 'buffer'> as WebAssembly.Memory;
-    const ring = new CommandRing(memory, slotsOffset, headOffset, tailOffset, ringCapacity);
+    const ring = new CommandRing(
+        memory,
+        0,
+        ringCapacity * SLOT_BYTES,
+        ringCapacity * SLOT_BYTES + 4,
+        ringCapacity,
+    );
 
     for (let i = 0; i < entityCount; i++) {
         const x = (Math.random() * 2 - 1) * halfW;
