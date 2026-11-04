@@ -3,4 +3,4 @@ node_modules/
 */node_modules/
 dist/
 pkg/
-sdk-typescript/wasm/
+sdk/typescript/wasm/

@@ -1,5 +1,3 @@
-packages:                                                                                                                                  
-    - "sdk/typescript"
-    - "renderer/three"                                                                                                                       
-    - "inspector"                                                                                                                          
-    - "examples"
+packages:
+  - "sdk/typescript"
+  - "examples"

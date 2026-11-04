@@ -3,8 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:core": "wasm-pack build core --target web --out-dir ../sdk-typescript/wasm",
-    "build:core:release": "wasm-pack build core --target web --out-dir ../sdk-typescript/wasm --release",
+    "build:core": "wasm-pack build core --target web --out-dir ../sdk/typescript/wasm",
+    "build:core:release": "wasm-pack build core --target web --out-dir ../sdk/typescript/wasm --release",
     "dev": "vite examples --port 5173"
   },
   "devDependencies": {

@@ -6,7 +6,7 @@ build:
 
 # Build WASM (release, optimized — use before shipping)
 build-release:
-	wasm-pack build core --target web --out-dir ../sdk/typescript/wasm
+	wasm-pack build core --target web --out-dir ../sdk/typescript/wasm --release
 
 # Install all workspace dependencies
 install:
