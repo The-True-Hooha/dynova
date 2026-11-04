@@ -22,7 +22,9 @@ async function run() {
     }
 
     const mesh = new InstancedMesh(new BoxGeometry(1, 1, 1), new MeshNormalMaterial(), BOXES + 1);
-    const adapter = threeAdapter(world, mesh);
+    const scales = new Float32Array((BOXES + 1) * 3).fill(1);
+    scales.set([60, 1, 60], 0);
+    const adapter = threeAdapter(world, mesh, { scales });
     const scene = new Scene();
     scene.add(mesh);
     const camera = new PerspectiveCamera(50, 320 / 240, 0.1, 100);
@@ -48,7 +50,7 @@ async function run() {
         mesh.getMatrixAt(i, m);
         for (let k = 0; k < 3; k++) worst = Math.max(worst, Math.abs(m.elements[12 + k] - buf[i * 7 + k]));
     }
-    return { rendered, worst, children: scene.children.length, meshChildren: mesh.children.length, topY: Math.max(...Array.from({ length: BOXES }, (_, i) => buf[(i + 1) * 7 + 1])) };
+    return { rendered, worst, children: scene.children.length, meshChildren: mesh.children.length, floorWidth: (() => { mesh.getMatrixAt(0, m); return m.elements[0]; })(), boxWidth: (() => { mesh.getMatrixAt(1, m); return m.elements[0]; })(), topY: Math.max(...Array.from({ length: BOXES }, (_, i) => buf[(i + 1) * 7 + 1])) };
 }
 
 run().then(

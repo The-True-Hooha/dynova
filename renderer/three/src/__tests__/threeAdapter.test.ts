@@ -28,7 +28,7 @@ describe('threeAdapter', () => {
         const q = new Quaternion(0.1, 0.5, -0.3, 0.8).normalize();
         const buf = frame([1, 2, 3, 0, 0, 0, 1], [-4, 5.5, 6, q.x, q.y, q.z, q.w]);
         const before = mesh.instanceMatrix.version;
-        expect(threeAdapter(source(buf), mesh).update()).toBe(2);
+        expect(threeAdapter(source(buf), mesh).update().live).toBe(2);
         const expected = new Matrix4().compose(new Vector3(-4, 5.5, 6), q, new Vector3(1, 1, 1));
         const got = matrixOf(mesh, 1);
         got.elements.forEach((v, k) => expect(v).toBeCloseTo(expected.elements[k], 5));
@@ -39,7 +39,7 @@ describe('threeAdapter', () => {
     it('tombstoned slots (zero quaternion) become degenerate zero-scale matrices, not identity ghosts', () => {
         const mesh = meshOf(2);
         const buf = frame([9, 9, 9, 0, 0, 0, 0], [1, 1, 1, 0, 0, 0, 1]);
-        expect(threeAdapter(source(buf), mesh).update()).toBe(1);
+        expect(threeAdapter(source(buf), mesh).update().live).toBe(1);
         const dead = matrixOf(mesh, 0).elements;
         expect(dead.slice(0, 12).every((v) => v === 0)).toBe(true);
         expect(dead[15]).toBe(1);
@@ -62,7 +62,7 @@ describe('threeAdapter', () => {
         threeAdapter(source(buf), small).update();
         expect(Array.from(sentinel.slice(16))).toEqual(new Array(16).fill(7));
         const big = meshOf(5);
-        const live = threeAdapter(source(frame([1, 0, 0, 0, 0, 0, 1])), big).update();
+        const live = threeAdapter(source(frame([1, 0, 0, 0, 0, 0, 1])), big).update().live;
         expect(live).toBe(1);
         expect(matrixOf(big, 3).elements[12]).toBe(0);
     });
@@ -79,9 +79,9 @@ describe('threeAdapter', () => {
         const mesh = meshOf(4);
         let buf = frame([1, 0, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 0, 1]);
         const adapter = threeAdapter({ readTransforms: () => buf }, mesh);
-        expect(adapter.update()).toBe(2);
+        expect(adapter.update().live).toBe(2);
         buf = frame([1, 0, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 0, 1], [3, 0, 0, 0, 0, 0, 1], [4, 0, 0, 0, 0, 0, 1]);
-        expect(adapter.update()).toBe(4);
+        expect(adapter.update().live).toBe(4);
         expect(matrixOf(mesh, 3).elements[12]).toBe(4);
     });
 
@@ -93,7 +93,7 @@ describe('threeAdapter', () => {
         const first = Array.from(mesh.instanceMatrix.array);
         adapter.update();
         expect(Array.from(mesh.instanceMatrix.array)).toEqual(first);
-        expect(threeAdapter(source(new Float32Array(0)), mesh).update()).toBe(0);
+        expect(threeAdapter(source(new Float32Array(0)), mesh).update().live).toBe(0);
     });
 
     it('never creates scene objects: the mesh has no children after updates', () => {
@@ -123,7 +123,7 @@ describe('threeAdapter', () => {
         ['Infinity quaternion', [0, 0, 0, 0, 0, 0, Infinity]],
     ])('hides an entity with %s instead of poisoning the instance buffer', (_n, e) => {
         const mesh = meshOf(2);
-        const live = threeAdapter(source(frame(e as number[], [1, 0, 0, 0, 0, 0, 1])), mesh).update();
+        const live = threeAdapter(source(frame(e as number[], [1, 0, 0, 0, 0, 0, 1])), mesh).update().live;
         expect(live).toBe(1);
         expect((mesh.instanceMatrix.array as Float32Array).every(Number.isFinite)).toBe(true);
         expect(matrixOf(mesh, 0).elements.slice(0, 12).every((v) => v === 0)).toBe(true);
@@ -135,7 +135,7 @@ describe('threeAdapter', () => {
         let buf = frame([1, 0, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 0, 1], [3, 0, 0, 0, 0, 0, 1]);
         adapter.update();
         buf = frame([1, 0, 0, 0, 0, 0, 1]);
-        expect(adapter.update()).toBe(1);
+        expect(adapter.update().live).toBe(1);
         expect(matrixOf(mesh, 1).elements.slice(0, 12).every((v) => v === 0)).toBe(true);
         expect(matrixOf(mesh, 2).elements[12]).toBe(0);
     });
@@ -152,5 +152,43 @@ describe('threeAdapter', () => {
         threeAdapter(source(frame([1, 0, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 0, 1], [3, 0, 0, 0, 0, 0, 1])), mesh).update();
         expect(matrixOf(mesh, 0).elements[12]).toBe(1);
         expect(matrixOf(mesh, 1).elements[12]).toBe(0);
+    });
+
+    it('applies per-entity scales and matches Matrix4.compose with scale', () => {
+        const mesh = meshOf(2);
+        const q = new Quaternion(0.2, -0.4, 0.1, 0.9).normalize();
+        const buf = frame([0, 0, 0, 0, 0, 0, 1], [1, 2, 3, q.x, q.y, q.z, q.w]);
+        threeAdapter(source(buf), mesh, { scales: [30, 0.5, 30, 2, 3, 4] }).update();
+        const expected = new Matrix4().compose(new Vector3(1, 2, 3), q, new Vector3(2, 3, 4));
+        matrixOf(mesh, 1).elements.forEach((v, k) => expect(v).toBeCloseTo(expected.elements[k], 5));
+        expect(matrixOf(mesh, 0).elements[0]).toBe(30);
+        expect(matrixOf(mesh, 0).elements[5]).toBe(0.5);
+    });
+
+    it('scales are indexed by entity id, so idOffset shifts into the scales array too', () => {
+        const mesh = meshOf(1);
+        threeAdapter(source(frame([0, 0, 0, 0, 0, 0, 1], [5, 0, 0, 0, 0, 0, 1])), mesh, { idOffset: 1, scales: [1, 1, 1, 7, 8, 9] }).update();
+        expect(matrixOf(mesh, 0).elements[0]).toBe(7);
+        expect(matrixOf(mesh, 0).elements[5]).toBe(8);
+    });
+
+    it('missing scale entries default to 1 and a non-finite scale hides the instance', () => {
+        const mesh = meshOf(2);
+        const r = threeAdapter(source(frame([0, 0, 0, 0, 0, 0, 1], [0, 0, 0, 0, 0, 0, 1])), mesh, { scales: [NaN, 1, 1] }).update();
+        expect(r).toEqual({ live: 1, hidden: 1, truncated: 0 });
+        expect(matrixOf(mesh, 1).elements[0]).toBe(1);
+    });
+
+    it('reports hidden and truncated counts', () => {
+        const mesh = meshOf(2);
+        const buf = frame([0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 0, 1], [3, 0, 0, 0, 0, 0, 1]);
+        expect(threeAdapter(source(buf), mesh).update()).toEqual({ live: 1, hidden: 1, truncated: 2 });
+    });
+
+    it('truncated is zero when everything fits and idOffset reduces the entity count', () => {
+        const mesh = meshOf(3);
+        const buf = frame([1, 0, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 0, 1], [3, 0, 0, 0, 0, 0, 1]);
+        expect(threeAdapter(source(buf), mesh).update().truncated).toBe(0);
+        expect(threeAdapter(source(buf), mesh, { idOffset: 2 }).update()).toEqual({ live: 1, hidden: 0, truncated: 0 });
     });
 });
