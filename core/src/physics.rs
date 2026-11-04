@@ -122,6 +122,17 @@ impl PhysicsWorld {
         }
     }
 
+    pub fn resize(&mut self, new_capacity: usize) {
+        if new_capacity <= self.capacity { return; }
+        macro_rules! grow { ($($f:ident = $v:expr),* $(,)?) => { $( self.$f.resize(new_capacity, $v); )* } }
+        grow!(pos_x = 0.0, pos_y = 0.0, pos_z = 0.0, vel_x = 0.0, vel_y = 0.0, vel_z = 0.0,
+              ang_x = 0.0, ang_y = 0.0, ang_z = 0.0, qx = 0.0, qy = 0.0, qz = 0.0, qw = 1.0,
+              half_x = 0.5, half_y = 0.5, half_z = 0.5, radius = 0.5, inv_mass = 1.0, inv_inertia = 1.0,
+              restitution = 0.3, shape = SHAPE_BOX, active = false, sleeping = false, sleep_timer = 0.0);
+        self.cell_next.resize(new_capacity, -1);
+        self.capacity = new_capacity;
+    }
+
     pub fn spawn(&mut self, id: usize, d: &BodyDesc) {
         if id >= self.capacity { return; }
         let [x, y, z] = d.pos;

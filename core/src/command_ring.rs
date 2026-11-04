@@ -6,6 +6,8 @@ pub const SLOT_BYTES: usize = 64;
 pub const TAG_SPAWN: u8   = 0;
 pub const TAG_DESTROY: u8 = 1;
 pub const TAG_FORCE: u8   = 2;
+pub const TAG_GROW: u8    = 3;
+pub const MAX_CAPACITY: u32 = 1 << 20;
 
 const MAX_FORCE: f32 = 1.0e6;
 
@@ -26,14 +28,16 @@ pub enum Command {
     Spawn   { id: u32, generation: u8, body: BodyDesc },
     Destroy { id: u32, generation: u8 },
     Force   { id: u32, generation: u8, x: f32, y: f32, z: f32 },
+    Grow    { capacity: u32 },
 }
 
 impl Command {
-    pub fn target(&self) -> (u32, u8) {
+    pub fn target(&self) -> Option<(u32, u8)> {
         match self {
             Command::Spawn   { id, generation, .. }
             | Command::Destroy { id, generation }
-            | Command::Force   { id, generation, .. } => (*id, *generation),
+            | Command::Force   { id, generation, .. } => Some((*id, *generation)),
+            Command::Grow { .. } => None,
         }
     }
 }
@@ -119,7 +123,7 @@ impl CommandRing {
             let slot = &self.slots[(head & self.mask) as usize];
             match decode_slot(&slot.0) {
                 Some(cmd) => {
-                    if (cmd.target().0 as usize) < id_capacity {
+                    if cmd.target().is_none_or(|(id, _)| (id as usize) < id_capacity) {
                         out.push(cmd);
                     } else {
                         self.stale_dropped += 1;
@@ -150,7 +154,7 @@ fn wr_f32x<const N: usize>(b: &mut [u8], o: usize, v: &[f32; N]) {
 
 fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
     b.fill(0);
-    let (id, generation) = cmd.target();
+    let (id, generation) = cmd.target().unwrap_or((0, 0));
     b[OFF_ID..OFF_ID + 4].copy_from_slice(&id.to_le_bytes());
     b[OFF_GEN] = generation;
     match cmd {
@@ -164,6 +168,10 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             wr_f32(b, OFF_RESTITUTION, body.restitution);
         }
         Command::Destroy { .. } => b[0] = TAG_DESTROY,
+        Command::Grow { capacity } => {
+            b[0] = TAG_GROW;
+            b[OFF_POS..OFF_POS + 4].copy_from_slice(&capacity.to_le_bytes());
+        }
         Command::Force { x, y, z, .. } => {
             b[0] = TAG_FORCE;
             wr_f32x(b, OFF_POS, &[*x, *y, *z]);
@@ -192,6 +200,10 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
             Some(Command::Spawn { id, generation, body })
         }
         TAG_DESTROY => Some(Command::Destroy { id, generation }),
+        TAG_GROW => {
+            let capacity = u32::from_le_bytes([b[OFF_POS], b[OFF_POS + 1], b[OFF_POS + 2], b[OFF_POS + 3]]);
+            (1..=MAX_CAPACITY).contains(&capacity).then_some(Command::Grow { capacity })
+        }
         TAG_FORCE => {
             let v: [f32; 3] = rd_f32x(b, OFF_POS);
             if !all_finite(&v) || v.iter().any(|f| f.abs() > MAX_FORCE) { return None; }
@@ -450,5 +462,29 @@ mod tests {
         ring.drain_commands(1, 3, &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(out.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn grow_round_trips_and_ignores_id_capacity() {
+        let mut ring = CommandRing::new(2);
+        let g = Command::Grow { capacity: 4096 };
+        assert!(ring.push(&g));
+        let mut out = Vec::new();
+        ring.drain_commands(0, 8, &mut out);
+        assert_eq!(out, vec![g]);
+        assert_eq!(ring.stale_dropped(), 0);
+    }
+
+    #[test]
+    fn grow_with_zero_or_oversized_capacity_is_malformed() {
+        let mut ring = CommandRing::new(4);
+        ring.push(&Command::Grow { capacity: 0 });
+        ring.push(&Command::Grow { capacity: MAX_CAPACITY + 1 });
+        ring.push(&Command::Grow { capacity: u32::MAX });
+        ring.push(&Command::Grow { capacity: MAX_CAPACITY });
+        let mut out = Vec::new();
+        ring.drain_commands(1, 8, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(ring.malformed_dropped(), 3);
     }
 }

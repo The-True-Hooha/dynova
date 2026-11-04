@@ -1,12 +1,19 @@
 use crate::command_ring::{Command, CommandRing};
-use crate::physics::PhysicsWorld;
-use crate::physics::BodyDesc;
-use crate::transform_buffers::{Transform, TransformBuffers};
+use crate::physics::{BodyDesc, PhysicsWorld};
+use crate::transform_buffers::{Transform, TransformBuffers, INITIAL_STATE};
 use std::sync::atomic::{AtomicU32, Ordering};
 use wasm_bindgen::prelude::*;
 
+const H_EPOCH: usize = 0;
+const H_CAPACITY: usize = 1;
+const H_BUF0: usize = 2;
+const H_STATE: usize = 5;
+const H_GENERATIONS: usize = 6;
+const HEADER_WORDS: usize = 8;
+
 #[wasm_bindgen]
 pub struct Runtime {
+    header: Box<[AtomicU32; HEADER_WORDS]>,
     pub(crate) transforms: TransformBuffers,
     pub(crate) ring: CommandRing,
     generations: Vec<u8>,
@@ -20,7 +27,8 @@ pub struct Runtime {
 impl Runtime {
     #[wasm_bindgen(constructor)]
     pub fn new(capacity: u32, ring_capacity: u32) -> Self {
-        Self {
+        let rt = Self {
+            header: Box::new(std::array::from_fn(|_| AtomicU32::new(0))),
             transforms: TransformBuffers::new(capacity),
             ring: CommandRing::new(ring_capacity),
             generations: vec![0u8; capacity as usize],
@@ -28,18 +36,17 @@ impl Runtime {
             commands: Vec::new(),
             physics: PhysicsWorld::new(capacity as usize),
             physics_enabled: false,
-        }
+        };
+        rt.header[H_STATE].store(INITIAL_STATE, Ordering::Release);
+        rt.publish_layout();
+        rt
     }
 
-    pub fn transforms_buf_a_ptr(&self) -> *const f32 {
-        self.transforms.buf_a_ptr()
+    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, _].
+    pub fn header_ptr(&self) -> *const u32 {
+        self.header.as_ptr() as *const u32
     }
-    pub fn transforms_buf_b_ptr(&self) -> *const f32 {
-        self.transforms.buf_b_ptr()
-    }
-    pub fn transforms_write_index_ptr(&self) -> *const u32 {
-        self.transforms.write_index_ptr()
-    }
+
     pub fn transforms_capacity(&self) -> u32 {
         self.transforms.capacity()
     }
@@ -63,9 +70,6 @@ impl Runtime {
         self.ring.malformed_dropped()
     }
 
-    pub fn generations_ptr(&self) -> *const u8 {
-        self.generations.as_ptr()
-    }
 
     pub fn id_counter_ptr(&self) -> *const u32 {
         self.id_counter.as_ptr()
@@ -131,12 +135,19 @@ impl Runtime {
         let mut commands = std::mem::take(&mut self.commands);
         self.ring.drain_commands(self.generations.len(), 4096, &mut commands);
         for cmd in commands.drain(..) {
-            let (id, generation) = cmd.target();
-            if self.generations[id as usize] != generation {
+            if let Command::Grow { capacity } = cmd {
+                if !self.grow_to(capacity) {
+                    self.ring.note_malformed();
+                }
+                continue;
+            }
+            let Some((id, generation)) = cmd.target() else { continue };
+            if (id as usize) >= self.generations.len() || self.generations[id as usize] != generation {
                 self.ring.note_stale();
                 continue;
             }
             match cmd {
+                Command::Grow { .. } => {}
                 Command::Spawn { body, .. } => {
                     self.transforms.write_transform(id, Transform { pos: body.pos, rot: body.rot });
                     if self.physics_enabled {
@@ -176,11 +187,37 @@ impl Runtime {
             }
         }
 
-        self.transforms.swap();
+        self.transforms.publish(&self.header[H_STATE]);
     }
 }
 
 impl Runtime {
+    #[cfg(test)]
+    fn transforms_write_for_test(&self) -> usize {
+        self.transforms.write_index_for_test()
+    }
+
+    fn publish_layout(&self) {
+        let h = &self.header;
+        h[H_CAPACITY].store(self.transforms.capacity(), Ordering::Release);
+        for i in 0..3 {
+            h[H_BUF0 + i].store(self.transforms.buf_ptr(i) as u32, Ordering::Release);
+        }
+        h[H_GENERATIONS].store(self.generations.as_ptr() as u32, Ordering::Release);
+    }
+
+    fn grow_to(&mut self, capacity: u32) -> bool {
+        if capacity <= self.transforms.capacity() {
+            return false;
+        }
+        self.transforms.grow(&self.header[H_STATE], capacity);
+        self.generations.resize(capacity as usize, 0);
+        self.physics.resize(capacity as usize);
+        self.publish_layout();
+        self.header[H_EPOCH].fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
     fn spawn_direct(&mut self, id: u32, body: &BodyDesc) -> bool {
         if id as usize >= self.generations.len() || !body.is_valid() {
             self.ring.note_malformed();
@@ -206,12 +243,7 @@ mod tests {
     }
 
     fn read_buf(rt: &Runtime) -> Vec<f32> {
-        let src = if rt.transforms.write_index() == 0 {
-            &rt.transforms.buf_b
-        } else {
-            &rt.transforms.buf_a
-        };
-        src.clone()
+        rt.transforms.bufs[TransformBuffers::latest_index(&rt.header[H_STATE])].clone()
     }
 
     fn entity(rt: &Runtime, id: usize) -> [f32; 7] {
@@ -415,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn destroyed_entity_becomes_tombstone_in_both_buffers() {
+    fn destroyed_entity_becomes_tombstone_in_every_buffer() {
         let mut rt = Runtime::new(2, 16);
         rt.enable_physics();
         rt.set_gravity(0.0, 0.0, 0.0);
@@ -427,7 +459,9 @@ mod tests {
             assert_eq!(entity(&rt, 0)[3..7], [0.0; 4]);
             rt.step();
         }
-        assert_eq!(rt.transforms.buf_a[..7], rt.transforms.buf_b[..7]);
+        for b in &rt.transforms.bufs {
+            assert_eq!(b[3..7], [0.0; 4]);
+        }
     }
 
     #[test]
@@ -476,6 +510,81 @@ mod tests {
         rt.id_counter.fetch_add(3, Ordering::AcqRel);
         assert_eq!(rt.allocated_ids(), 3);
         assert_eq!(rt.id_counter_ptr(), p);
+    }
+
+    fn header(rt: &Runtime, i: usize) -> u32 {
+        rt.header[i].load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn header_describes_current_layout() {
+        let rt = Runtime::new(4, 4);
+        assert_eq!(header(&rt, H_EPOCH), 0);
+        assert_eq!(header(&rt, H_CAPACITY), 4);
+        for i in 0..3 {
+            assert_eq!(header(&rt, H_BUF0 + i), rt.transforms.buf_ptr(i) as u32);
+        }
+        assert_eq!(header(&rt, H_GENERATIONS), rt.generations.as_ptr() as u32);
+        assert_eq!(header(&rt, H_STATE), INITIAL_STATE);
+    }
+
+    #[test]
+    fn grow_command_bumps_epoch_reallocates_and_keeps_data() {
+        let mut rt = Runtime::new(2, 8);
+        rt.ring.push(&spawn_cmd(1, 0, unit_box(3.0, 4.0, 5.0)));
+        rt.step();
+        let old_ptrs: Vec<u32> = (0..3).map(|i| header(&rt, H_BUF0 + i)).collect();
+        rt.ring.push(&Command::Grow { capacity: 6 });
+        rt.step();
+        assert_eq!(header(&rt, H_EPOCH), 1);
+        assert_eq!(header(&rt, H_CAPACITY), 6);
+        assert_ne!((0..3).map(|i| header(&rt, H_BUF0 + i)).collect::<Vec<_>>(), old_ptrs);
+        assert_eq!(rt.generations.len(), 6);
+        assert_eq!(entity(&rt, 1)[..3], [3.0, 4.0, 5.0]);
+        rt.ring.push(&spawn_cmd(5, 0, unit_box(1.0, 1.0, 1.0)));
+        rt.step();
+        assert_eq!(entity(&rt, 5)[..3], [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn grow_to_same_or_smaller_capacity_is_counted_and_changes_nothing() {
+        let mut rt = Runtime::new(4, 8);
+        rt.ring.push(&Command::Grow { capacity: 4 });
+        rt.ring.push(&Command::Grow { capacity: 2 });
+        rt.step();
+        assert_eq!(header(&rt, H_EPOCH), 0);
+        assert_eq!(rt.malformed_dropped(), 2);
+        assert_eq!(rt.transforms.capacity(), 4);
+    }
+
+    #[test]
+    fn repeated_growth_keeps_counting_epochs_and_physics_working() {
+        let mut rt = Runtime::new(2, 16);
+        rt.enable_physics();
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, -2.0, 0.0], [10.0, 0.5, 10.0], 0.0, 0.0)));
+        for (n, cap) in [4u32, 8, 16].into_iter().enumerate() {
+            rt.ring.push(&Command::Grow { capacity: cap });
+            rt.step();
+            assert_eq!(header(&rt, H_EPOCH), n as u32 + 1);
+        }
+        rt.ring.push(&spawn_cmd(15, 0, BodyDesc::sphere_at([0.0, 1.0, 0.0], 0.4, 1.0, 0.0)));
+        for _ in 0..300 { rt.step(); }
+        let y = entity(&rt, 15)[1];
+        assert!((y - -1.1).abs() < 0.05, "sphere rests on the grown world's floor, got {y}");
+        assert!(read_buf(&rt).iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn grow_resets_published_state_to_a_valid_permutation() {
+        let mut rt = Runtime::new(2, 8);
+        for _ in 0..3 { rt.step(); }
+        rt.ring.push(&Command::Grow { capacity: 3 });
+        rt.step();
+        assert_eq!(header(&rt, H_STATE) & 0b11, TransformBuffers::latest_index(&rt.header[H_STATE]) as u32);
+        let v = header(&rt, H_STATE);
+        let mut roles = [rt.transforms_write_for_test(), (v & 0b11) as usize, ((v >> 3) & 0b11) as usize];
+        roles.sort_unstable();
+        assert_eq!(roles, [0, 1, 2]);
     }
 
     #[test]
