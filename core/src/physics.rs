@@ -48,11 +48,43 @@ pub struct Contact {
     pub lambda: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BodyDesc {
     pub pos: [f32; 3],
+    pub rot: [f32; 4],
     pub half: [f32; 3],
+    pub shape: u8,
     pub inv_mass: f32,
     pub restitution: f32,
+}
+
+pub const MAX_COORD: f32 = 1.0e6;
+pub const MIN_HALF: f32 = 1.0e-3;
+pub const MAX_HALF: f32 = 1.0e4;
+pub const MAX_INV_MASS: f32 = 1.0e6;
+
+impl BodyDesc {
+    pub fn is_valid(&self) -> bool {
+        let finite = self.pos.iter().chain(&self.rot).chain(&self.half)
+            .chain([&self.inv_mass, &self.restitution]).all(|v| v.is_finite());
+        let len_sq: f32 = self.rot.iter().map(|q| q * q).sum();
+        finite
+            && (self.shape == SHAPE_BOX || self.shape == SHAPE_SPHERE)
+            && self.pos.iter().all(|p| p.abs() <= MAX_COORD)
+            && self.half.iter().all(|h| (MIN_HALF..=MAX_HALF).contains(h))
+            && (0.0..=MAX_INV_MASS).contains(&self.inv_mass)
+            && (0.0..=1.0).contains(&self.restitution)
+            && len_sq.is_finite()
+            && len_sq > 1e-12
+    }
+
+    pub fn box_at(pos: [f32; 3], half: [f32; 3], inv_mass: f32, restitution: f32) -> Self {
+        Self { pos, rot: [0.0, 0.0, 0.0, 1.0], half, shape: SHAPE_BOX, inv_mass, restitution }
+    }
+
+    pub fn sphere_at(pos: [f32; 3], r: f32, inv_mass: f32, restitution: f32) -> Self {
+        Self { pos, rot: [0.0, 0.0, 0.0, 1.0], half: [r; 3], shape: SHAPE_SPHERE, inv_mass, restitution }
+    }
 }
 
 struct Motion<'a> {
@@ -98,7 +130,7 @@ impl PhysicsWorld {
         self.pos_x[id] = x;   self.pos_y[id] = y;   self.pos_z[id] = z;
         self.vel_x[id] = 0.0; self.vel_y[id] = 0.0; self.vel_z[id] = 0.0;
         self.ang_x[id] = 0.0; self.ang_y[id] = 0.0; self.ang_z[id] = 0.0;
-        self.qx[id] = 0.0; self.qy[id] = 0.0; self.qz[id] = 0.0; self.qw[id] = 1.0;
+        [self.qx[id], self.qy[id], self.qz[id], self.qw[id]] = d.rot;
         self.half_x[id] = hx; self.half_y[id] = hy; self.half_z[id] = hz;
         self.radius[id] = hx;
         self.inv_mass[id] = inv_mass;
@@ -108,20 +140,10 @@ impl PhysicsWorld {
             if r2 > 0.0 { 1.0 / (0.4 * mass * r2) } else { 0.0 }
         } else { 0.0 };
         self.restitution[id] = restitution;
-        self.shape[id] = SHAPE_BOX;
+        self.shape[id] = d.shape;
         self.active[id] = true;
         self.sleeping[id] = false;
         self.sleep_timer[id] = 0.0;
-    }
-
-    pub fn spawn_sphere(&mut self, id: usize, pos: [f32; 3], r: f32, inv_mass: f32, restitution: f32) {
-        self.spawn(id, &BodyDesc { pos, half: [r, r, r], inv_mass, restitution });
-        self.shape[id] = SHAPE_SPHERE;
-        self.radius[id] = r;
-        self.inv_inertia[id] = if inv_mass > 0.0 {
-            let mass = 1.0 / inv_mass;
-            1.0 / (0.4 * mass * r * r)
-        } else { 0.0 };
     }
 
     pub fn deactivate(&mut self, id: usize) {

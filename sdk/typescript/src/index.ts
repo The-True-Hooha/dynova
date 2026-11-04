@@ -1,5 +1,5 @@
 export { TransformView, FLOATS_PER_TRANSFORM } from './TransformView.js';
-export { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SLOT_BYTES } from './CommandRing.js';
+export { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SLOT_BYTES } from './CommandRing.js';
 export { EntityIdAllocator } from './EntityIdAllocator.js';
 export { World } from './World.js';
 export { createMemory, detectMode } from './memory.js';

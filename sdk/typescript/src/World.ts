@@ -1,5 +1,5 @@
 import { TransformView } from './TransformView.js';
-import { CommandRing, SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
+import { CommandRing, SLOT_BYTES, SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import { createMemory, MemoryMode } from './memory.js';
 
@@ -24,6 +24,10 @@ export interface WorldLayout {
 export interface SpawnOptions {
     x?: number; y?: number; z?: number;
     qx?: number; qy?: number; qz?: number; qw?: number;
+    shape?: number;
+    hx?: number; hy?: number; hz?: number;
+    invMass?: number;
+    restitution?: number;
 }
 
 export class World {
@@ -72,7 +76,7 @@ export class World {
         const floatsPerEntity = 7;
         const bytesPerFloat = 4;
         const transformBufBytes = config.capacity * floatsPerEntity * bytesPerFloat;
-        const ringBytes = config.ringCapacity * 40;
+        const ringBytes = config.ringCapacity * SLOT_BYTES;
 
         let offset = 0;
         const align = (n: number) => { offset = Math.ceil(offset / n) * n; };
@@ -106,6 +110,8 @@ export class World {
             id: handle.id, gen: handle.gen,
             x: opts.x ?? 0, y: opts.y ?? 0, z: opts.z ?? 0,
             qx: opts.qx ?? 0, qy: opts.qy ?? 0, qz: opts.qz ?? 0, qw: opts.qw ?? 1,
+            shape: opts.shape, hx: opts.hx, hy: opts.hy, hz: opts.hz,
+            invMass: opts.invMass, restitution: opts.restitution,
         };
         if (!this.ring.spawn(desc)) {
             this.ids.free(handle);

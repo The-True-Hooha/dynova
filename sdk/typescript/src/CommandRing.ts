@@ -1,14 +1,21 @@
-export const SLOT_BYTES = 40;
+export const SLOT_BYTES = 64;
 
 export const TAG_SPAWN   = 0;
 export const TAG_DESTROY = 1;
 export const TAG_FORCE   = 2;
+
+export const SHAPE_BOX    = 0;
+export const SHAPE_SPHERE = 1;
 
 export interface SpawnDesc {
     id: number;
     gen: number;
     x: number; y: number; z: number;
     qx: number; qy: number; qz: number; qw: number;
+    shape?: number;
+    hx?: number; hy?: number; hz?: number;
+    invMass?: number;
+    restitution?: number;
 }
 
 export interface DestroyDesc {
@@ -68,6 +75,13 @@ export class CommandRing {
         this.view.setFloat32(off + 22, desc.qy, true);
         this.view.setFloat32(off + 26, desc.qz, true);
         this.view.setFloat32(off + 30, desc.qw, true);
+        this.view.setUint8(off + 34, desc.shape ?? SHAPE_BOX);
+        this.view.setUint8(off + 35, 0);
+        this.view.setFloat32(off + 36, desc.hx ?? 0.5, true);
+        this.view.setFloat32(off + 40, desc.hy ?? 0.5, true);
+        this.view.setFloat32(off + 44, desc.hz ?? 0.5, true);
+        this.view.setFloat32(off + 48, desc.invMass ?? 1, true);
+        this.view.setFloat32(off + 52, desc.restitution ?? 0.3, true);
         Atomics.add(this.tail, 0, 1);
         return true;
     }
