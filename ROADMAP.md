@@ -54,7 +54,7 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 
 ## Phase 1 — Runtime Substrate
 
-### Stage 1A — Boundary mechanics
+### Stage 1A — Boundary mechanics  ✅ done
 - `TransformBuffers` struct (buf_a/buf_b/write_index/capacity), `swap()`, `current_write_ptr()`
 - `TransformView` TS class, `Atomics.load` read path
 - SPSC command ring (spawn/force/destroy), fixed capacity, wraparound handling
@@ -62,7 +62,7 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 - SAB feature detect + non-SAB fallback (sync WASM call path)
 - **Exit:** spawn 10k entities from JS, worker writes garbage transforms, main thread reads them via swap, no main-thread WASM calls per frame. Correctness of physics doesn't matter yet — only the plumbing.
 
-### Stage 1B — Boundary hardening
+### Stage 1B — Boundary hardening  ✅ done (Firefox unverified in dev sandbox)
 - Generation byte on entity slots, stale-handle detection (`spawn` returns `{id, gen}`, `destroy` bumps gen, any command against a stale gen is silently dropped + counted, not panicked)
 - Buffer growth path: realloc, detach event fired to JS (`onBufferGrowth` callback), SDK auto-reacquires views — write a test that grows mid-frame and asserts no torn read
 - COOP/COEP doc page + a runtime check that throws a clear error if SAB is expected but unavailable due to missing headers (distinguish "no SAB support" from "SAB supported but headers missing" — different error messages, first is a browser limitation, second is a config bug on the host site)
@@ -74,15 +74,15 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 
 ## Phase 2 — Physics Core
 
-### Stage 2A — Rigid bodies, single shape type
+### Stage 2A — Rigid bodies, single shape type  ✅ done
 - Box only, no sphere/capsule/hull yet — prove the pipeline end to end on the simplest shape
 - Spatial hash grid (as specced), narrow phase = AABB-only (no exact box-box SAT yet, just broad phase correctness)
 - Sequential-impulse solver, fixed 4 iterations, no warm starting
 - Integration (semi-implicit Euler), no sleeping yet
 - **Exit:** a stack of 50 boxes settles under gravity without exploding or NaN-ing, at 60fps in the worker.
 
-### Stage 2B — Full shape set + solver correctness
-- Sphere, capsule, convex hull narrow phase (SAT for convex, sphere-sphere/sphere-capsule analytic)
+### Stage 2B — Full shape set + solver correctness  ✅ done with deviations: convex hull moved to Stage 3A; exit 'stack of 50' delivered as wall/pyramid/20-column; exit 'constrained bodies' delivered as 30 unconstrained mixed bodies in a container (no joints exist)
+- Sphere, capsule narrow phase (OBB SAT for boxes, sphere-sphere/sphere-capsule analytic); convex hull deferred to Stage 3A
 - Warm starting on the solver (carry impulses frame-to-frame for contact persistence — real perf/stability win, don't skip it)
 - Sleeping (velocity + angular velocity threshold, island-based — sleeping is per-connected-component, not per-body, or a sleeping body touching an awake one causes tunneling)
 - Continuous collision detection for fast-moving small bodies (swept sphere at minimum — full CCD for arbitrary shapes is a stretch goal, not a v1 requirement)
@@ -95,6 +95,7 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 
 ### Stage 3A — Three.js adapter, GLTF in
 - `threeAdapter(transforms, instancedMesh)` — instance matrix update from buffer, no per-entity Three.js objects
+- Convex hull narrow phase (SAT, moved here from Stage 2B) so mesh-derived colliders work
 - GLTF load -> mesh extraction -> convex hull / primitive-fit collider generation -> spawn command
 - Camera/scene ownership stays fully in user code — Dynova never creates a `THREE.Scene`
 - **Exit:** load a GLTF scene, spawn colliders matching visual meshes, drop them, watch them collide and render correctly.

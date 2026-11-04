@@ -136,6 +136,8 @@ Out-of-plan observations. Do not act on these without approval.
 - (Step 6 review, LOW) No fallback contact when every clipped box point is dropped (uses body-centre midpoint); parallel capsules get one contact point; island ids are not relabelled when a new contact merges sleeping islands; CCD scales the whole displacement (loses tangential travel near a surface) and sweeps boxes as their thinnest-axis sphere; stored `lt2` has the wrong sign for one frame when a pair's a/b order flips; `bucket_counts` pointer in the header is stale if `enable_physics` runs twice; the edge-edge segment-length mutant (2x) survives (needs a contact at an edge end).
 - (Step 6) Single unit-box column above ~20 buckles under sequential impulses; a block solver would be a separate project.
 
+- (Final review, Phase 3/4 inputs) `spawn_box/spawn_sphere/spawn_capsule/set_gravity/enable_physics` wasm exports bypass the ring (add a Gravity command, gate the rest behind a test feature); backpressure/ring-depth/overrun counters are JS-local (publish in header for the inspector); `bucket_counts` is written in place while JS may read it (publish a copy); roadmap sin/cos/atan2 determinism smoke test and a shared-build hash run are missing; Grow near the 1 GiB max traps mid-grow; spawn is O(warm_cache) and deactivate O(capacity); `publish` copies the whole buffer each tick; generation byte aliases after 256 respawns of one id; no upper bound on `capacity` in launchWorld; Firefox unrun.
+
 ## Plan changes
 
 - 2026-11-04: worker topology = Web Worker + SAB with sync fallback (user approved).

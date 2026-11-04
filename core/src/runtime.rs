@@ -148,7 +148,7 @@ impl Runtime {
     }
 
     pub fn sleeping_count(&self) -> u32 {
-        self.physics.sleeping.iter().filter(|&&s| s).count() as u32
+        self.physics.sleeping.iter().zip(&self.physics.active).filter(|(s, a)| **s && **a).count() as u32
     }
 
     pub fn step(&mut self) {
@@ -672,6 +672,19 @@ mod tests {
         assert!(!rt.spawn_capsule(1, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 0.1));
         assert!(!rt.spawn_capsule(1, 0.0, 0.0, 0.0, 0.3, f32::NAN, 1.0, 0.1));
         assert!(!rt.spawn_capsule(5, 0.0, 0.0, 0.0, 0.3, 0.5, 1.0, 0.1));
+    }
+
+    #[test]
+    fn sleeping_count_ignores_destroyed_bodies() {
+        let mut rt = Runtime::new(2, 8);
+        rt.enable_physics();
+        rt.ring.push(&spawn_cmd(0, 0, unit_box(0.0, 0.0, 0.0)));
+        rt.step();
+        rt.physics.sleeping[0] = true;
+        assert_eq!(rt.sleeping_count(), 1);
+        rt.ring.push(&Command::Destroy { id: 0, generation: 0 });
+        rt.step();
+        assert_eq!(rt.sleeping_count(), 0);
     }
 
     #[test]

@@ -52,12 +52,14 @@ Renderer Adapter (pure function: buffer -> draw calls, no entity knowledge)
 
 ```
 dynova/
-  core/              # Rust: ECS, scheduler, broadphase, solver, buffers
-  sdk/typescript/    # World, EntityId handles, command queue, buffer views
-  renderer/three/    # v1 Three.js adapter
-  inspector/         # Developer tooling
-  examples/          # Runnable demos
+  core/              # Rust: runtime, command ring, triple buffer, broadphase, solver, collision
+  sdk/typescript/    # World, handles, command ring, buffer views, launchWorld, sim worker
+  examples/          # Runnable demos and e2e pages
+  e2e/               # Playwright cross-browser tests
+  docs/              # Hosting notes (cross-origin isolation)
 ```
+
+Planned, not yet built: `renderer/three/` (Phase 3), `inspector/` (Phase 4).
 
 ---
 
@@ -96,6 +98,8 @@ Open `http://localhost:5173`.
 | `make dev` | Start examples dev server |
 | `make test` | Run SDK unit tests |
 | `make check` | TypeScript typecheck |
+| `make build-st` | Build the single-threaded WASM used by the non-SharedArrayBuffer fallback |
+| `make e2e` | Cross-browser Playwright tests (builds both WASM variants first) |
 | `make all` | Release WASM build + install |
 | `make clean` | Wipe build artifacts |
 
@@ -114,4 +118,6 @@ Open `http://localhost:5173`.
 
 ## Status
 
-Currently in **Phase 1 — Stage 1A** (boundary mechanics). The command ring → Rust drain → transform buffer → JS read path is working. See [ROADMAP.md](./ROADMAP.md) for the full implementation plan.
+Phases 1 and 2 are complete: shared-memory worker runtime with a sync fallback, lock-free triple-buffered transforms with growth, bounded command backpressure, and a physics core (spheres, boxes, capsules, friction, warm starting, island sleeping, swept CCD). Next is Phase 3 (Three.js adapter, GLTF colliders, convex hulls). See [ROADMAP.md](./ROADMAP.md) and [PLAN.md](./PLAN.md).
+
+Known limits: a single column of unit boxes buckles above about 20 high; dynamic-vs-dynamic CCD is not implemented; Firefox is configured in Playwright but was not verified in the development sandbox. A solver golden hash (single-threaded build) matches the native build in Chromium and WebKit; the roadmap's sin/cos/atan2 smoke test and a shared-build run are not done. The 30-body stress scene has no joints (bodies are contained by static walls).

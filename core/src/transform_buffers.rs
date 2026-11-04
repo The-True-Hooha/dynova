@@ -122,7 +122,7 @@ impl TransformBuffers {
 }
 
 fn two_mut(bufs: &mut [Vec<f32>; 3], a: usize, b: usize) -> (&Vec<f32>, &mut Vec<f32>) {
-    assert_ne!(a, b);
+    assert!(a < 3 && b < 3 && a != b, "buffer roles out of range: {a} {b}");
     let p = bufs.as_mut_ptr();
     // SAFETY: a != b and both < 3, so the two references never alias.
     unsafe { (&*p.add(a), &mut *p.add(b)) }
