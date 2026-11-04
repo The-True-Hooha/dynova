@@ -1,5 +1,5 @@
 import { TransformView } from './TransformView.js';
-import { CommandRing, MAX_CAPACITY, SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
+import { CommandRing, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import type { MemoryMode } from './memory.js';
 
@@ -44,6 +44,8 @@ export interface SpawnOptions {
     invMass?: number;
     restitution?: number;
     friction?: number;
+    /** Hull id from `registerHull`; required with `shape: SHAPE_HULL`. */
+    hull?: number;
 }
 
 export interface StepDriver {
@@ -60,7 +62,9 @@ type Queued =
     | { k: 'destroy'; d: DestroyDesc }
     | { k: 'force'; d: ForceDesc }
     | { k: 'grow'; capacity: number }
-    | { k: 'gravity'; v: [number, number, number] };
+    | { k: 'gravity'; v: [number, number, number] }
+    | { k: 'hullVerts'; hull: number; coords: number[] }
+    | { k: 'hullCommit'; hull: number; count: number };
 
 const DEFAULT_MAX_DEFERRED = 1 << 16;
 
@@ -86,6 +90,7 @@ export class World {
     private rejected = 0;
     private growths = 0;
     private pendingGrow = 0;
+    private nextHull = 0;
 
     private constructor(
         config: WorldConfig,
@@ -196,6 +201,8 @@ export class World {
             case 'force': return this.ring.force(c.d);
             case 'grow': return this.ring.grow(c.capacity);
             case 'gravity': return this.ring.gravity(...c.v);
+            case 'hullVerts': return this.ring.hullVerts(c.hull, c.coords);
+            case 'hullCommit': return this.ring.hullCommit(c.hull, c.count);
         }
     }
 
@@ -227,13 +234,16 @@ export class World {
 
     spawn(opts: SpawnOptions = {}): EntityHandle {
         this.assertAlive();
+        if (opts.shape === SHAPE_HULL && !(Number.isInteger(opts.hull) && (opts.hull as number) >= 0 && (opts.hull as number) < this.nextHull)) {
+            throw new RangeError(`spawn with SHAPE_HULL needs a hull id returned by registerHull, got ${opts.hull}`);
+        }
         const handle = this.ids.alloc();
         const desc: SpawnDesc = {
             id: handle.id, gen: handle.gen,
             x: opts.x ?? 0, y: opts.y ?? 0, z: opts.z ?? 0,
             qx: opts.qx ?? 0, qy: opts.qy ?? 0, qz: opts.qz ?? 0, qw: opts.qw ?? 1,
             shape: opts.shape, hx: opts.hx, hy: opts.hy, hz: opts.hz,
-            invMass: opts.invMass, restitution: opts.restitution, friction: opts.friction,
+            invMass: opts.invMass, restitution: opts.restitution, friction: opts.friction, hull: opts.hull,
         };
         if (!this.enqueue({ k: 'spawn', d: desc })) {
             this.ids.release(handle);
@@ -267,6 +277,34 @@ export class World {
         }
         if (!this.enqueue({ k: 'grow', capacity })) throw new Error('CommandRing full');
         this.pendingGrow = capacity;
+    }
+
+    /**
+     * Upload a convex hull from flat x,y,z points (4 to 32 vertices, |coordinate| <= 1e4) and return its id for
+     * `spawn({ shape: SHAPE_HULL, hull })`. The runtime recentres the hull on the mean of its points, so the body
+     * origin is that mean. Invalid geometry (for example coplanar points) is rejected by the runtime and counted
+     * in `runtimeCounters.malformedDropped`; spawns that reference it are dropped the same way.
+     */
+    registerHull(points: ArrayLike<number>): number {
+        this.assertAlive();
+        const count = points.length / 3;
+        if (!Number.isInteger(count) || count < 4 || count > MAX_HULL_VERTS) {
+            throw new RangeError(`a hull needs 4 to ${MAX_HULL_VERTS} vertices as x,y,z triples, got ${points.length} numbers`);
+        }
+        for (let i = 0; i < points.length; i++) {
+            if (!Number.isFinite(points[i]) || Math.abs(points[i]) > MAX_HULL_COORD) throw new RangeError(`hull coordinate ${i} is not finite or exceeds ${MAX_HULL_COORD}`);
+        }
+        if (this.nextHull >= MAX_HULLS) throw new RangeError(`hull limit reached (${MAX_HULLS})`);
+        const chunks = Math.ceil(count / HULL_VERTS_PER_SLOT);
+        const room = this.ringCapacity - this.ring.pendingCount + this.maxDeferred - this.deferredCommands;
+        if (chunks + 1 > room) throw new Error('CommandRing full: not enough room to upload this hull');
+        const hull = this.nextHull++;
+        for (let c = 0; c < chunks; c++) {
+            const coords = Array.from(points).slice(c * HULL_VERTS_PER_SLOT * 3, (c + 1) * HULL_VERTS_PER_SLOT * 3);
+            this.enqueue({ k: 'hullVerts', hull, coords });
+        }
+        this.enqueue({ k: 'hullCommit', hull, count });
+        return hull;
     }
 
     /** Set world gravity through the command ring (values must be finite and within +-1000). */

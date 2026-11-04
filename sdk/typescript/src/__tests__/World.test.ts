@@ -319,6 +319,87 @@ describe('World growth', () => {
         Atomics.store(rt.header, 15, 11);
         expect(world.runtimeStats).toEqual({ ringPending: 5, droppedContacts: 2, workerOverruns: 7, contacts: 11 });
     });
+
+    describe('registerHull', () => {
+        const cube = () => {
+            const p: number[] = [];
+            for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) p.push(x, y, z);
+            return p;
+        };
+
+        function ringTags(mem: WebAssembly.Memory, layout: { ringSlotsByteOffset: number }, n: number) {
+            const v = new DataView(mem.buffer);
+            return Array.from({ length: n }, (_, i) => v.getUint8(layout.ringSlotsByteOffset + i * 64));
+        }
+
+        it('chunks 4 vertices per command and ends with a commit, returning sequential ids', () => {
+            const { world, memory, layout } = makeWorld({ capacity: 8, ringCapacity: 16 });
+            expect(world.registerHull(cube())).toBe(0);
+            expect(world.pendingCommands).toBe(3);
+            expect(ringTags(memory, layout, 3)).toEqual([5, 5, 6]);
+            expect(world.registerHull([...cube(), 0, 0, 2])).toBe(1);
+            expect(world.pendingCommands).toBe(7);
+        });
+
+        it('keeps chunk order across ring backpressure so the commit is last', () => {
+            const { world, rt, memory, layout } = makeWorld({ capacity: 8, ringCapacity: 2, maxDeferredCommands: 100 });
+            world.registerHull(cube());
+            const seen: number[] = [];
+            for (let i = 0; i < 10 && world.pendingCommands > 0; i++) {
+                seen.push(...ringTags(memory, layout, 0));
+                const head = new Int32Array(memory.buffer, layout.ringHeadByteOffset, 1);
+                const tail = new Int32Array(memory.buffer, layout.ringTailByteOffset, 1);
+                const v = new DataView(memory.buffer);
+                for (let h = Atomics.load(head, 0); h !== Atomics.load(tail, 0); h++) seen.push(v.getUint8(layout.ringSlotsByteOffset + (h & 1) * 64));
+                rt.drain();
+                world.flush();
+            }
+            expect(seen).toEqual([5, 5, 6]);
+        });
+
+        it.each([
+            ['fewer than 4 vertices', [0, 0, 0, 1, 0, 0, 0, 1, 0]],
+            ['not a multiple of 3', [...Array(13).fill(0)]],
+            ['more than 32 vertices', [...Array(99).fill(1)]],
+            ['NaN', (() => { const p = [...Array(12).fill(1)]; p[4] = NaN; return p; })()],
+            ['Infinity', (() => { const p = [...Array(12).fill(1)]; p[7] = Infinity; return p; })()],
+            ['out of range', (() => { const p = [...Array(12).fill(1)]; p[0] = 2e4; return p; })()],
+        ])('rejects %s before touching the ring', (_n, pts) => {
+            const { world } = makeWorld({ capacity: 8, ringCapacity: 16 });
+            expect(() => world.registerHull(pts)).toThrow(RangeError);
+            expect(world.pendingCommands).toBe(0);
+        });
+
+        it('stops at the hull limit and does not consume an id when the ring has no room', () => {
+            const tiny = makeWorld({ capacity: 8, ringCapacity: 2, maxDeferredCommands: 0 }).world;
+            expect(() => tiny.registerHull(cube())).toThrow('CommandRing full');
+            expect(tiny.pendingCommands).toBe(0);
+            const big = makeWorld({ capacity: 8, ringCapacity: 4096, maxDeferredCommands: 100 }, { pages: 16 }).world;
+            for (let i = 0; i < 1024; i++) big.registerHull(cube());
+            expect(() => big.registerHull(cube())).toThrow(RangeError);
+        });
+
+        it('commit carries the total vertex count', () => {
+            const { world, memory, layout } = makeWorld({ capacity: 8, ringCapacity: 16 });
+            world.registerHull([...cube(), 0, 0, 2]);
+            expect(new DataView(memory.buffer).getUint8(layout.ringSlotsByteOffset + 3 * 64 + 5)).toBe(9);
+        });
+
+        it.each([[undefined], [-1], [0.5], [2 ** 32], [5]])('spawn with SHAPE_HULL rejects hull id %s', (hull) => {
+            const { world } = makeWorld({ capacity: 8, ringCapacity: 16 });
+            world.registerHull(cube());
+            expect(() => world.spawn({ shape: 3, hull: hull as number })).toThrow(RangeError);
+            expect(world.allocatedEntities).toBe(0);
+        });
+
+        it('a spawn can reference the returned hull id', () => {
+            const { world, memory, layout } = makeWorld({ capacity: 8, ringCapacity: 16 });
+            const hull = world.registerHull(cube());
+            world.spawn({ shape: 3, hull });
+            const v = new DataView(memory.buffer);
+            expect(v.getUint32(layout.ringSlotsByteOffset + 3 * 64 + 60, true)).toBe(hull);
+        });
+    });
 });
 
 function buf0(world: import('../World.js').World) { return world.readTransforms()[0]; }

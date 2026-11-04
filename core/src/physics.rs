@@ -1,4 +1,5 @@
 use crate::collision::{self as geo, Manifold};
+use crate::hull::{self, HullData, MAX_HULLS};
 
 const BUCKET_COUNT: usize = 4096;
 const BUCKET_MASK:  usize = BUCKET_COUNT - 1;
@@ -21,6 +22,7 @@ const SLEEP_TIME:   f32   = 0.2;
 pub const SHAPE_BOX:    u8 = 0;
 pub const SHAPE_SPHERE: u8 = 1;
 pub const SHAPE_CAPSULE: u8 = 2;
+pub const SHAPE_HULL: u8 = 3;
 pub const MAX_FRICTION: f32 = 2.0;
 pub const DEFAULT_FRICTION: f32 = 0.5;
 
@@ -35,6 +37,8 @@ pub struct PhysicsWorld {
     pub inv_inertia: Vec<f32>,
     pub restitution: Vec<f32>,
     pub friction:    Vec<f32>,
+    pub hull_of:     Vec<u32>,
+    pub hulls:       Vec<Option<HullData>>,
     pub shape:       Vec<u8>,
     pub active:      Vec<bool>,
     pub sleeping:    Vec<bool>,
@@ -86,6 +90,7 @@ pub struct BodyDesc {
     pub inv_mass: f32,
     pub restitution: f32,
     pub friction: f32,
+    pub hull: u32,
 }
 
 pub const MAX_COORD: f32 = 1.0e6;
@@ -99,7 +104,7 @@ impl BodyDesc {
             .chain([&self.inv_mass, &self.restitution]).all(|v| v.is_finite());
         let len_sq: f32 = self.rot.iter().map(|q| q * q).sum();
         finite
-            && (self.shape == SHAPE_BOX || self.shape == SHAPE_SPHERE || self.shape == SHAPE_CAPSULE)
+            && (self.shape == SHAPE_BOX || self.shape == SHAPE_SPHERE || self.shape == SHAPE_CAPSULE || self.shape == SHAPE_HULL)
             && self.friction.is_finite() && (0.0..=MAX_FRICTION).contains(&self.friction)
             && self.pos.iter().all(|p| p.abs() <= MAX_COORD)
             && self.half.iter().all(|h| (MIN_HALF..=MAX_HALF).contains(h))
@@ -110,16 +115,20 @@ impl BodyDesc {
     }
 
     pub fn box_at(pos: [f32; 3], half: [f32; 3], inv_mass: f32, restitution: f32) -> Self {
-        Self { pos, rot: [0.0, 0.0, 0.0, 1.0], half, shape: SHAPE_BOX, inv_mass, restitution, friction: DEFAULT_FRICTION }
+        Self { pos, rot: [0.0, 0.0, 0.0, 1.0], half, shape: SHAPE_BOX, inv_mass, restitution, friction: DEFAULT_FRICTION, hull: 0 }
     }
 
     pub fn sphere_at(pos: [f32; 3], r: f32, inv_mass: f32, restitution: f32) -> Self {
-        Self { pos, rot: [0.0, 0.0, 0.0, 1.0], half: [r; 3], shape: SHAPE_SPHERE, inv_mass, restitution, friction: DEFAULT_FRICTION }
+        Self { pos, rot: [0.0, 0.0, 0.0, 1.0], half: [r; 3], shape: SHAPE_SPHERE, inv_mass, restitution, friction: DEFAULT_FRICTION, hull: 0 }
+    }
+
+    pub fn hull_at(pos: [f32; 3], hull: u32, inv_mass: f32, restitution: f32) -> Self {
+        Self { pos, rot: [0.0, 0.0, 0.0, 1.0], half: [0.5; 3], shape: SHAPE_HULL, inv_mass, restitution, friction: DEFAULT_FRICTION, hull }
     }
 
     /// Capsule along local Y: `r` radius, `half_len` half the cylinder length.
     pub fn capsule_at(pos: [f32; 3], r: f32, half_len: f32, inv_mass: f32, restitution: f32) -> Self {
-        Self { pos, rot: [0.0, 0.0, 0.0, 1.0], half: [r, half_len, r], shape: SHAPE_CAPSULE, inv_mass, restitution, friction: DEFAULT_FRICTION }
+        Self { pos, rot: [0.0, 0.0, 0.0, 1.0], half: [r, half_len, r], shape: SHAPE_CAPSULE, inv_mass, restitution, friction: DEFAULT_FRICTION, hull: 0 }
     }
 }
 
@@ -144,6 +153,8 @@ impl PhysicsWorld {
             inv_mass: vec![1.0; capacity], inv_inertia: vec![1.0; capacity],
             restitution: vec![0.3; capacity],
             friction:    vec![DEFAULT_FRICTION; capacity],
+            hull_of:     vec![0; capacity],
+            hulls:       Vec::new(),
             shape: vec![SHAPE_BOX; capacity],
             active: vec![false; capacity], sleeping: vec![false; capacity],
             sleep_timer: vec![0.0; capacity],
@@ -181,6 +192,7 @@ impl PhysicsWorld {
               half_x = 0.5, half_y = 0.5, half_z = 0.5, radius = 0.5, inv_mass = 1.0, inv_inertia = 1.0,
               restitution = 0.3, friction = DEFAULT_FRICTION, shape = SHAPE_BOX, active = false, sleeping = false, sleep_timer = 0.0);
         self.cell_next.resize(new_capacity, -1);
+        self.hull_of.resize(new_capacity, 0);
         self.touching.resize(new_capacity, false);
         self.penetrating.resize(new_capacity, false);
         self.uf_parent.resize(new_capacity, 0);
@@ -191,17 +203,35 @@ impl PhysicsWorld {
         self.capacity = new_capacity;
     }
 
+    /// Hulls are immutable once registered; returns false for an out-of-range or already used id.
+    pub fn register_hull(&mut self, id: u32, data: HullData) -> bool {
+        let i = id as usize;
+        if i >= MAX_HULLS || self.hulls.get(i).is_some_and(|h| h.is_some()) { return false; }
+        if self.hulls.len() <= i { self.hulls.resize(i + 1, None); }
+        self.hulls[i] = Some(data);
+        true
+    }
+
+    pub fn hull(&self, id: u32) -> Option<&HullData> {
+        self.hulls.get(id as usize).and_then(|h| h.as_ref())
+    }
+
     pub fn spawn(&mut self, id: usize, d: &BodyDesc) {
         if id >= self.capacity { return; }
+        let hull_shape = if d.shape == SHAPE_HULL {
+            let Some(h) = self.hull(d.hull) else { return };
+            Some((h.half, h.radius))
+        } else { None };
         let [x, y, z] = d.pos;
-        let [hx, hy, hz] = d.half;
+        let [hx, hy, hz] = hull_shape.map_or(d.half, |(h, _)| h);
         let (inv_mass, restitution) = (d.inv_mass, d.restitution);
         self.pos_x[id] = x;   self.pos_y[id] = y;   self.pos_z[id] = z;
         self.vel_x[id] = 0.0; self.vel_y[id] = 0.0; self.vel_z[id] = 0.0;
         self.ang_x[id] = 0.0; self.ang_y[id] = 0.0; self.ang_z[id] = 0.0;
         [self.qx[id], self.qy[id], self.qz[id], self.qw[id]] = d.rot;
         self.half_x[id] = hx; self.half_y[id] = hy; self.half_z[id] = hz;
-        self.radius[id] = hx;
+        self.radius[id] = hull_shape.map_or(hx, |(_, r)| r);
+        self.hull_of[id] = d.hull;
         self.inv_mass[id] = inv_mass;
         self.inv_inertia[id] = if inv_mass > 0.0 {
             let mass = 1.0 / inv_mass;
@@ -470,7 +500,7 @@ impl PhysicsWorld {
     /// Radius of the sphere swept for continuous collision: the shape's thinnest half-extent.
     fn core_radius(&self, i: usize) -> f32 {
         match self.shape[i] {
-            SHAPE_BOX => self.half_x[i].min(self.half_y[i]).min(self.half_z[i]),
+            SHAPE_BOX | SHAPE_HULL => self.half_x[i].min(self.half_y[i]).min(self.half_z[i]),
             _ => self.radius[i],
         }
     }
@@ -782,14 +812,38 @@ fn collide(a: usize, b: usize, w: &PhysicsWorld) -> Option<Manifold> {
         ),
         (SHAPE_CAPSULE, SHAPE_BOX) => geo::capsule_box(pa, qa, w.half_y[a], ra, pb, half(b), qb),
         (SHAPE_BOX, SHAPE_CAPSULE) => geo::capsule_box(pb, qb, w.half_y[b], rb, pa, half(a), qa).map(Manifold::flipped),
+        (SHAPE_HULL, _) | (_, SHAPE_HULL) => collide_hull(a, b, w),
         _ => None,
+    }
+}
+
+fn world_hull(w: &PhysicsWorld, i: usize) -> Option<hull::WorldHull> {
+    let pos = [w.pos_x[i], w.pos_y[i], w.pos_z[i]];
+    let rot = [w.qx[i], w.qy[i], w.qz[i], w.qw[i]];
+    match w.shape[i] {
+        SHAPE_HULL => Some(w.hull(w.hull_of[i])?.world(pos, rot)),
+        SHAPE_BOX => Some(HullData::cuboid([w.half_x[i], w.half_y[i], w.half_z[i]]).world(pos, rot)),
+        _ => None,
+    }
+}
+
+/// Contacts for pairs where at least one body is a convex hull; `n` points from `b` to `a`.
+fn collide_hull(a: usize, b: usize, w: &PhysicsWorld) -> Option<Manifold> {
+    let pos = |i: usize| [w.pos_x[i], w.pos_y[i], w.pos_z[i]];
+    let rot = |i: usize| [w.qx[i], w.qy[i], w.qz[i], w.qw[i]];
+    match (w.shape[a], w.shape[b]) {
+        (SHAPE_SPHERE, _) => hull::sphere_hull(pos(a), w.radius[a], &world_hull(w, b)?),
+        (_, SHAPE_SPHERE) => hull::sphere_hull(pos(b), w.radius[b], &world_hull(w, a)?).map(Manifold::flipped),
+        (SHAPE_CAPSULE, _) => hull::capsule_hull(pos(a), rot(a), w.half_y[a], w.radius[a], &world_hull(w, b)?),
+        (_, SHAPE_CAPSULE) => hull::capsule_hull(pos(b), rot(b), w.half_y[b], w.radius[b], &world_hull(w, a)?).map(Manifold::flipped),
+        _ => hull::hull_hull(&world_hull(w, a)?, &world_hull(w, b)?),
     }
 }
 
 fn extent(w: &PhysicsWorld, i: usize) -> f32 {
     match w.shape[i] {
         SHAPE_CAPSULE => w.half_y[i] + w.radius[i],
-        SHAPE_SPHERE => w.radius[i],
+        SHAPE_SPHERE | SHAPE_HULL => w.radius[i],
         _ => (w.half_x[i] * w.half_x[i] + w.half_y[i] * w.half_y[i] + w.half_z[i] * w.half_z[i]).sqrt(),
     }
 }

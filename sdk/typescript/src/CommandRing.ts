@@ -5,11 +5,18 @@ export const TAG_DESTROY = 1;
 export const TAG_FORCE   = 2;
 export const TAG_GROW    = 3;
 export const TAG_GRAVITY = 4;
+export const TAG_HULL_VERTS = 5;
+export const TAG_HULL_COMMIT = 6;
+export const HULL_VERTS_PER_SLOT = 4;
+export const MAX_HULL_VERTS = 32;
+export const MAX_HULLS = 1024;
+export const MAX_HULL_COORD = 1e4;
 export const MAX_CAPACITY = 1 << 18;
 
 export const SHAPE_BOX    = 0;
 export const SHAPE_SPHERE = 1;
 export const SHAPE_CAPSULE = 2;
+export const SHAPE_HULL = 3;
 
 export interface SpawnDesc {
     id: number;
@@ -21,6 +28,7 @@ export interface SpawnDesc {
     invMass?: number;
     restitution?: number;
     friction?: number;
+    hull?: number;
 }
 
 export interface DestroyDesc {
@@ -87,7 +95,7 @@ export class CommandRing {
         this.view.setFloat32(off + 48, desc.invMass ?? 1, true);
         this.view.setFloat32(off + 52, desc.restitution ?? 0.3, true);
         this.view.setFloat32(off + 56, desc.friction ?? 0.5, true);
-        this.view.setFloat32(off + 60, 0, true);
+        this.view.setUint32(off + 60, desc.hull ?? 0, true);
         Atomics.add(this.tail, 0, 1);
         return true;
     }
@@ -124,6 +132,35 @@ export class CommandRing {
         for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
         this.view.setUint8(off, TAG_GROW);
         this.view.setUint32(off + 6, capacity, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    /** `coords` holds 1 to 4 vertices as flat x,y,z triples. */
+    hullVerts(hull: number, coords: ArrayLike<number>): boolean {
+        const count = coords.length / 3;
+        if (!Number.isInteger(count) || count < 1 || count > HULL_VERTS_PER_SLOT) throw new RangeError(`a hull chunk holds 1 to ${HULL_VERTS_PER_SLOT} vertices, got ${count}`);
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_HULL_VERTS);
+        this.view.setUint32(off + 1, hull, true);
+        this.view.setUint8(off + 5, count);
+        for (let i = 0; i < coords.length; i++) this.view.setFloat32(off + 6 + i * 4, coords[i], true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    /** `count` is the total number of vertices uploaded for this hull; the runtime rejects a mismatch. */
+    hullCommit(hull: number, count: number): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_HULL_COMMIT);
+        this.view.setUint32(off + 1, hull, true);
+        this.view.setUint8(off + 5, count);
         Atomics.add(this.tail, 0, 1);
         return true;
     }

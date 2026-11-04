@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, SLOT_BYTES } from '../CommandRing.js';
+import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, SHAPE_HULL, SLOT_BYTES } from '../CommandRing.js';
 
 function makeRing(capacity = 16) {
     const mem = new WebAssembly.Memory({ initial: 1 });
@@ -137,5 +137,52 @@ describe('CommandRing', () => {
         expect(view.getFloat32(10, true)).toBeCloseTo(-9.81);
         expect(view.getUint32(1, true)).toBe(0);
         expect(view.getFloat32(36, true)).toBe(0);
+    });
+
+    it('hullVerts encodes tag, hull id, count and vertices; hullCommit encodes tag and id; slots are zeroed first', () => {
+        const { mem, ring } = makeRing(1);
+        ring.spawn({ id: 1, gen: 1, x: 5, y: 5, z: 5, qx: 0, qy: 0, qz: 0, qw: 1, hx: 9 });
+        Atomics.store(new Int32Array(mem.buffer, SLOT_BYTES, 1), 0, 1);
+        expect(ring.hullVerts(300, [1, 2, 3, -4, 5.5, 6])).toBe(true);
+        const view = new DataView(mem.buffer);
+        expect(view.getUint8(0)).toBe(TAG_HULL_VERTS);
+        expect(view.getUint32(1, true)).toBe(300);
+        expect(view.getUint8(5)).toBe(2);
+        expect(view.getFloat32(6, true)).toBe(1);
+        expect(view.getFloat32(22, true)).toBe(5.5);
+        expect(view.getFloat32(26, true)).toBe(6);
+        expect(view.getFloat32(30, true)).toBe(0);
+        Atomics.store(new Int32Array(mem.buffer, SLOT_BYTES, 1), 0, 2);
+        expect(ring.hullCommit(300, 8)).toBe(true);
+        expect(view.getUint8(0)).toBe(TAG_HULL_COMMIT);
+        expect(view.getUint32(1, true)).toBe(300);
+        expect(view.getUint8(5)).toBe(8);
+    });
+
+    it('hullVerts rejects empty and oversized chunks and reports a full ring', () => {
+        const { ring } = makeRing(1);
+        expect(() => ring.hullVerts(0, [])).toThrow(RangeError);
+        expect(() => ring.hullVerts(0, new Array(15).fill(0))).toThrow(RangeError);
+        expect(() => ring.hullVerts(0, [1, 2])).toThrow(RangeError);
+        expect(ring.hullCommit(0, 4)).toBe(true);
+        expect(ring.hullVerts(0, [1, 2, 3])).toBe(false);
+        expect(ring.hullCommit(0, 4)).toBe(false);
+    });
+
+    it('spawn carries the hull id at bytes 60 to 63', () => {
+        const { mem, ring } = makeRing();
+        ring.spawn({ id: 0, gen: 0, x: 0, y: 0, z: 0, qx: 0, qy: 0, qz: 0, qw: 1, shape: SHAPE_HULL, hull: 513 });
+        const view = new DataView(mem.buffer);
+        expect(view.getUint8(34)).toBe(SHAPE_HULL);
+        expect(view.getUint32(60, true)).toBe(513);
+    });
+
+    it('a full 4-vertex chunk fills bytes 6 to 53 in order', () => {
+        const { mem, ring } = makeRing();
+        ring.hullVerts(1, Array.from({ length: 12 }, (_, i) => i + 1));
+        const view = new DataView(mem.buffer);
+        for (let i = 0; i < 12; i++) expect(view.getFloat32(6 + i * 4, true)).toBe(i + 1);
+        expect(view.getFloat32(54, true)).toBe(0);
+        expect(view.getUint8(5)).toBe(4);
     });
 });

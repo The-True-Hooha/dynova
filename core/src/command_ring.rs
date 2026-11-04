@@ -1,3 +1,5 @@
+use crate::collision::V3;
+use crate::hull::MAX_HULL_COORD;
 use crate::physics::BodyDesc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use wasm_bindgen::prelude::*;
@@ -8,6 +10,9 @@ pub const TAG_DESTROY: u8 = 1;
 pub const TAG_FORCE: u8   = 2;
 pub const TAG_GROW: u8    = 3;
 pub const TAG_GRAVITY: u8 = 4;
+pub const TAG_HULL_VERTS: u8 = 5;
+pub const TAG_HULL_COMMIT: u8 = 6;
+pub const HULL_VERTS_PER_SLOT: usize = 4;
 /// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
 pub const MAX_CAPACITY: u32 = 1 << 18;
 pub const MAX_GRAVITY: f32 = 1000.0;
@@ -23,6 +28,7 @@ const OFF_HALF: usize       = 36;
 const OFF_INV_MASS: usize   = 48;
 const OFF_RESTITUTION: usize = 52;
 const OFF_FRICTION: usize = 56;
+const OFF_HULL: usize = 60;
 
 #[repr(C, align(4))]
 struct Slot([u8; SLOT_BYTES]);
@@ -34,6 +40,8 @@ pub enum Command {
     Force   { id: u32, generation: u8, x: f32, y: f32, z: f32 },
     Grow    { capacity: u32 },
     Gravity { x: f32, y: f32, z: f32 },
+    HullVerts { hull: u32, count: u8, verts: [V3; HULL_VERTS_PER_SLOT] },
+    HullCommit { hull: u32, count: u8 },
 }
 
 impl Command {
@@ -42,7 +50,7 @@ impl Command {
             Command::Spawn   { id, generation, .. }
             | Command::Destroy { id, generation }
             | Command::Force   { id, generation, .. } => Some((*id, *generation)),
-            Command::Grow { .. } | Command::Gravity { .. } => None,
+            Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } => None,
         }
     }
 }
@@ -168,8 +176,22 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             wr_f32(b, OFF_INV_MASS, body.inv_mass);
             wr_f32(b, OFF_RESTITUTION, body.restitution);
             wr_f32(b, OFF_FRICTION, body.friction);
+            b[OFF_HULL..OFF_HULL + 4].copy_from_slice(&body.hull.to_le_bytes());
         }
         Command::Destroy { .. } => b[0] = TAG_DESTROY,
+        Command::HullVerts { hull, count, verts } => {
+            b[0] = TAG_HULL_VERTS;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&hull.to_le_bytes());
+            b[OFF_GEN] = *count;
+            for (i, v) in verts.iter().enumerate() {
+                wr_f32x(b, OFF_POS + i * 12, v);
+            }
+        }
+        Command::HullCommit { hull, count } => {
+            b[0] = TAG_HULL_COMMIT;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&hull.to_le_bytes());
+            b[OFF_GEN] = *count;
+        }
         Command::Gravity { x, y, z } => {
             b[0] = TAG_GRAVITY;
             wr_f32x(b, OFF_POS, &[*x, *y, *z]);
@@ -200,6 +222,7 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
                 inv_mass: rd_f32(b, OFF_INV_MASS),
                 restitution: rd_f32(b, OFF_RESTITUTION),
                 friction: rd_f32(b, OFF_FRICTION),
+                hull: u32::from_le_bytes([b[OFF_HULL], b[OFF_HULL + 1], b[OFF_HULL + 2], b[OFF_HULL + 3]]),
             };
             if !body.is_valid() { return None; }
             let inv_len = body.rot.iter().map(|q| q * q).sum::<f32>().sqrt().recip();
@@ -207,6 +230,21 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
             Some(Command::Spawn { id, generation, body })
         }
         TAG_DESTROY => Some(Command::Destroy { id, generation }),
+        TAG_HULL_VERTS => {
+            let count = b[OFF_GEN];
+            if count == 0 || count as usize > HULL_VERTS_PER_SLOT {
+                return None;
+            }
+            let mut verts = [[0.0f32; 3]; HULL_VERTS_PER_SLOT];
+            for (i, v) in verts.iter_mut().enumerate().take(count as usize) {
+                *v = rd_f32x(b, OFF_POS + i * 12);
+                if !all_finite(v) || v.iter().any(|f| f.abs() > MAX_HULL_COORD) {
+                    return None;
+                }
+            }
+            Some(Command::HullVerts { hull: id, count, verts })
+        }
+        TAG_HULL_COMMIT => Some(Command::HullCommit { hull: id, count: b[OFF_GEN] }),
         TAG_GRAVITY => {
             let v: [f32; 3] = rd_f32x(b, OFF_POS);
             (all_finite(&v) && v.iter().all(|f| f.abs() <= MAX_GRAVITY)).then_some(Command::Gravity { x: v[0], y: v[1], z: v[2] })
@@ -238,6 +276,7 @@ mod tests {
             inv_mass: 1.0,
             restitution: 0.3,
             friction: 0.5,
+            hull: 0,
         }
     }
 
@@ -285,6 +324,7 @@ mod tests {
             inv_mass: 2.0,
             restitution: 0.5,
             friction: 0.5,
+            hull: 0,
         });
         encode_slot(&cmd, &mut b);
         let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
@@ -518,5 +558,42 @@ mod tests {
         let per_entity = 5 * 7 * 4 + 30 * 4 + 64;
         assert!((MAX_CAPACITY as u64) * per_entity < (1u64 << 30) / 2, "MAX_CAPACITY {MAX_CAPACITY} too large");
         assert_eq!(MAX_CAPACITY, 1 << 18, "changing the cap needs a new memory budget");
+    }
+
+    #[test]
+    fn hull_commands_round_trip() {
+        let mut ring = CommandRing::new(8);
+        let v = Command::HullVerts { hull: 7, count: 4, verts: [[1.0, 2.0, 3.0], [-1.0, 0.5, 0.0], [0.0, 0.0, 9.0], [4.0, -5.0, 6.5]] };
+        let c = Command::HullCommit { hull: 7, count: 3 };
+        ring.push(&v);
+        ring.push(&c);
+        let mut out = Vec::new();
+        ring.drain_commands(8, &mut out);
+        assert_eq!(out, vec![v, c]);
+    }
+
+    #[test]
+    fn hull_verts_with_bad_count_or_values_are_malformed() {
+        let mut ring = CommandRing::new(16);
+        let good = [[1.0, 1.0, 1.0]; 4];
+        ring.push(&Command::HullVerts { hull: 0, count: 0, verts: good });
+        ring.push(&Command::HullVerts { hull: 0, count: 5, verts: good });
+        ring.push(&Command::HullVerts { hull: 0, count: 2, verts: [[f32::NAN, 0.0, 0.0], [0.0; 3], [0.0; 3], [0.0; 3]] });
+        ring.push(&Command::HullVerts { hull: 0, count: 1, verts: [[1.0e9, 0.0, 0.0], [0.0; 3], [0.0; 3], [0.0; 3]] });
+        let mut out = Vec::new();
+        ring.drain_commands(16, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(ring.malformed_dropped(), 4);
+    }
+
+    #[test]
+    fn spawn_carries_a_hull_id_in_bytes_60_to_63() {
+        let mut ring = CommandRing::new(2);
+        let cmd = spawn(0, 0, BodyDesc { hull: 513, shape: crate::physics::SHAPE_HULL, ..body(0.0, 0.0, 0.0) });
+        ring.push(&cmd);
+        let mut raw = [0u8; SLOT_BYTES];
+        encode_slot(&cmd, &mut raw);
+        assert_eq!(&raw[60..64], &513u32.to_le_bytes());
+        assert_eq!(drain(&mut ring, &[0]), vec![cmd]);
     }
 }

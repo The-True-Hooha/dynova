@@ -1,5 +1,7 @@
+use crate::collision::V3;
 use crate::command_ring::{Command, CommandRing};
-use crate::physics::{BodyDesc, PhysicsWorld};
+use crate::hull::{HullData, MAX_HULL_VERTS};
+use crate::physics::{BodyDesc, PhysicsWorld, SHAPE_HULL};
 use crate::transform_buffers::{Transform, TransformBuffers, INITIAL_STATE};
 use std::sync::atomic::{AtomicU32, Ordering};
 use wasm_bindgen::prelude::*;
@@ -29,6 +31,7 @@ pub struct Runtime {
     pub(crate) ring: CommandRing,
     generations: Vec<u8>,
     live: Vec<bool>,
+    hull_staging: Option<(u32, Vec<V3>)>,
     bucket_view: Vec<AtomicU32>,
     id_counter: AtomicU32,
     commands: Vec<Command>,
@@ -46,6 +49,7 @@ impl Runtime {
             ring: CommandRing::new(ring_capacity),
             generations: vec![0u8; capacity as usize],
             live: vec![false; capacity as usize],
+            hull_staging: None,
             bucket_view: Vec::new(),
             id_counter: AtomicU32::new(0),
             commands: Vec::new(),
@@ -122,6 +126,17 @@ impl Runtime {
                 }
                 continue;
             }
+            match cmd {
+                Command::HullVerts { hull, count, verts } => {
+                    self.stage_hull_verts(hull, &verts[..count as usize]);
+                    continue;
+                }
+                Command::HullCommit { hull, count } => {
+                    self.commit_hull(hull, count);
+                    continue;
+                }
+                _ => {}
+            }
             if let Command::Gravity { x, y, z } = cmd {
                 self.physics.gx = x;
                 self.physics.gy = y;
@@ -134,9 +149,9 @@ impl Runtime {
                 continue;
             }
             match cmd {
-                Command::Grow { .. } | Command::Gravity { .. } => {}
+                Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } => {}
                 Command::Spawn { body, .. } => {
-                    if self.live[id as usize] {
+                    if self.live[id as usize] || (body.shape == SHAPE_HULL && self.physics.hull(body.hull).is_none()) {
                         self.ring.note_malformed();
                         continue;
                     }
@@ -277,8 +292,40 @@ impl Runtime {
         true
     }
 
+    fn stage_hull_verts(&mut self, hull: u32, verts: &[V3]) {
+        let mut staged = match self.hull_staging.take() {
+            Some((id, v)) if id == hull => v,
+            Some(_) => {
+                self.ring.note_malformed();
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        if staged.len() + verts.len() > MAX_HULL_VERTS {
+            self.ring.note_malformed();
+            return;
+        }
+        staged.extend_from_slice(verts);
+        self.hull_staging = Some((hull, staged));
+    }
+
+    fn commit_hull(&mut self, hull: u32, count: u8) {
+        let staged = self.hull_staging.take();
+        let points = match staged {
+            Some((id, points)) if id == hull && points.len() == count as usize && self.physics.hull(hull).is_none() => points,
+            _ => {
+                self.ring.note_malformed();
+                return;
+            }
+        };
+        let registered = HullData::build(&points).is_ok_and(|data| self.physics.register_hull(hull, data));
+        if !registered {
+            self.ring.note_malformed();
+        }
+    }
+
     fn spawn_direct(&mut self, id: u32, body: &BodyDesc) -> bool {
-        if id as usize >= self.generations.len() || !body.is_valid() {
+        if id as usize >= self.generations.len() || !body.is_valid() || (body.shape == SHAPE_HULL && self.physics.hull(body.hull).is_none()) {
             self.ring.note_malformed();
             return false;
         }
@@ -766,6 +813,216 @@ mod tests {
         assert!(header(&rt, H_CONTACTS) >= 1);
         assert_eq!(header(&rt, H_DROPPED_CONTACTS), 0);
         assert_eq!(header(&rt, H_OVERRUNS), 0);
+    }
+
+    fn upload_hull(rt: &mut Runtime, hull: u32, pts: &[[f32; 3]]) {
+        for chunk in pts.chunks(4) {
+            let mut verts = [[0.0; 3]; 4];
+            verts[..chunk.len()].copy_from_slice(chunk);
+            rt.ring.push(&Command::HullVerts { hull, count: chunk.len() as u8, verts });
+        }
+        rt.ring.push(&Command::HullCommit { hull, count: pts.len() as u8 });
+    }
+
+    fn cube(h: f32) -> Vec<[f32; 3]> {
+        let mut p = Vec::new();
+        for x in [-h, h] { for y in [-h, h] { for z in [-h, h] { p.push([x, y, z]); } } }
+        p
+    }
+
+    fn hull_spawn(id: u32, hull: u32, y: f32) -> Command {
+        spawn_cmd(id, 0, BodyDesc::hull_at([0.0, y, 0.0], hull, 1.0, 0.0))
+    }
+
+    fn floor() -> Command {
+        spawn_cmd(0, 0, BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.0))
+    }
+
+    #[test]
+    fn hull_uploaded_in_chunks_registers_and_a_hull_body_rests_on_a_box_floor() {
+        let mut rt = Runtime::new(4, 64);
+        rt.enable_physics();
+        upload_hull(&mut rt, 3, &cube(0.5));
+        rt.ring.push(&floor());
+        rt.ring.push(&hull_spawn(1, 3, 2.0));
+        for _ in 0..300 { rt.step(); }
+        assert_eq!(rt.malformed_dropped(), 0);
+        assert!(rt.physics.hull(3).is_some());
+        let y = entity(&rt, 1)[1];
+        assert!((y - 0.5).abs() < 0.03, "hull cube rests at {y}");
+        assert_eq!(rt.sleeping_count(), 1);
+    }
+
+    #[test]
+    fn hull_cube_and_box_behave_the_same_when_dropped_on_the_same_floor() {
+        let rest = |hull: bool| {
+            let mut rt = Runtime::new(4, 64);
+            rt.enable_physics();
+            upload_hull(&mut rt, 0, &cube(0.5));
+            rt.ring.push(&floor());
+            rt.ring.push(&if hull { hull_spawn(1, 0, 3.0) } else { spawn_cmd(1, 0, BodyDesc::box_at([0.0, 3.0, 0.0], [0.5; 3], 1.0, 0.0)) });
+            for _ in 0..240 { rt.step(); }
+            entity(&rt, 1)[1]
+        };
+        assert!((rest(true) - rest(false)).abs() < 0.02, "{} vs {}", rest(true), rest(false));
+    }
+
+    #[test]
+    fn tetrahedron_settles_on_a_face_and_sleeps() {
+        let mut rt = Runtime::new(4, 64);
+        rt.enable_physics();
+        upload_hull(&mut rt, 1, &[[1.0, 1.0, 1.0], [1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [-1.0, -1.0, 1.0]]);
+        rt.ring.push(&floor());
+        rt.ring.push(&hull_spawn(1, 1, 3.0));
+        for _ in 0..900 { rt.step(); }
+        assert!(entity(&rt, 1)[1] > 0.4 && entity(&rt, 1)[1] < 1.2, "{:?}", entity(&rt, 1));
+        assert!(entity(&rt, 1).iter().all(|v| v.is_finite()));
+        assert_eq!(rt.sleeping_count(), 1);
+    }
+
+    #[test]
+    fn pyramid_of_hull_cubes_stays_upright_and_falls_asleep() {
+        let mut rt = Runtime::new(16, 256);
+        rt.enable_physics();
+        upload_hull(&mut rt, 0, &cube(0.5));
+        rt.ring.push(&floor());
+        let mut id = 1;
+        for r in 0..4 {
+            for c in 0..(4 - r) {
+                let x = (c as f32 - (3 - r) as f32 / 2.0) * 1.0;
+                rt.ring.push(&spawn_cmd(id, 0, BodyDesc::hull_at([x, 0.5 + r as f32, 0.0], 0, 1.0, 0.0)));
+                id += 1;
+            }
+        }
+        for _ in 0..900 { rt.step(); }
+        assert_eq!(rt.malformed_dropped(), 0);
+        assert_eq!(rt.sleeping_count(), 10);
+        let top = entity(&rt, 10);
+        assert!(top[1] > 3.3 && top[1] < 3.6 && top[0].abs() < 0.1 && top[2].abs() < 0.1, "{top:?}");
+    }
+
+    #[test]
+    fn spheres_and_capsules_collide_with_hull_bodies() {
+        let mut rt = Runtime::new(6, 64);
+        rt.enable_physics();
+        upload_hull(&mut rt, 0, &cube(1.0));
+        rt.ring.push(&floor());
+        rt.ring.push(&spawn_cmd(1, 0, BodyDesc::hull_at([0.0, 1.0, 0.0], 0, 0.0, 0.0)));
+        rt.ring.push(&spawn_cmd(2, 0, BodyDesc::sphere_at([0.3, 4.0, 0.0], 0.4, 1.0, 0.0)));
+        rt.ring.push(&spawn_cmd(3, 0, BodyDesc::capsule_at([-0.3, 6.0, 0.2], 0.3, 0.5, 1.0, 0.0)));
+        for _ in 0..600 { rt.step(); }
+        assert_eq!(rt.malformed_dropped(), 0);
+        assert!(entity(&rt, 2)[1] > 2.3, "sphere fell through the hull: {:?}", entity(&rt, 2));
+        assert!(entity(&rt, 3)[1] > 2.2, "capsule fell through the hull: {:?}", entity(&rt, 3));
+    }
+
+    #[test]
+    fn hostile_hull_uploads_are_counted_and_never_panic() {
+        let mut rt = Runtime::new(4, 128);
+        rt.enable_physics();
+        let flat = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
+        upload_hull(&mut rt, 0, &flat);
+        rt.ring.push(&Command::HullCommit { hull: 5, count: 4 });
+        upload_hull(&mut rt, 1, &cube(0.5));
+        upload_hull(&mut rt, 1, &cube(0.5));
+        upload_hull(&mut rt, 5000, &cube(0.5));
+        for k in 0..9 {
+            rt.ring.push(&Command::HullVerts { hull: 7, count: 4, verts: [[k as f32, 0.0, 0.0]; 4] });
+        }
+        rt.ring.push(&Command::HullCommit { hull: 7, count: 36 });
+        rt.ring.push(&Command::HullVerts { hull: 8, count: 2, verts: [[0.0; 3]; 4] });
+        rt.ring.push(&Command::HullVerts { hull: 9, count: 2, verts: [[0.0; 3]; 4] });
+        rt.ring.push(&Command::HullCommit { hull: 8, count: 2 });
+        rt.step();
+        assert!(rt.physics.hull(0).is_none(), "coplanar hull accepted");
+        assert!(rt.physics.hull(1).is_some());
+        assert!(rt.physics.hull(5000).is_none());
+        assert!(rt.physics.hull(7).is_none());
+        assert_eq!(rt.malformed_dropped(), 8);
+    }
+
+    #[test]
+    fn spawning_with_an_unknown_hull_is_rejected_without_activating_a_body() {
+        let mut rt = Runtime::new(2, 8);
+        rt.enable_physics();
+        rt.ring.push(&hull_spawn(0, 4, 1.0));
+        rt.step();
+        assert_eq!(rt.malformed_dropped(), 1);
+        assert!(!rt.physics.active[0]);
+        assert!(!rt.spawn_direct(1, &BodyDesc::hull_at([0.0; 3], 4, 1.0, 0.0)));
+    }
+
+    #[test]
+    fn hull_ids_are_immutable_and_independent_of_entity_ids() {
+        let mut rt = Runtime::new(4, 64);
+        rt.enable_physics();
+        upload_hull(&mut rt, 2, &cube(0.5));
+        upload_hull(&mut rt, 2, &cube(2.0));
+        rt.step();
+        assert!((rt.physics.hull(2).unwrap().half[0] - 0.5).abs() < 1e-3);
+        assert_eq!(rt.malformed_dropped(), 1);
+    }
+
+    #[test]
+    fn hull_scene_is_deterministic() {
+        let run = || {
+            let mut rt = Runtime::new(8, 128);
+            rt.enable_physics();
+            upload_hull(&mut rt, 0, &cube(0.5));
+            upload_hull(&mut rt, 1, &[[1.0, 1.0, 1.0], [1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [-1.0, -1.0, 1.0]]);
+            rt.ring.push(&floor());
+            for k in 0..5u32 {
+                rt.ring.push(&spawn_cmd(1 + k, 0, BodyDesc::hull_at([0.2 * k as f32, 1.0 + 1.3 * k as f32, 0.0], k % 2, 1.0, 0.1)));
+            }
+            for _ in 0..400 { rt.step(); }
+            read_buf(&rt).iter().map(|f| f.to_bits()).collect::<Vec<_>>()
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn commit_with_a_wrong_vertex_count_or_a_dropped_chunk_registers_nothing() {
+        let mut rt = Runtime::new(2, 64);
+        let pts = [[1.0, 1.0, 1.0], [1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [-1.0, -1.0, 1.0]];
+        rt.ring.push(&Command::HullVerts { hull: 0, count: 4, verts: pts });
+        rt.ring.push(&Command::HullVerts { hull: 0, count: 4, verts: [[f32::NAN, 0.0, 0.0], pts[1], pts[2], pts[3]] });
+        rt.ring.push(&Command::HullCommit { hull: 0, count: 8 });
+        rt.ring.push(&Command::HullVerts { hull: 1, count: 4, verts: pts });
+        rt.ring.push(&Command::HullCommit { hull: 1, count: 3 });
+        rt.step();
+        assert!(rt.physics.hull(0).is_none() && rt.physics.hull(1).is_none());
+        assert_eq!(rt.malformed_dropped(), 3);
+    }
+
+    #[test]
+    fn dynamic_hull_resting_on_static_spheres_and_capsules_is_pushed_out_not_in() {
+        let mut rt = Runtime::new(6, 64);
+        rt.enable_physics();
+        upload_hull(&mut rt, 0, &cube(0.5));
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::hull_at([0.0, 4.0, 0.0], 0, 1.0, 0.0)));
+        rt.ring.push(&spawn_cmd(1, 0, BodyDesc::sphere_at([0.0, 0.0, 0.0], 3.0, 0.0, 0.0)));
+        let mut lying = BodyDesc::capsule_at([20.0, 0.0, 0.0], 1.0, 4.0, 0.0, 0.0);
+        let h = std::f32::consts::FRAC_PI_4;
+        lying.rot = [0.0, 0.0, h.sin(), h.cos()];
+        rt.ring.push(&spawn_cmd(2, 0, lying));
+        rt.ring.push(&spawn_cmd(3, 0, BodyDesc::hull_at([20.0, 3.0, 0.0], 0, 1.0, 0.0)));
+        for _ in 0..40 { rt.step(); }
+        assert_eq!(rt.malformed_dropped(), 0);
+        assert!(entity(&rt, 0)[1] > 3.4, "hull sank into the static sphere: {:?}", entity(&rt, 0));
+        assert!(entity(&rt, 3)[1] > 1.4, "hull sank into the static capsule: {:?}", entity(&rt, 3));
+    }
+
+    #[test]
+    fn hull_spawn_takes_its_extent_and_radius_from_the_hull_not_the_request() {
+        let mut rt = Runtime::new(2, 32);
+        rt.enable_physics();
+        upload_hull(&mut rt, 0, &cube(2.0));
+        rt.ring.push(&hull_spawn(0, 0, 5.0));
+        rt.step();
+        let p = &rt.physics;
+        assert!((p.half_x[0] - 2.0).abs() < 1e-3 && (p.radius[0] - 12.0f32.sqrt()).abs() < 1e-3, "{} {}", p.half_x[0], p.radius[0]);
+        assert_eq!(p.hull_of[0], 0);
+        assert!(p.inv_inertia[0] > 0.0 && p.inv_inertia[0].is_finite());
     }
 
     #[test]

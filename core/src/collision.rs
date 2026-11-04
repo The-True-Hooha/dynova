@@ -15,7 +15,7 @@ pub struct Manifold {
 }
 
 impl Manifold {
-    fn one(n: V3, point: V3, depth: f32) -> Self {
+    pub(crate) fn one(n: V3, point: V3, depth: f32) -> Self {
         let mut pts = [([0.0; 3], 0.0); MAX_POINTS];
         pts[0] = (point, depth);
         Self { n, pts, len: 1 }
@@ -114,7 +114,7 @@ fn closest_on_segment(p: V3, a: V3, b: V3) -> V3 {
     add(a, scale(ab, t))
 }
 
-fn closest_segment_segment(p1: V3, q1: V3, p2: V3, q2: V3) -> (V3, V3) {
+pub(crate) fn closest_segment_segment(p1: V3, q1: V3, p2: V3, q2: V3) -> (V3, V3) {
     let d1 = sub(q1, p1);
     let d2 = sub(q2, p2);
     let r = sub(p1, p2);
@@ -203,7 +203,7 @@ pub fn capsule_box(pc: V3, qc: Quat, half_len: f32, rc: f32, pb: V3, hb: V3, qb:
     Some(out)
 }
 
-fn clip_polygon(poly: &[V3], plane_n: V3, plane_d: f32) -> Vec<V3> {
+pub(crate) fn clip_polygon(poly: &[V3], plane_n: V3, plane_d: f32) -> Vec<V3> {
     let mut out = Vec::with_capacity(poly.len() + 2);
     for i in 0..poly.len() {
         let cur = poly[i];
@@ -271,7 +271,7 @@ fn face_contacts(reference: &Obb, ref_idx: usize, outward: V3, incident: &Obb) -
         .collect()
 }
 
-fn reduce(mut pts: Vec<(V3, f32)>, n: V3) -> Vec<(V3, f32)> {
+pub(crate) fn reduce(mut pts: Vec<(V3, f32)>, n: V3) -> Vec<(V3, f32)> {
     if pts.len() <= MAX_POINTS {
         return pts;
     }
