@@ -515,7 +515,6 @@ mod tests {
 
     #[test]
     fn max_capacity_keeps_a_full_grow_inside_the_one_gib_wasm_limit() {
-        // per entity: 3 transform buffers + 2 retained generations (7 f32 each) + ~30 physics columns + bookkeeping
         let per_entity = 5 * 7 * 4 + 30 * 4 + 64;
         assert!((MAX_CAPACITY as u64) * per_entity < (1u64 << 30) / 2, "MAX_CAPACITY {MAX_CAPACITY} too large");
         assert_eq!(MAX_CAPACITY, 1 << 18, "changing the cap needs a new memory budget");

@@ -285,7 +285,6 @@ impl PhysicsWorld {
             self.ang_z[i] *= ANG_DAMP;
         }
 
-        // sleeping bodies treated as fixed (inv_mass=0) during solve
         let mut eff_mass = self.inv_mass.clone();
         let mut eff_inertia = self.inv_inertia.clone();
         for i in 0..cap {
@@ -295,7 +294,6 @@ impl PhysicsWorld {
             }
         }
 
-        // Per-contact target normal velocity: penetration recovery bias, or a bounce on a hard impact.
         self.targets.clear();
         self.pen_targets.clear();
         for c in &self.contacts {
@@ -326,7 +324,6 @@ impl PhysicsWorld {
         // Alternate sweep direction so the sequential solve does not bias one side of a manifold.
         for iter in 0..SOLVER_ITERS as usize {
             let count = self.contacts.len();
-            // deterministic pseudo-random sweep order (multiplicative stride coprime to count)
             let stride = { let mut st = 1 + (iter * 2 + 1) * 7 % count.max(2); while gcd(st, count.max(1)) != 1 { st += 1; } st };
             for k in 0..count {
                 let ci = (k * stride + iter) % count;
@@ -359,7 +356,6 @@ impl PhysicsWorld {
             }
         }
 
-        // clamp micro-residuals on bodies resting against static/sleeping supports
         for ci in 0..self.contacts.len() {
             // A deeply embedded body needs its recovery velocity; only settle shallow resting contacts.
             if self.contacts[ci].depth > 2.0 * SLOP { continue; }
@@ -479,8 +475,6 @@ impl PhysicsWorld {
         }
     }
 
-    /// Earliest hit of body `i` (as a swept sphere) moving by `d` against static boxes and spheres.
-    /// Returns the safe fraction of the move and the surface normal pointing away from the static.
     fn sweep_statics(&self, i: usize, d: [f32; 3]) -> Option<(f32, [f32; 3])> {
         let len = geo::dot(d, d).sqrt();
         let r = self.core_radius(i);
@@ -551,8 +545,6 @@ impl PhysicsWorld {
         x
     }
 
-    /// Put to sleep every island (bodies connected through dynamic contacts) whose awake members have all been
-    /// quiet long enough. Uses the contacts of the previous step.
     fn sleep_quiet_islands(&mut self) {
         let cap = self.capacity;
         for (i, p) in self.uf_parent.iter_mut().enumerate().take(cap) {
@@ -577,7 +569,6 @@ impl PhysicsWorld {
             if !self.active[i] || self.inv_mass[i] == 0.0 || self.sleeping[i] { continue; }
             let root = Self::find(&mut self.uf_parent, i as u32) as usize;
             if self.island_ok[root] == 2 {
-                // members share one id so the whole island wakes together
                 self.island_of[i] = root as u32 + 1;
             }
         }
@@ -595,7 +586,6 @@ impl PhysicsWorld {
         }
     }
 
-    /// Wake sleepers hit by a moving dynamic body; returns true if any woke so contacts can be regenerated.
     fn wake_disturbed_sleepers(&mut self) -> bool {
         let mut islands: Vec<u32> = Vec::new();
         for ci in 0..self.contacts.len() {
@@ -615,7 +605,6 @@ impl PhysicsWorld {
         true
     }
 
-    /// Wake a body and every sleeper that shares its island, so none is left frozen in mid-air.
     fn wake(&mut self, id: usize) {
         let island = self.island_of[id];
         self.sleeping[id] = false;
@@ -704,7 +693,6 @@ fn tangents(n: Dir) -> (Dir, Dir) {
     (t1, t2)
 }
 
-/// Apply `amount` of impulse along `dir` to `a` and the opposite to `b`, at the contact point.
 fn apply_at(c: &Contact, dir: Dir, amount: f32, inv_mass: &[f32], m: &mut Motion, inv_i: &[f32]) {
     let Motion { vx, vy, vz, ax, ay, az } = m;
     let (a, b) = (c.a as usize, c.b as usize);
@@ -747,7 +735,6 @@ fn solve_contact(c: &mut Contact, target: f32, inv_mass: &[f32], m: &mut Motion,
     let n = (c.nx, c.ny, c.nz);
     let (t1, t2) = tangents(n);
 
-    // Friction first, bounded by the normal impulse accumulated so far (Coulomb pyramid).
     let limit = c.mu * c.lambda;
     for (t, which) in [(t1, 0), (t2, 1)] {
         let denom = effective_mass_inv(c, t, inv_mass, inv_i);
@@ -799,7 +786,6 @@ fn collide(a: usize, b: usize, w: &PhysicsWorld) -> Option<Manifold> {
     }
 }
 
-/// Largest distance from the body centre to any point of its shape; sizes grid cells.
 fn extent(w: &PhysicsWorld, i: usize) -> f32 {
     match w.shape[i] {
         SHAPE_CAPSULE => w.half_y[i] + w.radius[i],

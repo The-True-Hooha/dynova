@@ -37,7 +37,6 @@ export class TransformView {
     get epoch(): number { return this._epoch; }
     get capacity(): number { return this._capacity; }
 
-    /** Runtime health published each step; readable by a separate inspector with no wasm call. */
     stats(): { ringPending: number; droppedContacts: number; workerOverruns: number; contacts: number } {
         return {
             ringPending: Atomics.load(this.header, H_RING_PENDING) >>> 0,
@@ -47,12 +46,10 @@ export class TransformView {
         };
     }
 
-    /** Broadphase bucket occupancy, read straight from shared memory. */
     bucketCounts(): Uint32Array {
         return new Uint32Array(this.memory.buffer, Atomics.load(this.header, H_BUCKETS), Atomics.load(this.header, H_BUCKET_LEN));
     }
 
-    /** Runtime counters published by the worker each step. */
     counters(): { ticks: number; staleDropped: number; malformedDropped: number } {
         return {
             ticks: Atomics.load(this.header, H_TICKS) >>> 0,
@@ -67,7 +64,6 @@ export class TransformView {
      */
     peekEpoch(): number { return Atomics.load(this.header, H_EPOCH); }
 
-    /** Rebuild every view from the shared header. Retries if the writer grows again mid-read. */
     reacquire(): void {
         for (let spins = 0; ; spins++) {
             if (spins > MAX_SPINS) throw new Error('layout update stuck: the runtime never finished growing its buffers');

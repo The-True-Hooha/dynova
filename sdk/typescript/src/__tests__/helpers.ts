@@ -85,7 +85,6 @@ export class FakeRuntime {
         this.growCount++;
     }
 
-    /** Consume every command in the ring as the worker would. */
     drain() {
         const head = new Int32Array(this.memory.buffer, this.layout.ringHeadByteOffset, 1);
         const tail = new Int32Array(this.memory.buffer, this.layout.ringTailByteOffset, 1);

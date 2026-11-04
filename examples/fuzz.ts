@@ -4,7 +4,6 @@ const TARGET_TICKS = 10_000;
 const MAX_CAPACITY = 4096;
 const noRead = new URLSearchParams(location.search).has('noread');
 
-// Deterministic PRNG so a failing run can be replayed.
 let seed = Number(new URLSearchParams(location.search).get('seed') ?? 1) >>> 0;
 const rand = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32);
 

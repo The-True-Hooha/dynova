@@ -33,9 +33,7 @@ export interface LaunchOptions {
     autoRun?: boolean;
     initialPages?: number;
     maximumPages?: number;
-    /** Creates the simulation worker; called only when shared memory is available. */
     createWorker: () => Worker;
-    /** Builds a non-shared runtime on this thread; called only in fallback mode. */
     loadFallback: (config: WorldConfig) => Promise<FallbackLoad>;
 }
 

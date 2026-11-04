@@ -60,7 +60,6 @@ fn box_axes(q: Quat) -> [V3; 3] {
     [rotate(q, [1.0, 0.0, 0.0]), rotate(q, [0.0, 1.0, 0.0]), rotate(q, [0.0, 0.0, 1.0])]
 }
 
-/// Midpoint between the surfaces of two spheres; `n` from b to a.
 pub fn sphere_sphere(ca: V3, ra: f32, cb: V3, rb: f32) -> Option<Manifold> {
     let d = sub(cb, ca);
     let dist_sq = len_sq(d);
@@ -75,7 +74,6 @@ pub fn sphere_sphere(ca: V3, ra: f32, cb: V3, rb: f32) -> Option<Manifold> {
     Some(Manifold::one(neg(u), point, depth))
 }
 
-/// Sphere `a` against oriented box `b`; `n` from the box towards the sphere.
 pub fn sphere_box(cs: V3, r: f32, pb: V3, hb: V3, qb: Quat) -> Option<Manifold> {
     let local = inv_rotate(qb, sub(cs, pb));
     let inside = local[0].abs() <= hb[0] && local[1].abs() <= hb[1] && local[2].abs() <= hb[2];
@@ -206,7 +204,6 @@ pub fn capsule_box(pc: V3, qc: Quat, half_len: f32, rc: f32, pb: V3, hb: V3, qb:
 }
 
 fn clip_polygon(poly: &[V3], plane_n: V3, plane_d: f32) -> Vec<V3> {
-    // keep points with dot(p, n) <= d
     let mut out = Vec::with_capacity(poly.len() + 2);
     for i in 0..poly.len() {
         let cur = poly[i];
@@ -224,7 +221,6 @@ fn clip_polygon(poly: &[V3], plane_n: V3, plane_d: f32) -> Vec<V3> {
     out
 }
 
-/// Clip the incident face of one box against the side planes of the reference face of the other.
 struct Obb {
     pos: V3,
     axes: [V3; 3],
@@ -306,7 +302,6 @@ fn reduce(mut pts: Vec<(V3, f32)>, n: V3) -> Vec<(V3, f32)> {
     chosen
 }
 
-/// Oriented box vs oriented box by SAT, with a clipped contact manifold. `n` from b to a.
 pub fn box_box(pa: V3, ha: V3, qa: Quat, pb: V3, hb: V3, qb: Quat) -> Option<Manifold> {
     let aa = box_axes(qa);
     let ab = box_axes(qb);
@@ -467,7 +462,6 @@ mod tests {
 
     #[test]
     fn edge_on_edge_contact_is_a_single_point() {
-        // two boxes rotated 45 degrees about perpendicular axes meeting edge to edge
         let qa = about_z(std::f32::consts::FRAC_PI_4);
         let qb = [std::f32::consts::FRAC_1_SQRT_2 * 0.0, 0.0, 0.0, 1.0];
         let rot_x = {
@@ -482,7 +476,6 @@ mod tests {
 
     #[test]
     fn more_than_four_clipped_points_are_reduced_to_four_spread_points() {
-        // 45 degree offset gives an octagon overlap
         let q = about_y(std::f32::consts::FRAC_PI_4);
         let m = box_box([0.0, 0.95, 0.0], [0.5; 3], q, [0.0; 3], [0.5; 3], ID).unwrap();
         assert!(m.len <= MAX_POINTS && m.len >= 3, "len {}", m.len);
@@ -599,7 +592,6 @@ mod tests {
         assert_eq!(m.len, 1);
         assert!(close(m.n[1], 1.0), "{:?}", m.n);
         assert!((m.pts[0].1 - 0.02).abs() < 1.5e-3, "depth {}", m.pts[0].1);
-        // contact lies where the edges actually cross, not past their ends
         assert!(m.pts[0].0[0].abs() < 3.0 && m.pts[0].0[2].abs() < 3.0);
         let off = box_box([0.0, 2.0 * half - 0.02, 2.5], ha, qa, [0.0; 3], hb, qb).unwrap();
         assert!(off.pts[0].0[2] > 0.0 && off.pts[0].0[2] < 3.0, "{:?}", off.pts[0].0);

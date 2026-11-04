@@ -149,7 +149,6 @@ export class World {
         this.syncLayout();
     }
 
-    /** Re-acquire views after memory growth and apply capacity growth announced by the runtime. */
     syncLayout(): boolean {
         let changed = false;
         if (this.memory.buffer !== this.lastBuffer) {
@@ -181,7 +180,6 @@ export class World {
         }
     }
 
-    /** Alias kept for callers that only care about non-shared memory growth. */
     reacquireIfGrown(): boolean { return this.syncLayout(); }
 
     step(): void {
@@ -201,7 +199,6 @@ export class World {
         }
     }
 
-    /** Move deferred commands into the ring in order; returns how many remain deferred. */
     flush(): number {
         while (this.deferredHead < this.deferred.length) {
             if (!this.tryPush(this.deferred[this.deferredHead])) break;
@@ -289,17 +286,14 @@ export class World {
         return buf;
     }
 
-    /** Counters the runtime publishes into shared memory; no WASM call involved. */
     get runtimeCounters(): { ticks: number; staleDropped: number; malformedDropped: number } {
         return this.transforms.counters();
     }
 
-    /** Occupancy of each broadphase hash bucket; for the inspector. Valid until the layout is re-acquired. */
     bucketHistogram(): Uint32Array {
         return this.transforms.bucketCounts();
     }
 
-    /** Ring depth, dropped contacts, worker overruns and contact count, read from shared memory. */
     get runtimeStats(): { ringPending: number; droppedContacts: number; workerOverruns: number; contacts: number } {
         return this.transforms.stats();
     }
