@@ -52,6 +52,10 @@ impl CommandRing {
         self.tail.load(Ordering::Acquire).wrapping_sub(self.head.load(Ordering::Acquire))
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
+    }
+
     pub fn drain(&mut self, max: u32) -> u32 {
         let mut drained = 0u32;
         loop {
@@ -66,7 +70,7 @@ impl CommandRing {
 }
 
 impl CommandRing {
-    pub fn drain_commands(&mut self, generationerations: &[u8], max: u32) -> Vec<Command> {
+    pub fn drain_commands(&mut self, generations: &[u8], max: u32) -> Vec<Command> {
         let mut out = Vec::new();
         loop {
             let head = self.head.load(Ordering::Acquire);
@@ -81,7 +85,7 @@ impl CommandRing {
                         Command::Destroy { id, generation }     => (*id, *generation),
                         Command::Force   { id, generation, .. } => (*id, *generation),
                     };
-                    if id < generationerations.len() as u32 && generationerations[id as usize] == generation {
+                    if id < generations.len() as u32 && generations[id as usize] == generation {
                         out.push(cmd);
                     } else {
                         self.stale_dropped += 1;

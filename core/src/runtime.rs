@@ -1,7 +1,187 @@
 use crate::command_ring::{Command, CommandRing};
 use crate::physics::PhysicsWorld;
-use crate::transform_buffers::TransformBuffers;
+use crate::physics::BodyDesc;
+use crate::transform_buffers::{Transform, TransformBuffers};
 use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+pub struct Runtime {
+    pub(crate) transforms: TransformBuffers,
+    pub(crate) ring: CommandRing,
+    generations: Vec<u8>,
+    physics: PhysicsWorld,
+    physics_enabled: bool,
+}
+
+#[wasm_bindgen]
+impl Runtime {
+    #[wasm_bindgen(constructor)]
+    pub fn new(capacity: u32, ring_capacity: u32) -> Self {
+        Self {
+            transforms: TransformBuffers::new(capacity),
+            ring: CommandRing::new(ring_capacity),
+            generations: vec![0u8; capacity as usize],
+            physics: PhysicsWorld::new(capacity as usize),
+            physics_enabled: false,
+        }
+    }
+
+    pub fn transforms_buf_a_ptr(&self) -> *const f32 {
+        self.transforms.buf_a_ptr()
+    }
+    pub fn transforms_buf_b_ptr(&self) -> *const f32 {
+        self.transforms.buf_b_ptr()
+    }
+    pub fn transforms_write_index_ptr(&self) -> *const u32 {
+        self.transforms.write_index_ptr()
+    }
+    pub fn transforms_capacity(&self) -> u32 {
+        self.transforms.capacity()
+    }
+
+    pub fn ring_slots_ptr(&self) -> *const u8 {
+        self.ring.slots_ptr()
+    }
+    pub fn ring_head_ptr(&self) -> *const u32 {
+        self.ring.head_ptr()
+    }
+    pub fn ring_tail_ptr(&self) -> *const u32 {
+        self.ring.tail_ptr()
+    }
+    pub fn ring_capacity(&self) -> u32 {
+        self.ring.capacity()
+    }
+    pub fn stale_dropped(&self) -> u32 {
+        self.ring.stale_dropped()
+    }
+
+    pub fn generations_ptr(&self) -> *const u8 {
+        self.generations.as_ptr()
+    }
+
+    pub fn enable_physics(&mut self) {
+        self.physics_enabled = true;
+    }
+
+    pub fn contact_count(&self) -> u32 {
+        self.physics.contacts.len() as u32
+    }
+
+    pub fn set_gravity(&mut self, x: f32, y: f32, z: f32) {
+        self.physics.gx = x;
+        self.physics.gy = y;
+        self.physics.gz = z;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_box(
+        &mut self,
+        id: u32,
+        x: f32,
+        y: f32,
+        z: f32,
+        hx: f32,
+        hy: f32,
+        hz: f32,
+        inv_mass: f32,
+        restitution: f32,
+    ) {
+        let id = id as usize;
+        self.physics.spawn(
+            id,
+            &BodyDesc { pos: [x, y, z], half: [hx, hy, hz], inv_mass, restitution },
+        );
+        self.transforms.write_transform(id as u32, Transform::at(x, y, z));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_sphere(
+        &mut self,
+        id: u32,
+        x: f32,
+        y: f32,
+        z: f32,
+        radius: f32,
+        inv_mass: f32,
+        restitution: f32,
+    ) {
+        let id = id as usize;
+        self.physics.spawn_sphere(id, [x, y, z], radius, inv_mass, restitution);
+        self.transforms.write_transform(id as u32, Transform::at(x, y, z));
+    }
+
+    pub fn bucket_counts_ptr(&self) -> *const u32 {
+        self.physics.bucket_counts.as_ptr()
+    }
+
+    pub fn sleeping_count(&self) -> u32 {
+        self.physics.sleeping.iter().filter(|&&s| s).count() as u32
+    }
+
+    pub fn step(&mut self) {
+        let commands = self.ring.drain_commands(&self.generations, 4096);
+        for cmd in commands {
+            match cmd {
+                Command::Spawn {
+                    id,
+                    generation,
+                    x,
+                    y,
+                    z,
+                    qx,
+                    qy,
+                    qz,
+                    qw,
+                } => {
+                    self.generations[id as usize] = generation;
+                    self.transforms.write_transform(id, Transform { x, y, z, qx, qy, qz, qw });
+                    if self.physics_enabled {
+                        self.physics.spawn(
+                            id as usize,
+                            &BodyDesc { pos: [x, y, z], half: [0.5; 3], inv_mass: 1.0, restitution: 0.3 },
+                        );
+                    }
+                }
+                Command::Destroy { id, generation } => {
+                    self.generations[id as usize] = generation.wrapping_add(1);
+                    if self.physics_enabled {
+                        self.physics.deactivate(id as usize);
+                    }
+                }
+                Command::Force {
+                    id,
+                    generation,
+                    x,
+                    y,
+                    z,
+                } => {
+                    if self.physics_enabled
+                        && (id as usize) < self.generations.len()
+                        && self.generations[id as usize] == generation
+                    {
+                        self.physics.apply_impulse(id as usize, x, y, z);
+                    }
+                }
+            }
+        }
+
+        if self.physics_enabled {
+            self.physics.step();
+            // Write physics positions back to transform buffers
+            for i in 0..self.physics.capacity {
+                if !self.physics.active[i] {
+                    continue;
+                }
+                self.transforms.write_transform(
+                    i as u32,
+                    Transform::at(self.physics.pos_x[i], self.physics.pos_y[i], self.physics.pos_z[i]),
+                );
+            }
+        }
+
+        self.transforms.swap();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -72,186 +252,20 @@ mod tests {
 
         assert_eq!(rt.ring.stale_dropped(), 1);
     }
-}
 
-#[wasm_bindgen]
-pub struct Runtime {
-    pub(crate) transforms: TransformBuffers,
-    pub(crate) ring: CommandRing,
-    generationerations: Vec<u8>,
-    physics: PhysicsWorld,
-    physics_enabled: bool,
-}
-
-#[wasm_bindgen]
-impl Runtime {
-    #[wasm_bindgen(constructor)]
-    pub fn new(capacity: u32, ring_capacity: u32) -> Self {
-        Self {
-            transforms: TransformBuffers::new(capacity),
-            ring: CommandRing::new(ring_capacity),
-            generationerations: vec![0u8; capacity as usize],
-            physics: PhysicsWorld::new(capacity as usize),
-            physics_enabled: false,
+    #[test]
+    fn physics_scene_matches_golden_hash() {
+        let mut rt = Runtime::new(64, 64);
+        rt.enable_physics();
+        rt.spawn_box(0, 0.0, -5.0, 0.0, 20.0, 0.5, 20.0, 0.0, 0.1);
+        for i in 1..20u32 {
+            rt.spawn_box(i, (i % 5) as f32 * 1.1, -4.0 + (i / 5) as f32 * 1.1, 0.0, 0.5, 0.5, 0.5, 1.0, 0.3);
         }
-    }
-
-    pub fn transforms_buf_a_ptr(&self) -> *const f32 {
-        self.transforms.buf_a_ptr()
-    }
-    pub fn transforms_buf_b_ptr(&self) -> *const f32 {
-        self.transforms.buf_b_ptr()
-    }
-    pub fn transforms_write_index_ptr(&self) -> *const u32 {
-        self.transforms.write_index_ptr()
-    }
-    pub fn transforms_capacity(&self) -> u32 {
-        self.transforms.capacity()
-    }
-
-    pub fn ring_slots_ptr(&self) -> *const u8 {
-        self.ring.slots_ptr()
-    }
-    pub fn ring_head_ptr(&self) -> *const u32 {
-        self.ring.head_ptr()
-    }
-    pub fn ring_tail_ptr(&self) -> *const u32 {
-        self.ring.tail_ptr()
-    }
-    pub fn ring_capacity(&self) -> u32 {
-        self.ring.capacity()
-    }
-    pub fn stale_dropped(&self) -> u32 {
-        self.ring.stale_dropped()
-    }
-
-    pub fn generationerations_ptr(&self) -> *const u8 {
-        self.generationerations.as_ptr()
-    }
-
-    pub fn enable_physics(&mut self) {
-        self.physics_enabled = true;
-    }
-
-    pub fn contact_count(&self) -> u32 {
-        self.physics.contacts.len() as u32
-    }
-
-    pub fn set_gravity(&mut self, x: f32, y: f32, z: f32) {
-        self.physics.gx = x;
-        self.physics.gy = y;
-        self.physics.gz = z;
-    }
-
-    pub fn spawn_box(
-        &mut self,
-        id: u32,
-        x: f32,
-        y: f32,
-        z: f32,
-        hx: f32,
-        hy: f32,
-        hz: f32,
-        inv_mass: f32,
-        restitution: f32,
-    ) {
-        let id = id as usize;
-        self.physics
-            .spawn(id, x, y, z, hx, hy, hz, inv_mass, restitution);
-        self.transforms
-            .write_transform(id as u32, x, y, z, 0.0, 0.0, 0.0, 1.0);
-    }
-
-    pub fn spawn_sphere(
-        &mut self,
-        id: u32,
-        x: f32,
-        y: f32,
-        z: f32,
-        radius: f32,
-        inv_mass: f32,
-        restitution: f32,
-    ) {
-        let id = id as usize;
-        self.physics
-            .spawn_sphere(id, x, y, z, radius, inv_mass, restitution);
-        self.transforms
-            .write_transform(id as u32, x, y, z, 0.0, 0.0, 0.0, 1.0);
-    }
-
-    pub fn bucket_counts_ptr(&self) -> *const u32 {
-        self.physics.bucket_counts.as_ptr()
-    }
-
-    pub fn sleeping_count(&self) -> u32 {
-        self.physics.sleeping.iter().filter(|&&s| s).count() as u32
-    }
-
-    pub fn step(&mut self) {
-        let commands = self.ring.drain_commands(&self.generationerations, 4096);
-        for cmd in commands {
-            match cmd {
-                Command::Spawn {
-                    id,
-                    generation,
-                    x,
-                    y,
-                    z,
-                    qx,
-                    qy,
-                    qz,
-                    qw,
-                } => {
-                    self.generationerations[id as usize] = generation;
-                    self.transforms.write_transform(id, x, y, z, qx, qy, qz, qw);
-                    if self.physics_enabled {
-                        self.physics
-                            .spawn(id as usize, x, y, z, 0.5, 0.5, 0.5, 1.0, 0.3);
-                    }
-                }
-                Command::Destroy { id, generation } => {
-                    self.generationerations[id as usize] = generation.wrapping_add(1);
-                    if self.physics_enabled {
-                        self.physics.deactivate(id as usize);
-                    }
-                }
-                Command::Force {
-                    id,
-                    generation,
-                    x,
-                    y,
-                    z,
-                } => {
-                    if self.physics_enabled
-                        && (id as usize) < self.generationerations.len()
-                        && self.generationerations[id as usize] == generation
-                    {
-                        self.physics.apply_impulse(id as usize, x, y, z);
-                    }
-                }
-            }
+        for i in 20..30u32 {
+            rt.spawn_sphere(i, (i % 5) as f32 * 1.0 + 0.3, 0.0 + (i / 5) as f32, 0.2, 0.4, 1.0, 0.2);
         }
-
-        if self.physics_enabled {
-            self.physics.step();
-            // Write physics positions back to transform buffers
-            for i in 0..self.physics.capacity {
-                if !self.physics.active[i] {
-                    continue;
-                }
-                self.transforms.write_transform(
-                    i as u32,
-                    self.physics.pos_x[i],
-                    self.physics.pos_y[i],
-                    self.physics.pos_z[i],
-                    0.0,
-                    0.0,
-                    0.0,
-                    1.0,
-                );
-            }
-        }
-
-        self.transforms.swap();
+        for _ in 0..300 { rt.step(); }
+        let h = read_buf(&rt).iter().fold(0u64, |a, v| a.wrapping_mul(1099511628211) ^ v.to_bits() as u64);
+        assert_eq!(h, 3851500051203725484);
     }
 }

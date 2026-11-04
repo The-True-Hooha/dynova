@@ -48,6 +48,18 @@ pub struct Contact {
     pub lambda: f32,
 }
 
+pub struct BodyDesc {
+    pub pos: [f32; 3],
+    pub half: [f32; 3],
+    pub inv_mass: f32,
+    pub restitution: f32,
+}
+
+struct Motion<'a> {
+    vx: &'a mut [f32], vy: &'a mut [f32], vz: &'a mut [f32],
+    ax: &'a mut [f32], ay: &'a mut [f32], az: &'a mut [f32],
+}
+
 #[derive(Clone)]
 struct WarmEntry { a: u32, b: u32, lambda: f32 }
 
@@ -78,9 +90,11 @@ impl PhysicsWorld {
         }
     }
 
-    pub fn spawn(&mut self, id: usize, x: f32, y: f32, z: f32,
-                 hx: f32, hy: f32, hz: f32, inv_mass: f32, restitution: f32) {
+    pub fn spawn(&mut self, id: usize, d: &BodyDesc) {
         if id >= self.capacity { return; }
+        let [x, y, z] = d.pos;
+        let [hx, hy, hz] = d.half;
+        let (inv_mass, restitution) = (d.inv_mass, d.restitution);
         self.pos_x[id] = x;   self.pos_y[id] = y;   self.pos_z[id] = z;
         self.vel_x[id] = 0.0; self.vel_y[id] = 0.0; self.vel_z[id] = 0.0;
         self.ang_x[id] = 0.0; self.ang_y[id] = 0.0; self.ang_z[id] = 0.0;
@@ -100,9 +114,8 @@ impl PhysicsWorld {
         self.sleep_timer[id] = 0.0;
     }
 
-    pub fn spawn_sphere(&mut self, id: usize, x: f32, y: f32, z: f32,
-                        r: f32, inv_mass: f32, restitution: f32) {
-        self.spawn(id, x, y, z, r, r, r, inv_mass, restitution);
+    pub fn spawn_sphere(&mut self, id: usize, pos: [f32; 3], r: f32, inv_mass: f32, restitution: f32) {
+        self.spawn(id, &BodyDesc { pos, half: [r, r, r], inv_mass, restitution });
         self.shape[id] = SHAPE_SPHERE;
         self.radius[id] = r;
         self.inv_inertia[id] = if inv_mass > 0.0 {
@@ -159,10 +172,9 @@ impl PhysicsWorld {
             self.pos_x[i] += self.vel_x[i] * dt;
             self.pos_y[i] += self.vel_y[i] * dt;
             self.pos_z[i] += self.vel_z[i] * dt;
-            integrate_quaternion(
-                &mut self.qx[i], &mut self.qy[i], &mut self.qz[i], &mut self.qw[i],
-                self.ang_x[i], self.ang_y[i], self.ang_z[i], dt,
-            );
+            let mut q = [self.qx[i], self.qy[i], self.qz[i], self.qw[i]];
+            integrate_quaternion(&mut q, [self.ang_x[i], self.ang_y[i], self.ang_z[i]], dt);
+            [self.qx[i], self.qy[i], self.qz[i], self.qw[i]] = q;
         }
 
         self.cell_heads.fill(-1);
@@ -227,20 +239,20 @@ impl PhysicsWorld {
             if lambda == 0.0 { continue; }
             let (wa, wb) = (self.contacts[ci].a as usize, self.contacts[ci].b as usize);
             if eff_mass[wa] == 0.0 || eff_mass[wb] == 0.0 { continue; }
-            apply_impulse_pair(&mut self.contacts[ci], lambda, eff_mass.as_mut_slice(),
-                self.vel_x.as_mut_slice(), self.vel_y.as_mut_slice(), self.vel_z.as_mut_slice(),
-                self.ang_x.as_mut_slice(), self.ang_y.as_mut_slice(), self.ang_z.as_mut_slice(),
-                self.inv_inertia.as_slice());
+            let mut m = Motion {
+                vx: &mut self.vel_x, vy: &mut self.vel_y, vz: &mut self.vel_z,
+                ax: &mut self.ang_x, ay: &mut self.ang_y, az: &mut self.ang_z,
+            };
+            apply_impulse_pair(&self.contacts[ci], lambda, &eff_mass, &mut m, &self.inv_inertia);
         }
 
         for _ in 0..SOLVER_ITERS {
             for ci in 0..self.contacts.len() {
-                solve_contact(&mut self.contacts[ci],
-                    eff_mass.as_slice(),
-                    self.vel_x.as_mut_slice(), self.vel_y.as_mut_slice(), self.vel_z.as_mut_slice(),
-                    self.ang_x.as_mut_slice(), self.ang_y.as_mut_slice(), self.ang_z.as_mut_slice(),
-                    self.inv_inertia.as_slice(),
-                    self.restitution.as_slice());
+                let mut m = Motion {
+                    vx: &mut self.vel_x, vy: &mut self.vel_y, vz: &mut self.vel_z,
+                    ax: &mut self.ang_x, ay: &mut self.ang_y, az: &mut self.ang_z,
+                };
+                solve_contact(&mut self.contacts[ci], &eff_mass, &mut m, &self.inv_inertia, &self.restitution);
             }
         }
 
@@ -302,24 +314,21 @@ impl PhysicsWorld {
     }
 }
 
-fn integrate_quaternion(qx: &mut f32, qy: &mut f32, qz: &mut f32, qw: &mut f32,
-                        wx: f32, wy: f32, wz: f32, dt: f32) {
+fn integrate_quaternion(q: &mut [f32; 4], w: [f32; 3], dt: f32) {
+    let [qx, qy, qz, qw] = *q;
+    let [wx, wy, wz] = w;
     let h = dt * 0.5;
-    let dqw = -h * (wx * *qx + wy * *qy + wz * *qz);
-    let dqx =  h * (wx * *qw + wz * *qy - wy * *qz);
-    let dqy =  h * (wy * *qw - wz * *qx + wx * *qz);
-    let dqz =  h * (wz * *qw + wy * *qx - wx * *qy);
-    *qw += dqw; *qx += dqx; *qy += dqy; *qz += dqz;
-    let inv_len = (*qx**qx + *qy**qy + *qz**qz + *qw**qw).sqrt().recip();
-    *qx *= inv_len; *qy *= inv_len; *qz *= inv_len; *qw *= inv_len;
+    let dqw = -h * (wx * qx + wy * qy + wz * qz);
+    let dqx =  h * (wx * qw + wz * qy - wy * qz);
+    let dqy =  h * (wy * qw - wz * qx + wx * qz);
+    let dqz =  h * (wz * qw + wy * qx - wx * qy);
+    let n = [qx + dqx, qy + dqy, qz + dqz, qw + dqw];
+    let inv_len = (n[0]*n[0] + n[1]*n[1] + n[2]*n[2] + n[3]*n[3]).sqrt().recip();
+    *q = [n[0] * inv_len, n[1] * inv_len, n[2] * inv_len, n[3] * inv_len];
 }
 
-fn apply_impulse_pair(c: &mut Contact, lambda: f32,
-    inv_mass: &mut [f32],
-    vx: &mut [f32], vy: &mut [f32], vz: &mut [f32],
-    ax: &mut [f32], ay: &mut [f32], az: &mut [f32],
-    inv_i: &[f32])
-{
+fn apply_impulse_pair(c: &Contact, lambda: f32, inv_mass: &[f32], m: &mut Motion, inv_i: &[f32]) {
+    let Motion { vx, vy, vz, ax, ay, az } = m;
     let (a, b) = (c.a as usize, c.b as usize);
     let (nx, ny, nz) = (c.nx, c.ny, c.nz);
     let ima = inv_mass[a]; let imb = inv_mass[b];
@@ -336,12 +345,8 @@ fn apply_impulse_pair(c: &mut Contact, lambda: f32,
     ax[b] -= tb.0 * ii_b; ay[b] -= tb.1 * ii_b; az[b] -= tb.2 * ii_b;
 }
 
-fn solve_contact(c: &mut Contact,
-    inv_mass: &[f32],
-    vx: &mut [f32], vy: &mut [f32], vz: &mut [f32],
-    ax: &mut [f32], ay: &mut [f32], az: &mut [f32],
-    inv_i: &[f32], restitution: &[f32])
-{
+fn solve_contact(c: &mut Contact, inv_mass: &[f32], m: &mut Motion, inv_i: &[f32], restitution: &[f32]) {
+    let Motion { vx, vy, vz, ax, ay, az } = m;
     let (a, b) = (c.a as usize, c.b as usize);
     let ima = inv_mass[a]; let imb = inv_mass[b];
     let (nx, ny, nz) = (c.nx, c.ny, c.nz);
