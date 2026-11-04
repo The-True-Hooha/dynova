@@ -1,13 +1,11 @@
 import { TransformView } from './TransformView.js';
-import { CommandRing, SLOT_BYTES, SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
+import { CommandRing, SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
-import { createMemory, MemoryMode } from './memory.js';
+import type { MemoryMode } from './memory.js';
 
 export interface WorldConfig {
     capacity: number;
     ringCapacity: number;
-    initialPages?: number;
-    maximumPages?: number;
 }
 
 export interface WorldLayout {
@@ -21,6 +19,30 @@ export interface WorldLayout {
     generationsByteOffset: number;
 }
 
+export interface RuntimePointers {
+    transforms_buf_a_ptr(): number;
+    transforms_buf_b_ptr(): number;
+    transforms_write_index_ptr(): number;
+    ring_slots_ptr(): number;
+    ring_head_ptr(): number;
+    ring_tail_ptr(): number;
+    id_counter_ptr(): number;
+    generations_ptr(): number;
+}
+
+export function layoutFromRuntime(rt: RuntimePointers): WorldLayout {
+    return {
+        transformAByteOffset: rt.transforms_buf_a_ptr(),
+        transformBByteOffset: rt.transforms_buf_b_ptr(),
+        writeIndexByteOffset: rt.transforms_write_index_ptr(),
+        ringSlotsByteOffset: rt.ring_slots_ptr(),
+        ringHeadByteOffset: rt.ring_head_ptr(),
+        ringTailByteOffset: rt.ring_tail_ptr(),
+        idCounterByteOffset: rt.id_counter_ptr(),
+        generationsByteOffset: rt.generations_ptr(),
+    };
+}
+
 export interface SpawnOptions {
     x?: number; y?: number; z?: number;
     qx?: number; qy?: number; qz?: number; qw?: number;
@@ -28,6 +50,10 @@ export interface SpawnOptions {
     hx?: number; hy?: number; hz?: number;
     invMass?: number;
     restitution?: number;
+}
+
+export interface StepDriver {
+    step(): void;
 }
 
 export class World {
@@ -39,12 +65,24 @@ export class World {
     private ring: CommandRing;
     private ids: EntityIdAllocator;
     private capacity: number;
+    private driver: StepDriver | null;
+    private lastBuffer: ArrayBufferLike;
+    private fatal: string | null = null;
+    private onDispose: (() => void) | null = null;
 
-    constructor(config: WorldConfig, memory: WebAssembly.Memory, mode: MemoryMode, layout: WorldLayout) {
+    private constructor(
+        config: WorldConfig,
+        memory: WebAssembly.Memory,
+        mode: MemoryMode,
+        layout: WorldLayout,
+        driver: StepDriver | null,
+    ) {
         this.memory = memory;
         this.mode = mode;
         this.layout = layout;
         this.capacity = config.capacity;
+        this.driver = driver;
+        this.lastBuffer = memory.buffer;
 
         this.transforms = new TransformView(
             memory,
@@ -60,51 +98,62 @@ export class World {
             layout.ringTailByteOffset,
             config.ringCapacity,
         );
-        this.ids = new EntityIdAllocator(
-            memory,
-            layout.idCounterByteOffset,
-            layout.generationsByteOffset,
-            config.capacity,
-        );
+        this.ids = new EntityIdAllocator(memory, layout.idCounterByteOffset, config.capacity);
     }
 
-    static create(config: WorldConfig): World {
-        const initialPages = config.initialPages ?? 256;
-        const maximumPages = config.maximumPages ?? 16384;
-        const { memory, mode } = createMemory(initialPages, maximumPages);
+    /** Worker mode: another thread owns the runtime and steps it. */
+    static attach(config: WorldConfig, memory: WebAssembly.Memory, mode: MemoryMode, layout: WorldLayout): World {
+        return new World(config, memory, mode, layout, null);
+    }
 
-        const floatsPerEntity = 7;
-        const bytesPerFloat = 4;
-        const transformBufBytes = config.capacity * floatsPerEntity * bytesPerFloat;
-        const ringBytes = config.ringCapacity * SLOT_BYTES;
+    /** Fallback mode: this thread owns the runtime; call `step()` yourself. */
+    static attachSync(
+        config: WorldConfig,
+        memory: WebAssembly.Memory,
+        mode: MemoryMode,
+        layout: WorldLayout,
+        driver: StepDriver,
+    ): World {
+        return new World(config, memory, mode, layout, driver);
+    }
 
-        let offset = 0;
-        const align = (n: number) => { offset = Math.ceil(offset / n) * n; };
+    /** @internal set by launchWorld so dispose() can stop the simulation worker. */
+    setDisposer(fn: () => void): void { this.onDispose = fn; }
 
-        align(4); const transformAByteOffset    = offset; offset += transformBufBytes;
-        align(4); const transformBByteOffset    = offset; offset += transformBufBytes;
-        align(4); const writeIndexByteOffset    = offset; offset += 4;
-        align(4); const ringSlotsByteOffset     = offset; offset += ringBytes;
-        align(4); const ringHeadByteOffset      = offset; offset += 4;
-        align(4); const ringTailByteOffset      = offset; offset += 4;
-        align(4); const idCounterByteOffset     = offset; offset += 4;
-        const generationsByteOffset             = offset;
+    /** @internal called when the simulation worker dies; further commands throw. */
+    markFatal(message: string): void { this.fatal ??= message; }
 
-        const layout: WorldLayout = {
-            transformAByteOffset,
-            transformBByteOffset,
-            writeIndexByteOffset,
-            ringSlotsByteOffset,
-            ringHeadByteOffset,
-            ringTailByteOffset,
-            idCounterByteOffset,
-            generationsByteOffset,
-        };
+    get failure(): string | null { return this.fatal; }
 
-        return new World(config, memory, mode, layout);
+    dispose(): void {
+        this.fatal ??= 'world disposed';
+        this.onDispose?.();
+        this.onDispose = null;
+    }
+
+    private assertAlive(): void {
+        if (this.fatal) throw new Error(`world unavailable: ${this.fatal}`);
+        this.reacquireIfGrown();
+    }
+
+    step(): void {
+        if (!this.driver) throw new Error('step() is only available in fallback mode; the worker steps the runtime');
+        this.driver.step();
+        this.reacquireIfGrown();
+    }
+
+    reacquireIfGrown(): boolean {
+        if (this.memory.buffer === this.lastBuffer) return false;
+        this.lastBuffer = this.memory.buffer;
+        const { layout, capacity } = this;
+        this.transforms.reacquire(this.memory, layout.transformAByteOffset, layout.transformBByteOffset, layout.writeIndexByteOffset, capacity);
+        this.ring.reacquire(this.memory, layout.ringSlotsByteOffset, layout.ringHeadByteOffset, layout.ringTailByteOffset);
+        this.ids.reacquire(this.memory, layout.idCounterByteOffset);
+        return true;
     }
 
     spawn(opts: SpawnOptions = {}): EntityHandle {
+        this.assertAlive();
         const handle = this.ids.alloc();
         const desc: SpawnDesc = {
             id: handle.id, gen: handle.gen,
@@ -114,38 +163,30 @@ export class World {
             invMass: opts.invMass, restitution: opts.restitution,
         };
         if (!this.ring.spawn(desc)) {
-            this.ids.free(handle);
+            this.ids.release(handle);
             throw new Error(`CommandRing full — increase ringCapacity (current: ${this.ring.pendingCount})`);
         }
         return handle;
     }
 
     destroy(handle: EntityHandle): void {
+        this.assertAlive();
+        if (!this.ids.isLive(handle)) throw new Error(`stale handle {id: ${handle.id}, gen: ${handle.gen}}`);
         const desc: DestroyDesc = { id: handle.id, gen: handle.gen };
         if (!this.ring.destroy(desc)) throw new Error('CommandRing full');
         this.ids.free(handle);
     }
 
     force(handle: EntityHandle, x: number, y: number, z: number): void {
+        this.assertAlive();
+        if (!this.ids.isLive(handle)) throw new Error(`stale handle {id: ${handle.id}, gen: ${handle.gen}}`);
         const desc: ForceDesc = { id: handle.id, gen: handle.gen, x, y, z };
         if (!this.ring.force(desc)) throw new Error('CommandRing full');
     }
 
-    grow(pages: number): number {
-        let prev: number;
-        try { prev = this.memory.grow(pages); } catch (e) {
-            if (e instanceof RangeError) return -1;
-            throw e;
-        }
-        if (prev === -1) return -1;
-        const { layout, capacity } = this;
-        this.transforms.reacquire(this.memory, layout.transformAByteOffset, layout.transformBByteOffset, layout.writeIndexByteOffset, capacity);
-        this.ring.reacquire(this.memory, layout.ringSlotsByteOffset, layout.ringHeadByteOffset, layout.ringTailByteOffset);
-        this.ids.reacquire(this.memory, layout.idCounterByteOffset, layout.generationsByteOffset);
-        return prev;
-    }
-
+    /** The returned array is valid until the next `step()` in fallback mode. */
     readTransforms(): Float32Array {
+        this.reacquireIfGrown();
         return this.transforms.read();
     }
 

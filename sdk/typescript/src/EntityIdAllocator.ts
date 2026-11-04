@@ -3,43 +3,59 @@ export interface EntityHandle {
     gen: number;
 }
 
+const NOT_LIVE = -1;
+
 export class EntityIdAllocator {
     private counter: Uint32Array;
-    private generations: Uint8Array;
     private freeList: EntityHandle[] = [];
+    private liveGen: Int16Array;
     private capacity: number;
 
-    constructor(memory: WebAssembly.Memory, counterByteOffset: number, generationsByteOffset: number, capacity: number) {
+    constructor(memory: WebAssembly.Memory, counterByteOffset: number, capacity: number) {
         this.counter = new Uint32Array(memory.buffer, counterByteOffset, 1);
-        this.generations = new Uint8Array(memory.buffer, generationsByteOffset, capacity);
         this.capacity = capacity;
+        this.liveGen = new Int16Array(capacity).fill(NOT_LIVE);
     }
 
     alloc(): EntityHandle {
-        if (this.freeList.length > 0) {
-            const handle = this.freeList.pop()!;
-            return handle;
+        const reused = this.freeList.pop();
+        if (reused) {
+            this.liveGen[reused.id] = reused.gen;
+            return reused;
+        }
+        if (Atomics.load(this.counter, 0) >= this.capacity) {
+            throw new RangeError(`entity capacity exhausted (${this.capacity})`);
         }
         const id = Atomics.add(this.counter, 0, 1);
+        if (id >= this.capacity) throw new RangeError(`entity capacity exhausted (${this.capacity})`);
+        this.liveGen[id] = 0;
         return { id, gen: 0 };
     }
 
-    free(handle: EntityHandle): void {
-        const nextGen = (this.generations[handle.id] + 1) & 0xff;
-        this.generations[handle.id] = nextGen;
-        this.freeList.push({ id: handle.id, gen: nextGen });
+    isLive(handle: EntityHandle): boolean {
+        return handle.id >= 0 && handle.id < this.capacity && this.liveGen[handle.id] === handle.gen;
     }
 
-    currentGen(id: number): number {
-        return this.generations[id];
+    free(handle: EntityHandle): boolean {
+        if (!this.isLive(handle)) return false;
+        this.liveGen[handle.id] = NOT_LIVE;
+        this.freeList.push({ id: handle.id, gen: (handle.gen + 1) & 0xff });
+        return true;
+    }
+
+    /** Undo an alloc whose Spawn never reached the ring: Rust never saw the generation, so do not bump it. */
+    release(handle: EntityHandle): boolean {
+        if (!this.isLive(handle)) return false;
+        this.liveGen[handle.id] = NOT_LIVE;
+        this.freeList.push({ id: handle.id, gen: handle.gen });
+        return true;
     }
 
     get allocated(): number {
         return Atomics.load(this.counter, 0);
     }
 
-    reacquire(memory: WebAssembly.Memory, counterByteOffset: number, generationsByteOffset: number): void {
+    reacquire(memory: WebAssembly.Memory, counterByteOffset: number): void {
         this.counter = new Uint32Array(memory.buffer, counterByteOffset, 1);
-        this.generations = new Uint8Array(memory.buffer, generationsByteOffset, this.capacity);
     }
 }

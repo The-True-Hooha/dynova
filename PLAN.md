@@ -115,8 +115,16 @@ Out-of-plan observations. Do not act on these without approval.
 - (Step 6.1) `warm_cache` is keyed by body id pair; reusing an id after destroy can inherit the old pair's impulse.
 - (low) `Runtime::new` panics on non-power-of-two ring capacity and can overflow `capacity * 7` on wasm32; `TransformBuffers::write_transform` still asserts on out-of-range id (all callers guarded).
 
+- (Step 4) World no longer has `grow()`; Step 4 redesigns growth + `onBufferGrowth` for worker mode (layout is valid today only because all pointers are allocated before `ready`; add a test that every layout offset+length lies inside the initial buffer).
+- (Step 4) `maximumPages` 16384 is duplicated between launch.ts and `--max-memory` in .cargo/config.toml; derive from one constant and validate the module minimum.
+- (Step 4) e2e gaps: tiny-ring backpressure + destroy/respawn end to end; the "no main-thread wasm" test only patches `WebAssembly.instantiate*`, add `Module`/`Instance`/`compile` and assert the worker ran.
+- (Step 4) No worker step/overrun counter in shared memory (needed for the inspector counters).
+- (low) Firefox cannot launch under this sandbox; run `pnpm exec playwright test --project=firefox` in a normal terminal.
+- (low) `allocatedEntities` is the monotonic id counter, not the live count; document.
+
 ## Plan changes
 
 - 2026-11-04: worker topology = Web Worker + SAB with sync fallback (user approved).
 - 2026-11-04: convex hull moved from Stage 2B to Phase 3 Stage 3A; capsule + OBB SAT stay in 2B (user approved). ROADMAP.md 2B/3A text needs matching edit in Step 7.
 - 2026-11-04: Playwright cross-browser (Chromium, Firefox, WebKit) from Step 4 (user approved).
+- 2026-11-04: Step 3 removed `World.grow()`/`initialPages` from World (growth redesign is Step 4); added `World.dispose()`/`markFatal`, `launchWorld` config validation, a second non-shared wasm build (`wasm-st`, `make build-st`) and Playwright e2e (`make e2e`).

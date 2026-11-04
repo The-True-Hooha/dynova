@@ -2,6 +2,7 @@ use crate::command_ring::{Command, CommandRing};
 use crate::physics::PhysicsWorld;
 use crate::physics::BodyDesc;
 use crate::transform_buffers::{Transform, TransformBuffers};
+use std::sync::atomic::{AtomicU32, Ordering};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -9,6 +10,7 @@ pub struct Runtime {
     pub(crate) transforms: TransformBuffers,
     pub(crate) ring: CommandRing,
     generations: Vec<u8>,
+    id_counter: AtomicU32,
     commands: Vec<Command>,
     physics: PhysicsWorld,
     physics_enabled: bool,
@@ -22,6 +24,7 @@ impl Runtime {
             transforms: TransformBuffers::new(capacity),
             ring: CommandRing::new(ring_capacity),
             generations: vec![0u8; capacity as usize],
+            id_counter: AtomicU32::new(0),
             commands: Vec::new(),
             physics: PhysicsWorld::new(capacity as usize),
             physics_enabled: false,
@@ -62,6 +65,14 @@ impl Runtime {
 
     pub fn generations_ptr(&self) -> *const u8 {
         self.generations.as_ptr()
+    }
+
+    pub fn id_counter_ptr(&self) -> *const u32 {
+        self.id_counter.as_ptr()
+    }
+
+    pub fn allocated_ids(&self) -> u32 {
+        self.id_counter.load(Ordering::Acquire)
     }
 
     pub fn enable_physics(&mut self) {
@@ -455,6 +466,16 @@ mod tests {
         for (i, ii) in rt.physics.inv_inertia.iter().enumerate() {
             assert!(ii.is_finite() && *ii > 0.0, "body {i}: {ii}");
         }
+    }
+
+    #[test]
+    fn id_counter_starts_at_zero_and_ptr_is_stable() {
+        let rt = Runtime::new(4, 4);
+        assert_eq!(rt.allocated_ids(), 0);
+        let p = rt.id_counter_ptr();
+        rt.id_counter.fetch_add(3, Ordering::AcqRel);
+        assert_eq!(rt.allocated_ids(), 3);
+        assert_eq!(rt.id_counter_ptr(), p);
     }
 
     #[test]

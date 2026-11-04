@@ -1,10 +1,11 @@
-import wasmInit, { Runtime } from '../sdk/typescript/wasm/dynova_core.js';
-import { FLOATS_PER_TRANSFORM, SLOT_BYTES } from '@dynova/sdk';
+import { FLOATS_PER_TRANSFORM, SHAPE_SPHERE, type EntityHandle } from '@dynova/sdk';
+import { createWorld } from './shared';
 
-const BOX_COUNT     = 30;
-const SPHERE_COUNT  = 20;
-const RING_CAPACITY = 1024;
-const CAPACITY      = BOX_COUNT + SPHERE_COUNT + 3; // floor + left wall + right wall
+const BOX_COUNT    = 30;
+const SPHERE_COUNT = 20;
+const BOX_HALF     = 0.5;
+const SPHERE_R     = 0.4;
+const CAPACITY     = BOX_COUNT + SPHERE_COUNT + 3;
 
 const canvas    = document.getElementById('canvas') as HTMLCanvasElement;
 const ctx       = canvas.getContext('2d')!;
@@ -15,142 +16,79 @@ const pendingEl = document.getElementById('pending')!;
 canvas.width  = window.innerWidth;
 canvas.height = window.innerHeight;
 
-// Physics world is centred at canvas centre, 1 unit = 20px
 const SCALE = 20;
 const cx = canvas.width  / 2;
 const cy = canvas.height / 2;
 
 async function main() {
-    const exports = await wasmInit(
-        new URL('../sdk/typescript/wasm/dynova_core_bg.wasm', import.meta.url)
-    ) as unknown as { memory: WebAssembly.Memory };
+    const world = await createWorld({ capacity: CAPACITY, ringCapacity: 1024 }, true);
+    modeEl.textContent = `Mode: ${world.mode} — ${world.mode === 'shared' ? 'physics in worker' : 'physics on main thread'}`;
 
-    const memory  = exports.memory;
-    const runtime = new Runtime(CAPACITY, RING_CAPACITY);
+    const floor = world.spawn({ y: -15, hx: 40, hy: 0.5, hz: 40, invMass: 0, restitution: 0.1 });
+    world.spawn({ x: -18, hx: 0.5, hy: 20, hz: 40, invMass: 0, restitution: 0.1 });
+    world.spawn({ x:  18, hx: 0.5, hy: 20, hz: 40, invMass: 0, restitution: 0.1 });
 
-    runtime.enable_physics();
-    runtime.set_gravity(0, -9.81, 0);
-
-    const aOffset        = runtime.transforms_buf_a_ptr();
-    const bOffset        = runtime.transforms_buf_b_ptr();
-    const writeIdxOffset = runtime.transforms_write_index_ptr();
-    const ringHeadOffset = runtime.ring_head_ptr();
-    const ringTailOffset = runtime.ring_tail_ptr();
-    const ringSlotsOffset= runtime.ring_slots_ptr();
-
-    const writeIndex  = new Uint32Array(memory.buffer, writeIdxOffset, 1);
-    const bufA        = new Float32Array(memory.buffer, aOffset, CAPACITY * FLOATS_PER_TRANSFORM);
-    const bufB        = new Float32Array(memory.buffer, bOffset, CAPACITY * FLOATS_PER_TRANSFORM);
-    const ringHeadView= new Uint32Array(memory.buffer, ringHeadOffset, 1);
-    const wasmRingTail= new Uint32Array(memory.buffer, ringTailOffset, 1);
-    const wasmRingView= new DataView(memory.buffer, ringSlotsOffset, RING_CAPACITY * SLOT_BYTES);
-    const wasmMask    = RING_CAPACITY - 1;
-
-    // id=0: static floor; id=51,52: left/right walls
-    const WALL_ID_L = BOX_COUNT + SPHERE_COUNT + 1;
-    const WALL_ID_R = BOX_COUNT + SPHERE_COUNT + 2;
-    runtime.spawn_box(0,          0,   -15, 0,  40, 0.5, 40,  0.0, 0.1);
-    runtime.spawn_box(WALL_ID_L, -18,   0,  0,  0.5, 20, 40,  0.0, 0.1);
-    runtime.spawn_box(WALL_ID_R,  18,   0,  0,  0.5, 20, 40,  0.0, 0.1);
-
-    // ids 1..BOX_COUNT: boxes in a grid, no overlaps
     const COLS = 6;
-    for (let i = 1; i <= BOX_COUNT; i++) {
-        const col = (i - 1) % COLS;
-        const row = Math.floor((i - 1) / COLS);
-        const x = (col - COLS / 2 + 0.5) * 1.2;
-        const y = -12 + row * 1.2;
-        runtime.spawn_box(i, x, y, 0,  0.5, 0.5, 0.5,  1.0, 0.3);
+    const boxes: EntityHandle[] = [];
+    for (let i = 0; i < BOX_COUNT; i++) {
+        const col = i % COLS;
+        const row = Math.floor(i / COLS);
+        boxes.push(world.spawn({
+            x: (col - COLS / 2 + 0.5) * 1.2, y: -12 + row * 1.2,
+            hx: BOX_HALF, hy: BOX_HALF, hz: BOX_HALF, invMass: 1, restitution: 0.3,
+        }));
     }
 
-    // ids BOX_COUNT+1..BOX_COUNT+SPHERE_COUNT: spheres offset to the right
-    for (let i = 1; i <= SPHERE_COUNT; i++) {
-        const col = (i - 1) % 4;
-        const row = Math.floor((i - 1) / 4);
-        const x = 8 + col * 1.0;
-        const y = -12 + row * 1.0;
-        runtime.spawn_sphere(BOX_COUNT + i, x, y, 0,  0.4,  1.0, 0.2);
+    const spheres: EntityHandle[] = [];
+    for (let i = 0; i < SPHERE_COUNT; i++) {
+        spheres.push(world.spawn({
+            x: 8 + (i % 4), y: -12 + Math.floor(i / 4),
+            shape: SHAPE_SPHERE, hx: SPHERE_R, hy: SPHERE_R, hz: SPHERE_R, invMass: 1, restitution: 0.2,
+        }));
     }
 
-    runtime.step();
-
-    const useWorker = false; // physics demo: main-thread sim only for now
-    modeEl.textContent = 'Physics: Stage 2B — 30 boxes + 20 spheres, warm start, sleeping';
-
-    // Shared ring for future worker use (kept alive but unused this demo)
-    const SHARED_BYTES = RING_CAPACITY * SLOT_BYTES + 8;
-    const sharedBuf = typeof SharedArrayBuffer !== 'undefined'
-        ? (() => { try { return new SharedArrayBuffer(SHARED_BYTES); } catch { return null; } })()
-        : null;
-    const sharedHead  = sharedBuf ? new Int32Array(sharedBuf, RING_CAPACITY * SLOT_BYTES,     1) : null;
-    const sharedTail  = sharedBuf ? new Int32Array(sharedBuf, RING_CAPACITY * SLOT_BYTES + 4, 1) : null;
-    const sharedSlots = sharedBuf ? new Uint8Array(sharedBuf, 0, RING_CAPACITY * SLOT_BYTES)  : null;
-
-    function bridgeSharedRing() {
-        if (!sharedHead || !sharedTail || !sharedSlots) return;
-        const head    = Atomics.load(sharedHead, 0);
-        const tail    = Atomics.load(sharedTail, 0);
-        const pending = (tail - head) >>> 0;
-        for (let i = 0; i < pending; i++) {
-            const srcOff = ((head + i) & wasmMask) * SLOT_BYTES;
-            const dstTail = wasmRingTail[0];
-            const dstOff  = (dstTail & wasmMask) * SLOT_BYTES;
-            for (let b = 0; b < SLOT_BYTES; b++) {
-                wasmRingView.setUint8(dstOff + b, sharedSlots[srcOff + b]);
-            }
-            wasmRingTail[0] = dstTail + 1;
-        }
-        if (pending > 0) Atomics.store(sharedHead, 0, tail);
-    }
-
+    (window as unknown as { __demo: unknown }).__demo = { world, boxes, spheres };
     let frameCount = 0;
+    const screen = (buf: Float32Array, id: number): [number, number] => {
+        const o = id * FLOATS_PER_TRANSFORM;
+        return [buf[o] * SCALE + cx, -buf[o + 1] * SCALE + cy];
+    };
+    const live = (buf: Float32Array, id: number) => buf[id * FLOATS_PER_TRANSFORM + 6] !== 0;
 
     function frame() {
-        bridgeSharedRing();
-        runtime.step();
+        if (world.mode === 'fallback') world.step();
         frameCount++;
-
+        const buf = world.readTransforms();
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        const buf = writeIndex[0] === 0 ? bufB : bufA;
-
-        // Draw floor (id=0) as a rectangle
-        {
-            const o = 0 * FLOATS_PER_TRANSFORM;
-            const sx = buf[o]     * SCALE + cx;
-            const sy = -buf[o+1]  * SCALE + cy;
+        if (live(buf, floor.id)) {
+            const [sx, sy] = screen(buf, floor.id);
             ctx.fillStyle = '#445544';
-            ctx.fillRect(sx - 40 * SCALE, sy - 0.5 * SCALE, 80 * SCALE, 1 * SCALE);
+            ctx.fillRect(sx - 40 * SCALE, sy - 0.5 * SCALE, 80 * SCALE, SCALE);
         }
 
-        // Draw dynamic boxes
         ctx.fillStyle = '#00ff88';
-        for (let i = 1; i <= BOX_COUNT; i++) {
-            const o = i * FLOATS_PER_TRANSFORM;
-            const sx = buf[o]    * SCALE + cx;
-            const sy = -buf[o+1] * SCALE + cy;
-            ctx.fillRect(sx - 0.5 * SCALE, sy - 0.5 * SCALE, SCALE, SCALE);
+        for (const h of boxes) {
+            if (!live(buf, h.id)) continue;
+            const [sx, sy] = screen(buf, h.id);
+            ctx.fillRect(sx - BOX_HALF * SCALE, sy - BOX_HALF * SCALE, 2 * BOX_HALF * SCALE, 2 * BOX_HALF * SCALE);
         }
 
-        // Draw spheres
         ctx.fillStyle = '#ff8844';
-        for (let i = 1; i <= SPHERE_COUNT; i++) {
-            const id = BOX_COUNT + i;
-            const o = id * FLOATS_PER_TRANSFORM;
-            const sx = buf[o]    * SCALE + cx;
-            const sy = -buf[o+1] * SCALE + cy;
-            const r  = 0.4 * SCALE;
+        for (const h of spheres) {
+            if (!live(buf, h.id)) continue;
+            const [sx, sy] = screen(buf, h.id);
             ctx.beginPath();
-            ctx.arc(sx, sy, r, 0, Math.PI * 2);
+            ctx.arc(sx, sy, SPHERE_R * SCALE, 0, Math.PI * 2);
             ctx.fill();
         }
 
-        countEl.textContent   = `Bodies: ${BOX_COUNT + SPHERE_COUNT}  frame: ${frameCount}  sleeping: ${runtime.sleeping_count()}`;
-        pendingEl.textContent = `Contacts: ${runtime.contact_count()}`;
+        countEl.textContent   = `Bodies: ${BOX_COUNT + SPHERE_COUNT}  frame: ${frameCount}`;
+        pendingEl.textContent = `Pending commands: ${world.pendingCommands}`;
         requestAnimationFrame(frame);
     }
 
     requestAnimationFrame(frame);
 }
 
-main().catch(console.error);
+main().catch((e) => { modeEl.textContent = String(e); console.error(e); });
