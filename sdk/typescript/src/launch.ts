@@ -1,4 +1,5 @@
 import { createMemory, detectMode, MemoryMode } from './memory.js';
+import { MAX_CAPACITY } from './CommandRing.js';
 import { World, WorldConfig, WorldLayout, RuntimePointers, layoutFromRuntime } from './World.js';
 
 export interface SimInit {
@@ -51,7 +52,9 @@ export class SharedMemoryUnavailableError extends Error {
 function validate(opts: LaunchOptions): void {
     const { capacity, ringCapacity } = opts.config;
     const hz = opts.hz ?? 60;
-    if (!Number.isInteger(capacity) || capacity < 1) throw new RangeError(`capacity must be an integer >= 1, got ${capacity}`);
+    if (!Number.isInteger(capacity) || capacity < 1 || capacity > MAX_CAPACITY) {
+        throw new RangeError(`capacity must be an integer in [1, ${MAX_CAPACITY}], got ${capacity}`);
+    }
     if (!Number.isInteger(ringCapacity) || ringCapacity < 1 || (ringCapacity & (ringCapacity - 1)) !== 0) {
         throw new RangeError(`ringCapacity must be a power of two, got ${ringCapacity}`);
     }

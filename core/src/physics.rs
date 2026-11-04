@@ -60,6 +60,7 @@ pub struct PhysicsWorld {
     pub dt: f32,
     pub cell_size: f32,
     pub narrow_calls: u32,
+    pub dropped_contacts: u32,
     max_dynamic_diameter: f32,
 }
 
@@ -167,6 +168,7 @@ impl PhysicsWorld {
             dt: 1.0 / 60.0,
             cell_size: 2.0,
             narrow_calls: 0,
+            dropped_contacts: 0,
             max_dynamic_diameter: 0.0,
         }
     }
@@ -636,7 +638,10 @@ impl PhysicsWorld {
         let pb = [self.pos_x[j], self.pos_y[j], self.pos_z[j]];
         let mu = (self.friction[i] * self.friction[j]).sqrt();
         for (k, (pt, depth)) in m.points().iter().enumerate() {
-            if self.contacts.len() >= MAX_CONTACTS { break; }
+            if self.contacts.len() >= MAX_CONTACTS {
+                self.dropped_contacts = self.dropped_contacts.saturating_add(1);
+                continue;
+            }
             let ra = geo::sub(*pt, pa);
             let rb = geo::sub(*pt, pb);
             let (lambda, lt1, lt2) = warm_lookup(&self.warm_cache, i as u32, j as u32, k as u8);
@@ -1471,5 +1476,20 @@ mod tests {
         fire(&mut w, 1, [800.0, 0.0, 0.0]);
         w.step();
         assert!(w.pos_x[1] < 4.85 - 0.5 * CCD_MARGIN, "no safety margin before the surface: {}", w.pos_x[1]);
+    }
+
+    #[test]
+    fn contacts_beyond_the_cap_are_counted_not_silently_dropped() {
+        let mut w = zero_g(2);
+        w.spawn(0, &BodyDesc::box_at([0.0; 3], [0.5; 3], 1.0, 0.0));
+        w.spawn(1, &BodyDesc::box_at([0.0, 0.9, 0.0], [0.5; 3], 1.0, 0.0));
+        w.contacts.resize(MAX_CONTACTS, w_dummy_contact());
+        w.try_contact(0, 1);
+        assert!(w.dropped_contacts >= 1, "dropped {}", w.dropped_contacts);
+        assert_eq!(w.contacts.len(), MAX_CONTACTS);
+    }
+
+    fn w_dummy_contact() -> Contact {
+        Contact { a: 0, b: 1, nx: 0.0, ny: 1.0, nz: 0.0, depth: 0.0, rax: 0.0, ray: 0.0, raz: 0.0, rbx: 0.0, rby: 0.0, rbz: 0.0, lambda: 0.0, lt1: 0.0, lt2: 0.0, mu: 0.0, key: 0 }
     }
 }

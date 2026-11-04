@@ -1,4 +1,4 @@
-import { TransformView } from '@dynova/sdk';
+import { TransformView, World, layoutFromRuntime } from '@dynova/sdk';
 
 const COLS = 5;
 const ROWS = 10;
@@ -8,21 +8,22 @@ const TICKS = 1500;
 async function run() {
     const glue = await import('../sdk/typescript/wasm-st/dynova_core.js');
     const exports = await glue.default() as unknown as { memory: WebAssembly.Memory };
-    const rt = new glue.Runtime(BOXES + 1, 64);
+    const config = { capacity: BOXES + 1, ringCapacity: 64 };
+    const rt = new glue.Runtime(config.capacity, config.ringCapacity);
     rt.enable_physics();
-    rt.spawn_box(0, 0, -0.5, 0, 30, 0.5, 30, 0, 0);
-    let id = 1;
+    const world = World.attachSync(config, exports.memory, 'fallback', layoutFromRuntime(rt), rt);
+    world.spawn({ y: -0.5, hx: 30, hy: 0.5, hz: 30, invMass: 0, restitution: 0 });
     for (let r = 0; r < ROWS; r++) {
         for (let c = 0; c < COLS; c++) {
             const x = (c - (COLS - 1) / 2) * 1.02 + (r % 2 ? 0.5 : 0);
-            rt.spawn_box(id++, x, 0.5 + r * 1.02, 0, 0.5, 0.5, 0.5, 1, 0);
+            world.spawn({ x, y: 0.5 + r * 1.02, hx: 0.5, hy: 0.5, hz: 0.5, invMass: 1, restitution: 0 });
         }
     }
 
     const times: number[] = [];
     for (let t = 0; t < TICKS; t++) {
         const t0 = performance.now();
-        rt.step();
+        world.step();
         times.push(performance.now() - t0);
     }
     const view = new TransformView(exports.memory, rt.header_ptr());

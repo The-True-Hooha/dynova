@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, SLOT_BYTES } from '../CommandRing.js';
+import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, SLOT_BYTES } from '../CommandRing.js';
 
 function makeRing(capacity = 16) {
     const mem = new WebAssembly.Memory({ initial: 1 });
@@ -125,5 +125,17 @@ describe('CommandRing', () => {
         const { mem, ring } = makeRing();
         ring.spawn({ id: 0, gen: 0, x: 0, y: 0, z: 0, qx: 0, qy: 0, qz: 0, qw: 1 });
         expect(new DataView(mem.buffer).getFloat32(56, true)).toBe(0.5);
+    });
+
+    it('gravity encodes tag and vector at the force offsets, with the rest zeroed', () => {
+        const { mem, ring } = makeRing(1);
+        ring.spawn({ id: 9, gen: 9, x: 1, y: 1, z: 1, qx: 0, qy: 0, qz: 0, qw: 1, hx: 9 });
+        Atomics.store(new Int32Array(mem.buffer, SLOT_BYTES, 1), 0, 1);
+        expect(ring.gravity(0, -9.81, 0)).toBe(true);
+        const view = new DataView(mem.buffer);
+        expect(view.getUint8(0)).toBe(TAG_GRAVITY);
+        expect(view.getFloat32(10, true)).toBeCloseTo(-9.81);
+        expect(view.getUint32(1, true)).toBe(0);
+        expect(view.getFloat32(36, true)).toBe(0);
     });
 });

@@ -59,7 +59,8 @@ type Queued =
     | { k: 'spawn'; d: SpawnDesc }
     | { k: 'destroy'; d: DestroyDesc }
     | { k: 'force'; d: ForceDesc }
-    | { k: 'grow'; capacity: number };
+    | { k: 'grow'; capacity: number }
+    | { k: 'gravity'; v: [number, number, number] };
 
 const DEFAULT_MAX_DEFERRED = 1 << 16;
 
@@ -196,6 +197,7 @@ export class World {
             case 'destroy': return this.ring.destroy(c.d);
             case 'force': return this.ring.force(c.d);
             case 'grow': return this.ring.grow(c.capacity);
+            case 'gravity': return this.ring.gravity(...c.v);
         }
     }
 
@@ -270,6 +272,13 @@ export class World {
         this.pendingGrow = capacity;
     }
 
+    /** Set world gravity through the command ring (values must be finite and within +-1000). */
+    setGravity(x: number, y: number, z: number): void {
+        this.assertAlive();
+        if (![x, y, z].every((v) => Number.isFinite(v) && Math.abs(v) <= 1000)) throw new RangeError('gravity must be finite and within +-1000');
+        if (!this.enqueue({ k: 'gravity', v: [x, y, z] })) throw new Error('CommandRing full');
+    }
+
     /** Valid until the next call to `readTransforms()` (and, in fallback mode, the next `step()`). */
     readTransforms(): Float32Array {
         if (this.fatal) throw new Error(`world unavailable: ${this.fatal}`);
@@ -288,6 +297,11 @@ export class World {
     /** Occupancy of each broadphase hash bucket; for the inspector. Valid until the layout is re-acquired. */
     bucketHistogram(): Uint32Array {
         return this.transforms.bucketCounts();
+    }
+
+    /** Ring depth, dropped contacts, worker overruns and contact count, read from shared memory. */
+    get runtimeStats(): { ringPending: number; droppedContacts: number; workerOverruns: number; contacts: number } {
+        return this.transforms.stats();
     }
 
     get capacity(): number { return this.ids.capacityNow; }

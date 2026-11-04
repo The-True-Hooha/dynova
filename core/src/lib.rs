@@ -21,3 +21,39 @@ pub fn init(){
 pub fn ping() -> u32 {
     42
 }
+
+/// Fixed-seed integration mixing sin, cos, atan2 and sqrt. The same value must come out of every browser and the
+/// native build, otherwise lockstep cannot rely on f32 transcendental determinism.
+#[wasm_bindgen]
+pub fn determinism_probe() -> u64 {
+    let (mut x, mut y, mut z) = (0.5f32, -1.25f32, 2.0f32);
+    let (mut vx, mut vy, mut vz) = (0.3f32, 0.1f32, -0.2f32);
+    let dt = 1.0f32 / 60.0;
+    let mut h: u64 = 0;
+    for i in 0..5000u32 {
+        let t = i as f32 * 0.01;
+        vx += (t * 1.3).sin() * dt - x * 0.01;
+        vy += (t * 0.7).cos() * dt - y * 0.01;
+        vz += y.atan2(1.0 + x.abs()) * dt - z * 0.01;
+        let speed = (vx * vx + vy * vy + vz * vz).sqrt().max(1e-6);
+        x += vx / speed * speed * dt;
+        y += vy * dt;
+        z += vz * dt;
+        for v in [x, y, z] {
+            h = h.wrapping_mul(1099511628211) ^ v.to_bits() as u64;
+        }
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn determinism_probe_is_stable_and_finite_math_only() {
+        let a = determinism_probe();
+        assert_eq!(a, determinism_probe());
+        assert_eq!(a, 7496710723231958662);
+    }
+}

@@ -4,7 +4,8 @@ export const TAG_SPAWN   = 0;
 export const TAG_DESTROY = 1;
 export const TAG_FORCE   = 2;
 export const TAG_GROW    = 3;
-export const MAX_CAPACITY = 1 << 20;
+export const TAG_GRAVITY = 4;
+export const MAX_CAPACITY = 1 << 18;
 
 export const SHAPE_BOX    = 0;
 export const SHAPE_SPHERE = 1;
@@ -123,6 +124,19 @@ export class CommandRing {
         for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
         this.view.setUint8(off, TAG_GROW);
         this.view.setUint32(off + 6, capacity, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    gravity(x: number, y: number, z: number): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_GRAVITY);
+        this.view.setFloat32(off + 6, x, true);
+        this.view.setFloat32(off + 10, y, true);
+        this.view.setFloat32(off + 14, z, true);
         Atomics.add(this.tail, 0, 1);
         return true;
     }

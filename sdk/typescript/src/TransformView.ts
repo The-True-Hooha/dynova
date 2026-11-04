@@ -9,7 +9,11 @@ export const H_STALE = 8;
 export const H_MALFORMED = 9;
 export const H_BUCKETS = 10;
 export const H_BUCKET_LEN = 11;
-export const HEADER_WORDS = 12;
+export const H_RING_PENDING = 12;
+export const H_DROPPED_CONTACTS = 13;
+export const H_OVERRUNS = 14;
+export const H_CONTACTS = 15;
+export const HEADER_WORDS = 16;
 
 const MAX_SPINS = 5_000_000;
 const NEW_FLAG = 0b100;
@@ -32,6 +36,16 @@ export class TransformView {
 
     get epoch(): number { return this._epoch; }
     get capacity(): number { return this._capacity; }
+
+    /** Runtime health published each step; readable by a separate inspector with no wasm call. */
+    stats(): { ringPending: number; droppedContacts: number; workerOverruns: number; contacts: number } {
+        return {
+            ringPending: Atomics.load(this.header, H_RING_PENDING) >>> 0,
+            droppedContacts: Atomics.load(this.header, H_DROPPED_CONTACTS) >>> 0,
+            workerOverruns: Atomics.load(this.header, H_OVERRUNS) >>> 0,
+            contacts: Atomics.load(this.header, H_CONTACTS) >>> 0,
+        };
+    }
 
     /** Broadphase bucket occupancy, read straight from shared memory. */
     bucketCounts(): Uint32Array {

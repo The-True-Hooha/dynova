@@ -14,7 +14,13 @@ const H_STALE: usize = 8;
 const H_MALFORMED: usize = 9;
 const H_BUCKETS: usize = 10;
 const H_BUCKET_LEN: usize = 11;
-const HEADER_WORDS: usize = 12;
+const H_RING_PENDING: usize = 12;
+const H_DROPPED_CONTACTS: usize = 13;
+/// Written only by the JS worker loop (Atomics.add), read by the inspector.
+#[cfg_attr(not(test), allow(dead_code))]
+const H_OVERRUNS: usize = 14;
+const H_CONTACTS: usize = 15;
+const HEADER_WORDS: usize = 16;
 
 #[wasm_bindgen]
 pub struct Runtime {
@@ -22,6 +28,8 @@ pub struct Runtime {
     pub(crate) transforms: TransformBuffers,
     pub(crate) ring: CommandRing,
     generations: Vec<u8>,
+    live: Vec<bool>,
+    bucket_view: Vec<AtomicU32>,
     id_counter: AtomicU32,
     commands: Vec<Command>,
     physics: PhysicsWorld,
@@ -37,17 +45,21 @@ impl Runtime {
             transforms: TransformBuffers::new(capacity),
             ring: CommandRing::new(ring_capacity),
             generations: vec![0u8; capacity as usize],
+            live: vec![false; capacity as usize],
+            bucket_view: Vec::new(),
             id_counter: AtomicU32::new(0),
             commands: Vec::new(),
             physics: PhysicsWorld::new(capacity as usize),
             physics_enabled: false,
         };
+        let mut rt = rt;
+        rt.bucket_view = (0..rt.physics.bucket_counts.len()).map(|_| AtomicU32::new(0)).collect();
         rt.header[H_STATE].store(INITIAL_STATE, Ordering::Release);
         rt.publish_layout();
         rt
     }
 
-    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len].
+    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts].
     pub fn header_ptr(&self) -> *const u32 {
         self.header.as_ptr() as *const u32
     }
@@ -92,6 +104,97 @@ impl Runtime {
         self.physics.contacts.len() as u32
     }
 
+    pub fn bucket_counts_ptr(&self) -> *const u32 {
+        self.bucket_view.as_ptr() as *const u32
+    }
+
+    pub fn sleeping_count(&self) -> u32 {
+        self.physics.sleeping.iter().zip(&self.physics.active).filter(|(s, a)| **s && **a).count() as u32
+    }
+
+    pub fn step(&mut self) {
+        let mut commands = std::mem::take(&mut self.commands);
+        self.ring.drain_commands(4096, &mut commands);
+        for cmd in commands.drain(..) {
+            if let Command::Grow { capacity } = cmd {
+                if !self.grow_to(capacity) {
+                    self.ring.note_malformed();
+                }
+                continue;
+            }
+            if let Command::Gravity { x, y, z } = cmd {
+                self.physics.gx = x;
+                self.physics.gy = y;
+                self.physics.gz = z;
+                continue;
+            }
+            let Some((id, generation)) = cmd.target() else { continue };
+            if (id as usize) >= self.generations.len() || self.generations[id as usize] != generation {
+                self.ring.note_stale();
+                continue;
+            }
+            match cmd {
+                Command::Grow { .. } | Command::Gravity { .. } => {}
+                Command::Spawn { body, .. } => {
+                    if self.live[id as usize] {
+                        self.ring.note_malformed();
+                        continue;
+                    }
+                    self.live[id as usize] = true;
+                    self.transforms.write_transform(id, Transform { pos: body.pos, rot: body.rot });
+                    if self.physics_enabled {
+                        self.physics.spawn(id as usize, &body);
+                    }
+                }
+                Command::Destroy { .. } => {
+                    self.live[id as usize] = false;
+                    self.generations[id as usize] = generation.wrapping_add(1);
+                    self.transforms.write_transform(id, Transform::TOMBSTONE);
+                    if self.physics_enabled {
+                        self.physics.deactivate(id as usize);
+                    }
+                }
+                Command::Force { x, y, z, .. } => {
+                    if self.physics_enabled {
+                        self.physics.apply_impulse(id as usize, x, y, z);
+                    }
+                }
+            }
+        }
+        self.commands = commands;
+
+        if self.physics_enabled {
+            self.physics.step();
+            let p = &self.physics;
+            for i in 0..p.capacity {
+                if !p.active[i] {
+                    continue;
+                }
+                self.transforms.write_transform(
+                    i as u32,
+                    Transform {
+                        pos: [p.pos_x[i], p.pos_y[i], p.pos_z[i]],
+                        rot: [p.qx[i], p.qy[i], p.qz[i], p.qw[i]],
+                    },
+                );
+            }
+        }
+
+        self.transforms.publish(&self.header[H_STATE]);
+        self.header[H_STALE].store(self.ring.stale_dropped(), Ordering::Release);
+        self.header[H_MALFORMED].store(self.ring.malformed_dropped(), Ordering::Release);
+        for (dst, src) in self.bucket_view.iter().zip(&self.physics.bucket_counts) {
+            dst.store(*src, Ordering::Relaxed);
+        }
+        self.header[H_RING_PENDING].store(self.ring.len(), Ordering::Release);
+        self.header[H_DROPPED_CONTACTS].store(self.physics.dropped_contacts, Ordering::Release);
+        self.header[H_CONTACTS].store(self.physics.contacts.len() as u32, Ordering::Release);
+        self.header[H_TICKS].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl Runtime {
+    /// Direct (non-ring) setup API for Rust tests and benches. Not exported to JS: the ring is the only JS write path.
     pub fn set_gravity(&mut self, x: f32, y: f32, z: f32) {
         self.physics.gx = x;
         self.physics.gy = y;
@@ -143,78 +246,6 @@ impl Runtime {
         self.spawn_direct(id, &BodyDesc::capsule_at([x, y, z], radius, half_len, inv_mass, restitution))
     }
 
-    pub fn bucket_counts_ptr(&self) -> *const u32 {
-        self.physics.bucket_counts.as_ptr()
-    }
-
-    pub fn sleeping_count(&self) -> u32 {
-        self.physics.sleeping.iter().zip(&self.physics.active).filter(|(s, a)| **s && **a).count() as u32
-    }
-
-    pub fn step(&mut self) {
-        let mut commands = std::mem::take(&mut self.commands);
-        self.ring.drain_commands(4096, &mut commands);
-        for cmd in commands.drain(..) {
-            if let Command::Grow { capacity } = cmd {
-                if !self.grow_to(capacity) {
-                    self.ring.note_malformed();
-                }
-                continue;
-            }
-            let Some((id, generation)) = cmd.target() else { continue };
-            if (id as usize) >= self.generations.len() || self.generations[id as usize] != generation {
-                self.ring.note_stale();
-                continue;
-            }
-            match cmd {
-                Command::Grow { .. } => {}
-                Command::Spawn { body, .. } => {
-                    self.transforms.write_transform(id, Transform { pos: body.pos, rot: body.rot });
-                    if self.physics_enabled {
-                        self.physics.spawn(id as usize, &body);
-                    }
-                }
-                Command::Destroy { .. } => {
-                    self.generations[id as usize] = generation.wrapping_add(1);
-                    self.transforms.write_transform(id, Transform::TOMBSTONE);
-                    if self.physics_enabled {
-                        self.physics.deactivate(id as usize);
-                    }
-                }
-                Command::Force { x, y, z, .. } => {
-                    if self.physics_enabled {
-                        self.physics.apply_impulse(id as usize, x, y, z);
-                    }
-                }
-            }
-        }
-        self.commands = commands;
-
-        if self.physics_enabled {
-            self.physics.step();
-            let p = &self.physics;
-            for i in 0..p.capacity {
-                if !p.active[i] {
-                    continue;
-                }
-                self.transforms.write_transform(
-                    i as u32,
-                    Transform {
-                        pos: [p.pos_x[i], p.pos_y[i], p.pos_z[i]],
-                        rot: [p.qx[i], p.qy[i], p.qz[i], p.qw[i]],
-                    },
-                );
-            }
-        }
-
-        self.transforms.publish(&self.header[H_STATE]);
-        self.header[H_STALE].store(self.ring.stale_dropped(), Ordering::Release);
-        self.header[H_MALFORMED].store(self.ring.malformed_dropped(), Ordering::Release);
-        self.header[H_TICKS].fetch_add(1, Ordering::AcqRel);
-    }
-}
-
-impl Runtime {
     #[cfg(test)]
     fn transforms_write_for_test(&self) -> usize {
         self.transforms.write_index_for_test()
@@ -227,8 +258,8 @@ impl Runtime {
             h[H_BUF0 + i].store(self.transforms.buf_ptr(i) as u32, Ordering::Release);
         }
         h[H_GENERATIONS].store(self.generations.as_ptr() as u32, Ordering::Release);
-        h[H_BUCKETS].store(self.physics.bucket_counts.as_ptr() as u32, Ordering::Release);
-        h[H_BUCKET_LEN].store(self.physics.bucket_counts.len() as u32, Ordering::Release);
+        h[H_BUCKETS].store(self.bucket_view.as_ptr() as u32, Ordering::Release);
+        h[H_BUCKET_LEN].store(self.bucket_view.len() as u32, Ordering::Release);
     }
 
     fn grow_to(&mut self, capacity: u32) -> bool {
@@ -239,6 +270,7 @@ impl Runtime {
         self.header[H_EPOCH].fetch_add(1, Ordering::AcqRel);
         self.transforms.grow(&self.header[H_STATE], capacity);
         self.generations.resize(capacity as usize, 0);
+        self.live.resize(capacity as usize, false);
         self.physics.resize(capacity as usize);
         self.publish_layout();
         self.header[H_EPOCH].fetch_add(1, Ordering::AcqRel);
@@ -651,14 +683,14 @@ mod tests {
     fn header_publishes_the_occupancy_histogram_and_it_counts_gridded_bodies() {
         let mut rt = Runtime::new(8, 8);
         rt.enable_physics();
-        assert_eq!(header(&rt, H_BUCKETS), rt.physics.bucket_counts.as_ptr() as u32);
+        assert_eq!(header(&rt, H_BUCKETS), rt.bucket_view.as_ptr() as u32);
         let len = header(&rt, H_BUCKET_LEN) as usize;
         assert_eq!(len, rt.physics.bucket_counts.len());
         rt.spawn_box(0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
         rt.spawn_box(1, 0.1, 0.0, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
         rt.spawn_sphere(2, 50.0, 0.0, 0.0, 0.5, 1.0, 0.0);
         rt.step();
-        let counts = &rt.physics.bucket_counts;
+        let counts: Vec<u32> = rt.bucket_view.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         assert_eq!(counts.iter().sum::<u32>(), 3);
         assert_eq!(*counts.iter().max().unwrap(), 2);
     }
@@ -685,6 +717,55 @@ mod tests {
         rt.ring.push(&Command::Destroy { id: 0, generation: 0 });
         rt.step();
         assert_eq!(rt.sleeping_count(), 0);
+    }
+
+    #[test]
+    fn gravity_command_changes_gravity_and_bypass_exports_are_not_wasm_exports() {
+        let mut rt = Runtime::new(2, 8);
+        rt.enable_physics();
+        rt.ring.push(&Command::Gravity { x: 0.0, y: 0.0, z: 0.0 });
+        rt.ring.push(&spawn_cmd(0, 0, unit_box(0.0, 5.0, 0.0)));
+        for _ in 0..30 { rt.step(); }
+        assert_eq!(entity(&rt, 0)[1], 5.0);
+        rt.ring.push(&Command::Gravity { x: 0.0, y: -9.81, z: 0.0 });
+        for _ in 0..30 { rt.step(); }
+        assert!(entity(&rt, 0)[1] < 4.9);
+    }
+
+    #[test]
+    fn spawn_on_a_live_id_is_rejected_and_destroy_frees_it() {
+        let mut rt = Runtime::new(2, 8);
+        rt.enable_physics();
+        rt.set_gravity(0.0, 0.0, 0.0);
+        rt.ring.push(&spawn_cmd(0, 0, unit_box(1.0, 0.0, 0.0)));
+        rt.ring.push(&spawn_cmd(0, 0, unit_box(9.0, 0.0, 0.0)));
+        rt.step();
+        assert_eq!(rt.malformed_dropped(), 1);
+        assert_eq!(entity(&rt, 0)[0], 1.0);
+        rt.ring.push(&Command::Destroy { id: 0, generation: 0 });
+        rt.ring.push(&spawn_cmd(0, 1, unit_box(4.0, 0.0, 0.0)));
+        rt.step();
+        assert_eq!(rt.malformed_dropped(), 1);
+        assert_eq!(entity(&rt, 0)[0], 4.0);
+    }
+
+    #[test]
+    fn header_publishes_ring_depth_contacts_and_dropped_contacts() {
+        let mut rt = Runtime::new(4, 8);
+        rt.enable_physics();
+        rt.spawn_box(0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
+        rt.spawn_box(1, 0.0, 0.9, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
+        rt.set_gravity(0.0, 0.0, 0.0);
+        for _ in 0..3 { rt.ring.push(&Command::Gravity { x: 0.0, y: 0.0, z: 0.0 }); }
+        rt.step();
+        assert_eq!(header(&rt, H_RING_PENDING), 0);
+        let mut busy = Runtime::new(2, 8192);
+        for _ in 0..4100 { busy.ring.push(&Command::Gravity { x: 0.0, y: 0.0, z: 0.0 }); }
+        busy.step();
+        assert_eq!(header(&busy, H_RING_PENDING), 4, "one step drains at most 4096 commands");
+        assert!(header(&rt, H_CONTACTS) >= 1);
+        assert_eq!(header(&rt, H_DROPPED_CONTACTS), 0);
+        assert_eq!(header(&rt, H_OVERRUNS), 0);
     }
 
     #[test]

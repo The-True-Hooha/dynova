@@ -20,6 +20,7 @@ self.onmessage = async (e: MessageEvent<SimInit>) => {
         post({ type: 'ready', layout: layoutFromRuntime(runtime) });
 
         if (!autoRun) return;
+        const stats = new Int32Array(memory.buffer, runtime.header_ptr(), 16);
         const stepMs = 1000 / hz;
         let next = performance.now();
         const loop = () => {
@@ -31,7 +32,10 @@ self.onmessage = async (e: MessageEvent<SimInit>) => {
                     steps++;
                     next += stepMs;
                 }
-                if (steps === 5) next = now + stepMs;
+                if (steps === 5) {
+                    Atomics.add(stats, 14, 1);
+                    next = now + stepMs;
+                }
                 setTimeout(loop, Math.max(0, next - performance.now()));
             } catch (err) {
                 post({ type: 'error', message: err instanceof Error ? err.message : String(err) });

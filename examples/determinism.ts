@@ -1,20 +1,22 @@
-import { TransformView } from '@dynova/sdk';
+import { TransformView, World, layoutFromRuntime, SHAPE_SPHERE } from '@dynova/sdk';
 
 // Inputs are rounded to f32 stepwise, exactly like the native test. Same scene and hash as `physics_scene_matches_golden_hash` in core/src/runtime.rs.
 async function run() {
     const glue = await import('../sdk/typescript/wasm-st/dynova_core.js');
     const exports = await glue.default() as unknown as { memory: WebAssembly.Memory };
-    const rt = new glue.Runtime(64, 64);
+    const config = { capacity: 64, ringCapacity: 64 };
+    const rt = new glue.Runtime(config.capacity, config.ringCapacity);
     rt.enable_physics();
-    rt.spawn_box(0, 0, -5, 0, 20, 0.5, 20, 0, 0.1);
+    const world = World.attachSync(config, exports.memory, 'fallback', layoutFromRuntime(rt), rt);
     const f = Math.fround;
+    world.spawn({ y: -5, hx: 20, hy: 0.5, hz: 20, invMass: 0, restitution: 0.1 });
     for (let i = 1; i < 20; i++) {
-        rt.spawn_box(i, f(f(i % 5) * f(1.1)), f(f(-4) + f(f(Math.floor(i / 5)) * f(1.1))), 0, 0.5, 0.5, 0.5, 1, 0.3);
+        world.spawn({ x: f(f(i % 5) * f(1.1)), y: f(f(-4) + f(f(Math.floor(i / 5)) * f(1.1))), hx: 0.5, hy: 0.5, hz: 0.5, invMass: 1, restitution: 0.3 });
     }
     for (let i = 20; i < 30; i++) {
-        rt.spawn_sphere(i, f(f(f(i % 5) * f(1)) + f(0.3)), f(f(0) + f(Math.floor(i / 5))), 0.2, 0.4, 1, 0.2);
+        world.spawn({ x: f(f(f(i % 5) * f(1)) + f(0.3)), y: f(f(0) + f(Math.floor(i / 5))), z: 0.2, shape: SHAPE_SPHERE, hx: 0.4, hy: 0.4, hz: 0.4, invMass: 1, restitution: 0.2 });
     }
-    for (let i = 0; i < 300; i++) rt.step();
+    for (let i = 0; i < 300; i++) world.step();
 
     const buf = new TransformView(exports.memory, rt.header_ptr()).read();
     const bits = new Uint32Array(1);
@@ -26,7 +28,7 @@ async function run() {
             h = ((h * 1099511628211n) & 0xffffffffffffffffn) ^ BigInt(bits[0]);
         }
     }
-    return { hash: h.toString(), userAgent: navigator.userAgent };
+    return { hash: h.toString(), probe: glue.determinism_probe().toString(), userAgent: navigator.userAgent };
 }
 
 run().then(

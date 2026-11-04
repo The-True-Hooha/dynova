@@ -7,7 +7,10 @@ pub const TAG_SPAWN: u8   = 0;
 pub const TAG_DESTROY: u8 = 1;
 pub const TAG_FORCE: u8   = 2;
 pub const TAG_GROW: u8    = 3;
-pub const MAX_CAPACITY: u32 = 1 << 20;
+pub const TAG_GRAVITY: u8 = 4;
+/// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
+pub const MAX_CAPACITY: u32 = 1 << 18;
+pub const MAX_GRAVITY: f32 = 1000.0;
 
 const MAX_FORCE: f32 = 1.0e6;
 
@@ -30,6 +33,7 @@ pub enum Command {
     Destroy { id: u32, generation: u8 },
     Force   { id: u32, generation: u8, x: f32, y: f32, z: f32 },
     Grow    { capacity: u32 },
+    Gravity { x: f32, y: f32, z: f32 },
 }
 
 impl Command {
@@ -38,7 +42,7 @@ impl Command {
             Command::Spawn   { id, generation, .. }
             | Command::Destroy { id, generation }
             | Command::Force   { id, generation, .. } => Some((*id, *generation)),
-            Command::Grow { .. } => None,
+            Command::Grow { .. } | Command::Gravity { .. } => None,
         }
     }
 }
@@ -166,6 +170,10 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             wr_f32(b, OFF_FRICTION, body.friction);
         }
         Command::Destroy { .. } => b[0] = TAG_DESTROY,
+        Command::Gravity { x, y, z } => {
+            b[0] = TAG_GRAVITY;
+            wr_f32x(b, OFF_POS, &[*x, *y, *z]);
+        }
         Command::Grow { capacity } => {
             b[0] = TAG_GROW;
             b[OFF_POS..OFF_POS + 4].copy_from_slice(&capacity.to_le_bytes());
@@ -199,6 +207,10 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
             Some(Command::Spawn { id, generation, body })
         }
         TAG_DESTROY => Some(Command::Destroy { id, generation }),
+        TAG_GRAVITY => {
+            let v: [f32; 3] = rd_f32x(b, OFF_POS);
+            (all_finite(&v) && v.iter().all(|f| f.abs() <= MAX_GRAVITY)).then_some(Command::Gravity { x: v[0], y: v[1], z: v[2] })
+        }
         TAG_GROW => {
             let capacity = u32::from_le_bytes([b[OFF_POS], b[OFF_POS + 1], b[OFF_POS + 2], b[OFF_POS + 3]]);
             (1..=MAX_CAPACITY).contains(&capacity).then_some(Command::Grow { capacity })
@@ -485,5 +497,27 @@ mod tests {
         ring.drain_commands(8, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(ring.malformed_dropped(), 3);
+    }
+
+    #[test]
+    fn gravity_round_trips_and_rejects_hostile_values() {
+        let mut ring = CommandRing::new(8);
+        let g = Command::Gravity { x: 0.0, y: -9.81, z: 0.0 };
+        ring.push(&g);
+        ring.push(&Command::Gravity { x: f32::NAN, y: 0.0, z: 0.0 });
+        ring.push(&Command::Gravity { x: 0.0, y: -1.0e9, z: 0.0 });
+        ring.push(&Command::Gravity { x: 0.0, y: f32::INFINITY, z: 0.0 });
+        let mut out = Vec::new();
+        ring.drain_commands(8, &mut out);
+        assert_eq!(out, vec![g]);
+        assert_eq!(ring.malformed_dropped(), 3);
+    }
+
+    #[test]
+    fn max_capacity_keeps_a_full_grow_inside_the_one_gib_wasm_limit() {
+        // per entity: 3 transform buffers + 2 retained generations (7 f32 each) + ~30 physics columns + bookkeeping
+        let per_entity = 5 * 7 * 4 + 30 * 4 + 64;
+        assert!((MAX_CAPACITY as u64) * per_entity < (1u64 << 30) / 2, "MAX_CAPACITY {MAX_CAPACITY} too large");
+        assert_eq!(MAX_CAPACITY, 1 << 18, "changing the cap needs a new memory budget");
     }
 }

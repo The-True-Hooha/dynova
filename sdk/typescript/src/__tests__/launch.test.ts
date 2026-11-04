@@ -87,6 +87,7 @@ describe('launchWorld', () => {
         ['ringCapacity 0', { capacity: 8, ringCapacity: 0 }, undefined],
         ['capacity 0', { capacity: 0, ringCapacity: 4 }, undefined],
         ['capacity 1.5', { capacity: 1.5, ringCapacity: 4 }, undefined],
+        ['capacity above the wasm-safe maximum', { capacity: (1 << 18) + 1, ringCapacity: 4 }, undefined],
         ['hz 0', { capacity: 8, ringCapacity: 4 }, 0],
         ['hz NaN', { capacity: 8, ringCapacity: 4 }, NaN],
     ])('rejects invalid config before touching a worker: %s', async (_n, cfg, hz) => {

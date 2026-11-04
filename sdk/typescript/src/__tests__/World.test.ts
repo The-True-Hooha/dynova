@@ -301,6 +301,24 @@ describe('World growth', () => {
         expect(order).toEqual([...order].sort((a, b) => a - b));
         expect(buf0(world)).toBe(1);
     });
+    it('setGravity enqueues a command, validates input, and respects backpressure order', () => {
+        const { world } = makeWorld(config);
+        world.setGravity(0, -9.81, 0);
+        expect(world.pendingCommands).toBe(1);
+        for (const bad of [[NaN, 0, 0], [0, Infinity, 0], [0, 0, 1e6]] as const) {
+            expect(() => world.setGravity(bad[0], bad[1], bad[2])).toThrow(RangeError);
+        }
+        expect(world.pendingCommands).toBe(1);
+    });
+
+    it('runtimeStats reads ring depth, dropped contacts, overruns and contacts from the header', () => {
+        const { world, rt } = makeWorld(config);
+        Atomics.store(rt.header, 12, 5);
+        Atomics.store(rt.header, 13, 2);
+        Atomics.store(rt.header, 14, 7);
+        Atomics.store(rt.header, 15, 11);
+        expect(world.runtimeStats).toEqual({ ringPending: 5, droppedContacts: 2, workerOverruns: 7, contacts: 11 });
+    });
 });
 
 function buf0(world: import('../World.js').World) { return world.readTransforms()[0]; }
