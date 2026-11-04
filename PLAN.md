@@ -129,6 +129,10 @@ Out-of-plan observations. Do not act on these without approval.
 - (low) "cross-thread view-refresh broadcast" is a pull of the shared epoch by the single main-thread World; a second thread must poll `peekEpoch`. Single consumer only: an array from `readTransforms()` is valid until the next read and until at most two growths.
 - (Step 7) Per-browser results to record: Chromium + WebKit verified (fuzz x3 seeds, determinism, plumbing, physics); Firefox unverified in this sandbox.
 
+- (Phase 5 BVH decision) Broadphase cost cliffs: one large dynamic body widens the grid cell for everyone (1000 boxes + one half-50 box = ~500k narrow calls/step); `big_statics` is scanned for every awake body (cost awake x big statics). Neither is needed for the roadmap exit scenes; decide with the bucket histogram (Step 6.6) data.
+- (Step 6) Island sleeping replaces the interim "wake sleepers next to an embedded body" rule; speed-only sleep threshold 0.3 m/s is very high; micro-velocity clamp still zeroes all velocity axes of a shallow resting contact; contacts past MAX_CONTACTS (16384) drop silently (add a counter); NaN positions are not quarantined (skip non-finite bodies in step); `eff_mass` clone and `targets`/`contacts` regrow each step.
+- (low) Wake timer asymmetry (`-SLEEP_TIME` on one side) was left as is.
+
 ## Plan changes
 
 - 2026-11-04: worker topology = Web Worker + SAB with sync fallback (user approved).
@@ -136,3 +140,4 @@ Out-of-plan observations. Do not act on these without approval.
 - 2026-11-04: Playwright cross-browser (Chromium, Firefox, WebKit) from Step 4 (user approved).
 - 2026-11-04: Step 3 removed `World.grow()`/`initialPages` from World (growth redesign is Step 4); added `World.dispose()`/`markFatal`, `launchWorld` config validation, a second non-shared wasm build (`wasm-st`, `make build-st`) and Playwright e2e (`make e2e`).
 - 2026-11-04: Step 4 replaced the double buffer with a lock-free triple buffer (state word packs latest/new/reader), added a shared 12-word layout header with a seqlock epoch (odd while growing; growth number = epoch/2), a `Grow` ring command, ticks/stale/malformed counters in the header, and a JS-side bounded deferred queue for backpressure instead of growing the ring. `TAG_GROW` slot added; ring no longer filters ids (apply-time checks only).
+- 2026-11-04: Step 5 restructured `PhysicsWorld::step` into contacts -> wake -> integrate velocities -> targets -> warm start -> 12 biased iterations -> integrate positions (was: positions first, direct positional correction, early return on separating contacts), because the 50-box stack could not settle otherwise. Broadphase now grids all non-giant bodies with a 27-cell deduped query and adaptive cell size; sleeping requires touching and not embedded; solver constants: BIAS_FACTOR 0.05, MAX_BIAS_VEL 0.5, SOLVER_ITERS 12, SLOP 0.01. Golden hash re-pinned (Rust + browser spec). Warm start, sleeping and the two-phase ordering from Step 6 items 1 and 3 are partially pulled forward; Step 6 still owns per-contact friction, island sleeping, OBB/capsule, CCD and the histogram.
