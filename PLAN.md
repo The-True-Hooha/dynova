@@ -97,6 +97,37 @@ In order:
 
 ---
 
+## Phase 3 steps (added 2026-11-04 on user go-ahead; same rules apply)
+
+Order is fixed. Each step ends with its tests, the verification gate and a commit.
+
+### Step 8 — Three.js instanced adapter (3A part 1)
+- New workspace package `renderer/three` (`@dynova/three`), peer-depends on `three`. `threeAdapter(world, instancedMesh)` writes instance matrices from `world.readTransforms()`; no per-entity Three objects; Dynova never creates a `THREE.Scene`.
+- Tombstoned slots (`qw == 0`) become zero-scale matrices; an optional per-instance scale source is a later step.
+- Edge cases to test: capacity growth mid-run (instance count / buffer swap), tombstones, non-unit quaternions, `count` less than capacity, NaN-free matrices, repeated calls without a new frame.
+- **Exit:** unit tests with a real `THREE.InstancedMesh` in Node; an e2e page renders 50 boxes through the adapter in Chromium and WebKit and the matrices match the transform buffer.
+
+### Step 9 — Convex hull collider in the runtime (3A part 2)
+- Hull data reaches Rust only through the ring: chunked `HullVerts` commands plus a `HullCommit`; spawn references a hull id. Validate counts, finiteness, bounds; cap vertices per hull and hulls per world.
+- Narrow phase: hull-vs-hull SAT with face clipping, hull-vs-box/sphere/capsule via the same routines; AABB/extent for the broadphase; inertia from the hull.
+- **Exit:** unit tests (degenerate hulls, coplanar points, huge/NaN vertices, hull==box equivalence against `box_box`), a hull pyramid settles, no panic from hostile ring bytes.
+
+### Step 10 — GLTF to colliders (3A part 3)
+- TS helper: load GLTF, extract meshes, fit box/sphere/capsule where the fit error is small, otherwise compute a convex hull (quickhull in TS, vertex cap), emit hull + spawn commands through `World`.
+- **Exit:** fixture GLTF (checked-in, generated in a test) produces the expected colliders; hull simplification is deterministic.
+
+### Step 11 — Stage 3A exit demo
+- **Exit (ROADMAP):** load a GLTF scene, spawn colliders matching the visual meshes, drop bodies, they collide and render correctly in Chromium and WebKit.
+
+### Step 12 — Adapter contract and second renderer (3B)
+- Formal adapter interface (buffer layout doc + TS type), a Canvas2D adapter as the proof, runtime swap Three.js to Canvas2D with zero `core/` changes.
+- **Exit (ROADMAP):** same buffer, same World, swap adapters at runtime; any `core/` change means the contract was wrong and is fixed here.
+
+### Step 13 — Phase 3 docs and final gate
+- README and ROADMAP progress, final adversarial review, one fixer pass, full gate, commit.
+
+---
+
 ## Open decisions (need user answer before the step that depends on them)
 
 1. ~~Worker topology~~ — DECIDED: dedicated Web Worker owns `Runtime` on shared WASM memory; sync main-thread fallback behind the same `World` API.

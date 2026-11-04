@@ -1,0 +1,25 @@
+{
+  "name": "@dynova/three",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@dynova/sdk": "workspace:*"
+  },
+  "peerDependencies": {
+    "three": ">=0.160"
+  },
+  "devDependencies": {
+    "three": "^0.170.0",
+    "@types/three": "^0.170.0",
+    "typescript": "^7.0",
+    "vitest": "^4.0"
+  }
+}

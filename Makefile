@@ -27,6 +27,7 @@ dev:
 # Run SDK unit tests
 test:
 	pnpm --filter @dynova/sdk test
+	pnpm --filter @dynova/three test
 
 # Watch mode for tests
 test-watch:
@@ -35,6 +36,7 @@ test-watch:
 # Typecheck SDK TypeScript
 check:
 	pnpm --filter @dynova/sdk typecheck
+	pnpm --filter @dynova/three typecheck
 
 # Full rebuild from scratch: release WASM + install deps
 all: build-release build-st install
