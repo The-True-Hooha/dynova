@@ -40,4 +40,14 @@ describe('createMemory', () => {
         expect(memory).toBeInstanceOf(WebAssembly.Memory);
         globalThis.SharedArrayBuffer = orig;
     });
+
+    it('returns headers-missing when SharedArrayBuffer exists but the page is not cross-origin isolated', () => {
+        const g = globalThis as { crossOriginIsolated?: boolean };
+        g.crossOriginIsolated = false;
+        try {
+            expect(detectMode()).toBe('headers-missing');
+        } finally {
+            delete g.crossOriginIsolated;
+        }
+    });
 });

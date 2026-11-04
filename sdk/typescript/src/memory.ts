@@ -7,6 +7,7 @@ export interface MemoryResult {
 
 export function detectMode(): MemoryMode {
     if (typeof SharedArrayBuffer === 'undefined') return 'fallback';
+    if (typeof crossOriginIsolated !== 'undefined' && !crossOriginIsolated) return 'headers-missing';
     try {
         new SharedArrayBuffer(4);
         return 'shared';

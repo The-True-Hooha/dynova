@@ -51,6 +51,16 @@ export class EntityIdAllocator {
         return true;
     }
 
+    setCapacity(capacity: number): void {
+        if (capacity <= this.capacity) return;
+        const live = new Int16Array(capacity).fill(NOT_LIVE);
+        live.set(this.liveGen);
+        this.liveGen = live;
+        this.capacity = capacity;
+    }
+
+    get capacityNow(): number { return this.capacity; }
+
     get allocated(): number {
         return Atomics.load(this.counter, 0);
     }

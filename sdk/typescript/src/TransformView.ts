@@ -1,40 +1,99 @@
 export const FLOATS_PER_TRANSFORM = 7;
 
-export class TransformView {
-    private a: Float32Array;
-    private b: Float32Array;
-    private flag: Int32Array;
+export const H_EPOCH = 0;
+export const H_CAPACITY = 1;
+export const H_BUF0 = 2;
+export const H_STATE = 5;
+export const H_TICKS = 7;
+export const H_STALE = 8;
+export const H_MALFORMED = 9;
+export const HEADER_WORDS = 12;
 
-    constructor(memory: WebAssembly.Memory, aByteOffset: number, bByteOffset: number, flagByteOffset: number, capacity: number) {
-        const len = capacity * FLOATS_PER_TRANSFORM;
-        this.a = new Float32Array(memory.buffer, aByteOffset, len);
-        this.b = new Float32Array(memory.buffer, bByteOffset, len);
-        this.flag = new Int32Array(memory.buffer, flagByteOffset, 1);
+const MAX_SPINS = 5_000_000;
+const NEW_FLAG = 0b100;
+const READER_SHIFT = 3;
+
+export class TransformView {
+    private header: Int32Array;
+    private bufs: Float32Array[] = [];
+    private memory: WebAssembly.Memory;
+    private headerByteOffset: number;
+    private _epoch = -1;
+    private _capacity = 0;
+
+    constructor(memory: WebAssembly.Memory, headerByteOffset: number) {
+        this.memory = memory;
+        this.headerByteOffset = headerByteOffset;
+        this.header = new Int32Array(memory.buffer, headerByteOffset, HEADER_WORDS);
+        this.reacquire();
     }
 
+    get epoch(): number { return this._epoch; }
+    get capacity(): number { return this._capacity; }
+
+    /** Runtime counters published by the worker each step. */
+    counters(): { ticks: number; staleDropped: number; malformedDropped: number } {
+        return {
+            ticks: Atomics.load(this.header, H_TICKS) >>> 0,
+            staleDropped: Atomics.load(this.header, H_STALE) >>> 0,
+            malformedDropped: Atomics.load(this.header, H_MALFORMED) >>> 0,
+        };
+    }
+
+    /**
+     * Epoch the writer has published; differs from `epoch` when buffers were reallocated. The epoch is a
+     * seqlock: odd while the runtime rewrites the layout, even when stable. Growth number = epoch / 2.
+     */
+    peekEpoch(): number { return Atomics.load(this.header, H_EPOCH); }
+
+    /** Rebuild every view from the shared header. Retries if the writer grows again mid-read. */
+    reacquire(): void {
+        for (let spins = 0; ; spins++) {
+            if (spins > MAX_SPINS) throw new Error('layout update stuck: the runtime never finished growing its buffers');
+            this.header = new Int32Array(this.memory.buffer, this.headerByteOffset, HEADER_WORDS);
+            const epoch = Atomics.load(this.header, H_EPOCH);
+            if (epoch & 1) continue;
+            const capacity = Atomics.load(this.header, H_CAPACITY);
+            const len = capacity * FLOATS_PER_TRANSFORM;
+            const bufs = [0, 1, 2].map(
+                (i) => new Float32Array(this.memory.buffer, Atomics.load(this.header, H_BUF0 + i), len),
+            );
+            if (Atomics.load(this.header, H_EPOCH) !== epoch) continue;
+            this.bufs = bufs;
+            this._epoch = epoch;
+            this._capacity = capacity;
+            return;
+        }
+    }
+
+    private acquire(): number {
+        for (;;) {
+            const cur = Atomics.load(this.header, H_STATE);
+            if ((cur & NEW_FLAG) === 0) return (cur >> READER_SHIFT) & 3;
+            const next = ((cur >> READER_SHIFT) & 3) | ((cur & 3) << READER_SHIFT);
+            if (Atomics.compareExchange(this.header, H_STATE, cur, next) === cur) return (next >> READER_SHIFT) & 3;
+        }
+    }
+
+    /**
+     * Latest published frame. Single consumer: the returned array is valid until the next `read()`,
+     * after which the writer may reuse it, and until at most two buffer growths have happened.
+     * Never returns a half-written frame to that consumer.
+     */
     read(): Float32Array {
-        const writing = Atomics.load(this.flag, 0);
-        return writing === 0 ? this.b : this.a;
+        for (let spins = 0; ; spins++) {
+            if (spins > MAX_SPINS) throw new Error('layout update stuck: the runtime never finished growing its buffers');
+            const e = Atomics.load(this.header, H_EPOCH);
+            if (e & 1) continue;
+            if (e !== this._epoch) this.reacquire();
+            const idx = this.acquire();
+            if (Atomics.load(this.header, H_EPOCH) === this._epoch) return this.bufs[idx];
+        }
     }
 
     readEntity(entityId: number): { x: number; y: number; z: number; qx: number; qy: number; qz: number; qw: number } {
         const buf = this.read();
         const o = entityId * FLOATS_PER_TRANSFORM;
-        return {
-            x:  buf[o],
-            y:  buf[o + 1],
-            z:  buf[o + 2],
-            qx: buf[o + 3],
-            qy: buf[o + 4],
-            qz: buf[o + 5],
-            qw: buf[o + 6],
-        };
-    }
-
-    reacquire(memory: WebAssembly.Memory, aByteOffset: number, bByteOffset: number, flagByteOffset: number, capacity: number): void {
-        const len = capacity * FLOATS_PER_TRANSFORM;
-        this.a = new Float32Array(memory.buffer, aByteOffset, len);
-        this.b = new Float32Array(memory.buffer, bByteOffset, len);
-        this.flag = new Int32Array(memory.buffer, flagByteOffset, 1);
+        return { x: buf[o], y: buf[o + 1], z: buf[o + 2], qx: buf[o + 3], qy: buf[o + 4], qz: buf[o + 5], qw: buf[o + 6] };
     }
 }

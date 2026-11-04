@@ -8,7 +8,10 @@ const READER_SHIFT: u32 = 3;
 const READER_MASK: u32 = 0b11 << READER_SHIFT;
 
 pub const INITIAL_STATE: u32 = 1 | (2 << READER_SHIFT);
+/// A reader holding an array across more than this many growths may see it reused.
+pub const RETAINED_GENERATIONS: usize = 2;
 const INITIAL_WRITE: usize = 0;
+const INITIAL_LATEST: usize = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
@@ -32,6 +35,9 @@ pub struct TransformBuffers {
     pub(crate) bufs: [Vec<f32>; 3],
     retired: Vec<[Vec<f32>; 3]>,
     write: usize,
+    /// Buffer holding the newest published frame. The state word's `latest` slot can hold an older frame
+    /// once the reader has acquired, so growth must not use it.
+    published: usize,
     capacity: u32,
 }
 
@@ -42,6 +48,7 @@ impl TransformBuffers {
             bufs: [vec![0.0; len], vec![0.0; len], vec![0.0; len]],
             retired: Vec::new(),
             write: INITIAL_WRITE,
+            published: INITIAL_LATEST,
             capacity,
         }
     }
@@ -75,6 +82,7 @@ impl TransformBuffers {
     /// bring it up to date so entities not rewritten next frame stay visible.
     pub fn publish(&mut self, state: &AtomicU32) {
         let published = self.write;
+        self.published = published;
         let mut cur = state.load(Ordering::Acquire);
         loop {
             let next = (cur & READER_MASK) | NEW_FLAG | published as u32;
@@ -88,23 +96,26 @@ impl TransformBuffers {
         dst.copy_from_slice(src);
     }
 
-    /// Reallocate every buffer. Old buffers stay alive until the next growth so a reader that has not yet
-    /// noticed the new epoch keeps reading valid memory. Returns the fresh state word to store.
+    /// Reallocate every buffer. Edits applied since the last publish live only in the write buffer, so the
+    /// new write buffer is seeded from it and the other two from the published frame. Old buffers stay
+    /// alive until the next growth so a reader that has not yet noticed the new epoch keeps reading valid memory.
     pub fn grow(&mut self, state: &AtomicU32, new_capacity: u32) {
         debug_assert!(new_capacity > self.capacity);
-        let latest = Self::latest_index(state);
         let len = new_capacity as usize * FLOATS_PER_TRANSFORM;
-        let fresh = |old: &Vec<f32>| {
+        let seeded = |old: &Vec<f32>| {
             let mut v = vec![0.0; len];
             v[..old.len()].copy_from_slice(old);
             v
         };
-        let published = self.bufs[latest].clone();
-        let new = [fresh(&published), fresh(&published), fresh(&published)];
+        let published = &self.bufs[self.published];
+        let new = [seeded(&self.bufs[self.write]), seeded(published), seeded(published)];
         let old = std::mem::replace(&mut self.bufs, new);
-        self.retired.clear();
+        if self.retired.len() >= RETAINED_GENERATIONS {
+            self.retired.remove(0);
+        }
         self.retired.push(old);
         self.write = INITIAL_WRITE;
+        self.published = INITIAL_LATEST;
         self.capacity = new_capacity;
         state.store(INITIAL_STATE, Ordering::Release);
     }
@@ -258,12 +269,91 @@ mod tests {
     }
 
     #[test]
-    fn second_grow_releases_the_first_generation_only() {
+    fn growth_retains_exactly_the_last_two_generations() {
         let mut tb = TransformBuffers::new(1);
         let s = state();
         tb.grow(&s, 2);
         tb.grow(&s, 3);
-        assert_eq!(tb.retired.len(), 1);
+        assert_eq!(tb.retired.len(), 2);
+        tb.grow(&s, 4);
+        assert_eq!(tb.retired.len(), 2);
         assert_eq!(tb.retired[0][0].len(), 2 * 7);
+        assert_eq!(tb.retired[1][0].len(), 3 * 7);
+    }
+
+    #[test]
+    fn grow_keeps_unpublished_writes_out_of_the_reader_frame_but_in_the_writer() {
+        let mut tb = TransformBuffers::new(2);
+        let s = state();
+        tb.write_transform(0, Transform::at(1.0, 0.0, 0.0));
+        tb.publish(&s);
+        tb.write_transform(1, Transform::at(2.0, 0.0, 0.0));
+        tb.grow(&s, 4);
+        let held = reader_acquire(&s);
+        assert_eq!(pos(&tb, held, 1), [0.0; 3], "reader must not see a half-applied step");
+        assert_eq!(pos(&tb, held, 0), [1.0, 0.0, 0.0]);
+        assert_eq!(pos(&tb, tb.write, 1), [2.0, 0.0, 0.0]);
+        tb.publish(&s);
+        let held = reader_acquire(&s);
+        assert_eq!(pos(&tb, held, 1), [2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn grow_after_the_reader_acquired_still_carries_the_newest_published_frame() {
+        let mut tb = TransformBuffers::new(2);
+        let s = state();
+        tb.write_transform(0, Transform::at(1.0, 0.0, 0.0));
+        tb.publish(&s);
+        reader_acquire(&s);
+        tb.write_transform(1, Transform::at(2.0, 0.0, 0.0));
+        tb.grow(&s, 4);
+        let held = reader_acquire(&s);
+        assert_eq!(pos(&tb, held, 0), [1.0, 0.0, 0.0], "published frame lost across grow");
+        assert_eq!(pos(&tb, held, 1), [0.0; 3]);
+        assert_eq!(pos(&tb, tb.write, 0), [1.0, 0.0, 0.0]);
+        assert_eq!(pos(&tb, tb.write, 1), [2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn random_edit_publish_acquire_grow_matches_a_simple_model() {
+        for seed in 1..=200u32 {
+            let mut rng = seed.wrapping_mul(2654435761);
+            let mut next = move || { rng = rng.wrapping_mul(1664525).wrapping_add(1013904223); rng >> 8 };
+            let mut tb = TransformBuffers::new(2);
+            let s = state();
+            let mut cap = 2usize;
+            let mut working: Vec<f32> = vec![0.0; cap * 7];
+            let mut published: Vec<f32> = vec![0.0; cap * 7];
+            for step in 0..300 {
+                match next() % 6 {
+                    0 | 1 => {
+                        let id = (next() as usize) % cap;
+                        let v = (step * 10 + id) as f32 + 1.0;
+                        tb.write_transform(id as u32, Transform::at(v, 0.0, 0.0));
+                        working[id * 7] = v;
+                        working[id * 7 + 6] = 1.0;
+                    }
+                    2 => {
+                        tb.publish(&s);
+                        published = working.clone();
+                    }
+                    3 | 4 => {
+                        let held = reader_acquire(&s);
+                        assert_eq!(tb.bufs[held][..cap * 7], published[..], "seed {seed} step {step}: reader frame != last published");
+                    }
+                    _ => {
+                        if cap < 40 {
+                            let new_cap = cap + 1 + (next() as usize) % 3;
+                            tb.grow(&s, new_cap as u32);
+                            working.resize(new_cap * 7, 0.0);
+                            published.resize(new_cap * 7, 0.0);
+                            cap = new_cap;
+                        }
+                    }
+                }
+                assert_permutation(&tb, &s);
+                assert_eq!(tb.bufs[tb.write][..cap * 7], working[..], "seed {seed} step {step}: writer buffer != working model");
+            }
+        }
     }
 }

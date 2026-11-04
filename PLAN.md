@@ -122,9 +122,17 @@ Out-of-plan observations. Do not act on these without approval.
 - (low) Firefox cannot launch under this sandbox; run `pnpm exec playwright test --project=firefox` in a normal terminal.
 - (low) `allocatedEntities` is the monotonic id counter, not the live count; document.
 
+- (Step 5/6) Grow allocation failure (huge capacity near the 1 GiB wasm max) traps mid-`grow_to` after the state reset; use `try_reserve` for every vector before mutating and count failure as a rejected command.
+- (Step 5/6) Fuzz weakness: all live slots share one pattern, so a stale-but-whole slot or wrong-epoch frame is indistinguishable from a correct one. Use per-frame unique values (tick in x, id^tick in y/z), assert a single tick per frame and monotonic ticks, and model-check every read.
+- (low) CommandRing.grow slot zeroing and the JS acquire CAS are not killed by a test (needs a JS-side racing publish/acquire test or a Worker+SAB test); post-read `applyEpoch` late path is untested.
+- (low) Header counters (ticks/stale/malformed) are separate stores, so a reader can see tick N with counters from tick N-1.
+- (low) "cross-thread view-refresh broadcast" is a pull of the shared epoch by the single main-thread World; a second thread must poll `peekEpoch`. Single consumer only: an array from `readTransforms()` is valid until the next read and until at most two growths.
+- (Step 7) Per-browser results to record: Chromium + WebKit verified (fuzz x3 seeds, determinism, plumbing, physics); Firefox unverified in this sandbox.
+
 ## Plan changes
 
 - 2026-11-04: worker topology = Web Worker + SAB with sync fallback (user approved).
 - 2026-11-04: convex hull moved from Stage 2B to Phase 3 Stage 3A; capsule + OBB SAT stay in 2B (user approved). ROADMAP.md 2B/3A text needs matching edit in Step 7.
 - 2026-11-04: Playwright cross-browser (Chromium, Firefox, WebKit) from Step 4 (user approved).
 - 2026-11-04: Step 3 removed `World.grow()`/`initialPages` from World (growth redesign is Step 4); added `World.dispose()`/`markFatal`, `launchWorld` config validation, a second non-shared wasm build (`wasm-st`, `make build-st`) and Playwright e2e (`make e2e`).
+- 2026-11-04: Step 4 replaced the double buffer with a lock-free triple buffer (state word packs latest/new/reader), added a shared 12-word layout header with a seqlock epoch (odd while growing; growth number = epoch/2), a `Grow` ring command, ticks/stale/malformed counters in the header, and a JS-side bounded deferred queue for backpressure instead of growing the ring. `TAG_GROW` slot added; ring no longer filters ids (apply-time checks only).

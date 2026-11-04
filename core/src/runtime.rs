@@ -9,7 +9,10 @@ const H_CAPACITY: usize = 1;
 const H_BUF0: usize = 2;
 const H_STATE: usize = 5;
 const H_GENERATIONS: usize = 6;
-const HEADER_WORDS: usize = 8;
+const H_TICKS: usize = 7;
+const H_STALE: usize = 8;
+const H_MALFORMED: usize = 9;
+const HEADER_WORDS: usize = 12;
 
 #[wasm_bindgen]
 pub struct Runtime {
@@ -42,7 +45,7 @@ impl Runtime {
         rt
     }
 
-    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, _].
+    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, _, _].
     pub fn header_ptr(&self) -> *const u32 {
         self.header.as_ptr() as *const u32
     }
@@ -133,7 +136,7 @@ impl Runtime {
 
     pub fn step(&mut self) {
         let mut commands = std::mem::take(&mut self.commands);
-        self.ring.drain_commands(self.generations.len(), 4096, &mut commands);
+        self.ring.drain_commands(4096, &mut commands);
         for cmd in commands.drain(..) {
             if let Command::Grow { capacity } = cmd {
                 if !self.grow_to(capacity) {
@@ -188,6 +191,9 @@ impl Runtime {
         }
 
         self.transforms.publish(&self.header[H_STATE]);
+        self.header[H_STALE].store(self.ring.stale_dropped(), Ordering::Release);
+        self.header[H_MALFORMED].store(self.ring.malformed_dropped(), Ordering::Release);
+        self.header[H_TICKS].fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -210,6 +216,8 @@ impl Runtime {
         if capacity <= self.transforms.capacity() {
             return false;
         }
+        // Seqlock: odd epoch means the layout is being rewritten; readers retry until it is even and unchanged.
+        self.header[H_EPOCH].fetch_add(1, Ordering::AcqRel);
         self.transforms.grow(&self.header[H_STATE], capacity);
         self.generations.resize(capacity as usize, 0);
         self.physics.resize(capacity as usize);
@@ -536,7 +544,7 @@ mod tests {
         let old_ptrs: Vec<u32> = (0..3).map(|i| header(&rt, H_BUF0 + i)).collect();
         rt.ring.push(&Command::Grow { capacity: 6 });
         rt.step();
-        assert_eq!(header(&rt, H_EPOCH), 1);
+        assert_eq!(header(&rt, H_EPOCH), 2);
         assert_eq!(header(&rt, H_CAPACITY), 6);
         assert_ne!((0..3).map(|i| header(&rt, H_BUF0 + i)).collect::<Vec<_>>(), old_ptrs);
         assert_eq!(rt.generations.len(), 6);
@@ -544,6 +552,26 @@ mod tests {
         rt.ring.push(&spawn_cmd(5, 0, unit_box(1.0, 1.0, 1.0)));
         rt.step();
         assert_eq!(entity(&rt, 5)[..3], [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn edits_made_earlier_in_the_same_step_survive_a_grow_command() {
+        let mut rt = Runtime::new(2, 16);
+        rt.ring.push(&spawn_cmd(0, 0, unit_box(1.0, 1.0, 1.0)));
+        rt.step();
+        rt.ring.push(&spawn_cmd(1, 0, unit_box(2.0, 2.0, 2.0)));
+        rt.ring.push(&Command::Destroy { id: 0, generation: 0 });
+        rt.ring.push(&Command::Grow { capacity: 4 });
+        rt.ring.push(&spawn_cmd(3, 0, unit_box(3.0, 3.0, 3.0)));
+        rt.step();
+        assert_eq!(entity(&rt, 1)[..3], [2.0, 2.0, 2.0]);
+        assert_eq!(entity(&rt, 0)[3..7], [0.0; 4], "destroy before grow must stick");
+        assert_eq!(entity(&rt, 3)[..3], [3.0, 3.0, 3.0]);
+        for _ in 0..4 {
+            rt.step();
+            assert_eq!(entity(&rt, 1)[..3], [2.0, 2.0, 2.0]);
+            assert_eq!(entity(&rt, 0)[3..7], [0.0; 4]);
+        }
     }
 
     #[test]
@@ -565,7 +593,7 @@ mod tests {
         for (n, cap) in [4u32, 8, 16].into_iter().enumerate() {
             rt.ring.push(&Command::Grow { capacity: cap });
             rt.step();
-            assert_eq!(header(&rt, H_EPOCH), n as u32 + 1);
+            assert_eq!(header(&rt, H_EPOCH), (n as u32 + 1) * 2);
         }
         rt.ring.push(&spawn_cmd(15, 0, BodyDesc::sphere_at([0.0, 1.0, 0.0], 0.4, 1.0, 0.0)));
         for _ in 0..300 { rt.step(); }
@@ -585,6 +613,19 @@ mod tests {
         let mut roles = [rt.transforms_write_for_test(), (v & 0b11) as usize, ((v >> 3) & 0b11) as usize];
         roles.sort_unstable();
         assert_eq!(roles, [0, 1, 2]);
+    }
+
+    #[test]
+    fn header_counts_ticks_and_mirrors_drop_counters() {
+        let mut rt = Runtime::new(2, 8);
+        for _ in 0..3 { rt.step(); }
+        assert_eq!(header(&rt, H_TICKS), 3);
+        rt.ring.push(&spawn_cmd(9, 0, unit_box(0.0, 0.0, 0.0)));
+        rt.ring.push(&spawn_cmd(0, 0, unit_box(f32::NAN, 0.0, 0.0)));
+        rt.step();
+        assert_eq!(header(&rt, H_TICKS), 4);
+        assert_eq!(header(&rt, H_STALE), 1);
+        assert_eq!(header(&rt, H_MALFORMED), 1);
     }
 
     #[test]

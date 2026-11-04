@@ -3,6 +3,8 @@ export const SLOT_BYTES = 64;
 export const TAG_SPAWN   = 0;
 export const TAG_DESTROY = 1;
 export const TAG_FORCE   = 2;
+export const TAG_GROW    = 3;
+export const MAX_CAPACITY = 1 << 20;
 
 export const SHAPE_BOX    = 0;
 export const SHAPE_SPHERE = 1;
@@ -35,7 +37,6 @@ export class CommandRing {
     private capacity: number;
     private mask: number;
     private view: DataView;
-    private drops = 0;
 
     constructor(
         memory: WebAssembly.Memory,
@@ -62,7 +63,7 @@ export class CommandRing {
     }
 
     spawn(desc: SpawnDesc): boolean {
-        if (this.isFull()) { this.drops++; return false; }
+        if (this.isFull()) return false;
         const tail = Atomics.load(this.tail, 0);
         const off = this.slotOffset(tail);
         this.view.setUint8(off,      TAG_SPAWN);
@@ -87,7 +88,7 @@ export class CommandRing {
     }
 
     destroy(desc: DestroyDesc): boolean {
-        if (this.isFull()) { this.drops++; return false; }
+        if (this.isFull()) return false;
         const tail = Atomics.load(this.tail, 0);
         const off = this.slotOffset(tail);
         this.view.setUint8(off,      TAG_DESTROY);
@@ -98,7 +99,7 @@ export class CommandRing {
     }
 
     force(desc: ForceDesc): boolean {
-        if (this.isFull()) { this.drops++; return false; }
+        if (this.isFull()) return false;
         const tail = Atomics.load(this.tail, 0);
         const off = this.slotOffset(tail);
         this.view.setUint8(off,      TAG_FORCE);
@@ -111,7 +112,16 @@ export class CommandRing {
         return true;
     }
 
-    get backpressureDrops(): number { return this.drops; }
+    grow(capacity: number): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_GROW);
+        this.view.setUint32(off + 6, capacity, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
 
     get pendingCount(): number {
         const tail = Atomics.load(this.tail, 0);

@@ -1,45 +1,38 @@
 import { TransformView } from './TransformView.js';
-import { CommandRing, SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
+import { CommandRing, MAX_CAPACITY, SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import type { MemoryMode } from './memory.js';
 
 export interface WorldConfig {
     capacity: number;
     ringCapacity: number;
+    /** Commands held in JS when the ring is full before spawn/destroy/force throw. Default 65536. */
+    maxDeferredCommands?: number;
 }
 
 export interface WorldLayout {
-    transformAByteOffset: number;
-    transformBByteOffset: number;
-    writeIndexByteOffset: number;
+    headerByteOffset: number;
     ringSlotsByteOffset: number;
     ringHeadByteOffset: number;
     ringTailByteOffset: number;
     idCounterByteOffset: number;
-    generationsByteOffset: number;
 }
 
 export interface RuntimePointers {
-    transforms_buf_a_ptr(): number;
-    transforms_buf_b_ptr(): number;
-    transforms_write_index_ptr(): number;
+    header_ptr(): number;
     ring_slots_ptr(): number;
     ring_head_ptr(): number;
     ring_tail_ptr(): number;
     id_counter_ptr(): number;
-    generations_ptr(): number;
 }
 
 export function layoutFromRuntime(rt: RuntimePointers): WorldLayout {
     return {
-        transformAByteOffset: rt.transforms_buf_a_ptr(),
-        transformBByteOffset: rt.transforms_buf_b_ptr(),
-        writeIndexByteOffset: rt.transforms_write_index_ptr(),
+        headerByteOffset: rt.header_ptr(),
         ringSlotsByteOffset: rt.ring_slots_ptr(),
         ringHeadByteOffset: rt.ring_head_ptr(),
         ringTailByteOffset: rt.ring_tail_ptr(),
         idCounterByteOffset: rt.id_counter_ptr(),
-        generationsByteOffset: rt.generations_ptr(),
     };
 }
 
@@ -56,19 +49,41 @@ export interface StepDriver {
     step(): void;
 }
 
+export interface GrowthEvent {
+    epoch: number;
+    capacity: number;
+}
+
+type Queued =
+    | { k: 'spawn'; d: SpawnDesc }
+    | { k: 'destroy'; d: DestroyDesc }
+    | { k: 'force'; d: ForceDesc }
+    | { k: 'grow'; capacity: number };
+
+const DEFAULT_MAX_DEFERRED = 1 << 16;
+
 export class World {
     readonly memory: WebAssembly.Memory;
     readonly mode: MemoryMode;
     readonly layout: WorldLayout;
+    onBufferGrowth: ((e: GrowthEvent) => void) | null = null;
 
     private transforms: TransformView;
     private ring: CommandRing;
     private ids: EntityIdAllocator;
-    private capacity: number;
+    private ringCapacity: number;
     private driver: StepDriver | null;
     private lastBuffer: ArrayBufferLike;
+    private knownEpoch: number;
     private fatal: string | null = null;
     private onDispose: (() => void) | null = null;
+    private deferred: Queued[] = [];
+    private deferredHead = 0;
+    private maxDeferred: number;
+    private deferredTotal = 0;
+    private rejected = 0;
+    private growths = 0;
+    private pendingGrow = 0;
 
     private constructor(
         config: WorldConfig,
@@ -80,17 +95,13 @@ export class World {
         this.memory = memory;
         this.mode = mode;
         this.layout = layout;
-        this.capacity = config.capacity;
         this.driver = driver;
+        this.ringCapacity = config.ringCapacity;
+        this.maxDeferred = config.maxDeferredCommands ?? DEFAULT_MAX_DEFERRED;
         this.lastBuffer = memory.buffer;
 
-        this.transforms = new TransformView(
-            memory,
-            layout.transformAByteOffset,
-            layout.transformBByteOffset,
-            layout.writeIndexByteOffset,
-            config.capacity,
-        );
+        this.transforms = new TransformView(memory, layout.headerByteOffset);
+        this.knownEpoch = this.transforms.epoch;
         this.ring = new CommandRing(
             memory,
             layout.ringSlotsByteOffset,
@@ -98,7 +109,7 @@ export class World {
             layout.ringTailByteOffset,
             config.ringCapacity,
         );
-        this.ids = new EntityIdAllocator(memory, layout.idCounterByteOffset, config.capacity);
+        this.ids = new EntityIdAllocator(memory, layout.idCounterByteOffset, this.transforms.capacity);
     }
 
     /** Worker mode: another thread owns the runtime and steps it. */
@@ -133,22 +144,84 @@ export class World {
 
     private assertAlive(): void {
         if (this.fatal) throw new Error(`world unavailable: ${this.fatal}`);
-        this.reacquireIfGrown();
+        this.syncLayout();
     }
+
+    /** Re-acquire views after memory growth and apply capacity growth announced by the runtime. */
+    syncLayout(): boolean {
+        let changed = false;
+        if (this.memory.buffer !== this.lastBuffer) {
+            this.lastBuffer = this.memory.buffer;
+            const { layout } = this;
+            this.transforms.reacquire();
+            this.ring.reacquire(this.memory, layout.ringSlotsByteOffset, layout.ringHeadByteOffset, layout.ringTailByteOffset);
+            this.ids.reacquire(this.memory, layout.idCounterByteOffset);
+            changed = true;
+        }
+        const peek = this.transforms.peekEpoch();
+        if ((peek & 1) === 0 && peek !== this.knownEpoch) {
+            this.transforms.reacquire();
+            this.applyEpoch();
+            changed = true;
+        }
+        return changed;
+    }
+
+    private applyEpoch(): void {
+        this.knownEpoch = this.transforms.epoch;
+        this.ids.setCapacity(this.transforms.capacity);
+        this.growths++;
+        if (this.pendingGrow <= this.transforms.capacity) this.pendingGrow = 0;
+        try {
+            this.onBufferGrowth?.({ epoch: this.knownEpoch >> 1, capacity: this.transforms.capacity });
+        } catch (err) {
+            queueMicrotask(() => { throw err; });
+        }
+    }
+
+    /** Alias kept for callers that only care about non-shared memory growth. */
+    reacquireIfGrown(): boolean { return this.syncLayout(); }
 
     step(): void {
         if (!this.driver) throw new Error('step() is only available in fallback mode; the worker steps the runtime');
         this.driver.step();
-        this.reacquireIfGrown();
+        this.syncLayout();
+        this.flush();
     }
 
-    reacquireIfGrown(): boolean {
-        if (this.memory.buffer === this.lastBuffer) return false;
-        this.lastBuffer = this.memory.buffer;
-        const { layout, capacity } = this;
-        this.transforms.reacquire(this.memory, layout.transformAByteOffset, layout.transformBByteOffset, layout.writeIndexByteOffset, capacity);
-        this.ring.reacquire(this.memory, layout.ringSlotsByteOffset, layout.ringHeadByteOffset, layout.ringTailByteOffset);
-        this.ids.reacquire(this.memory, layout.idCounterByteOffset);
+    private tryPush(c: Queued): boolean {
+        switch (c.k) {
+            case 'spawn': return this.ring.spawn(c.d);
+            case 'destroy': return this.ring.destroy(c.d);
+            case 'force': return this.ring.force(c.d);
+            case 'grow': return this.ring.grow(c.capacity);
+        }
+    }
+
+    /** Move deferred commands into the ring in order; returns how many remain deferred. */
+    flush(): number {
+        while (this.deferredHead < this.deferred.length) {
+            if (!this.tryPush(this.deferred[this.deferredHead])) break;
+            this.deferredHead++;
+        }
+        if (this.deferredHead === this.deferred.length) {
+            this.deferred.length = 0;
+            this.deferredHead = 0;
+        } else if (this.deferredHead > 1024 && this.deferredHead * 2 > this.deferred.length) {
+            this.deferred = this.deferred.slice(this.deferredHead);
+            this.deferredHead = 0;
+        }
+        return this.deferred.length - this.deferredHead;
+    }
+
+    private enqueue(c: Queued): boolean {
+        if (this.flush() === 0 && this.tryPush(c)) return true;
+        if (this.deferred.length - this.deferredHead >= this.maxDeferred) {
+            this.rejected++;
+            return false;
+        }
+        this.deferred.push(c);
+        this.deferredTotal++;
         return true;
     }
 
@@ -162,9 +235,9 @@ export class World {
             shape: opts.shape, hx: opts.hx, hy: opts.hy, hz: opts.hz,
             invMass: opts.invMass, restitution: opts.restitution,
         };
-        if (!this.ring.spawn(desc)) {
+        if (!this.enqueue({ k: 'spawn', d: desc })) {
             this.ids.release(handle);
-            throw new Error(`CommandRing full — increase ringCapacity (current: ${this.ring.pendingCount})`);
+            throw new Error(`CommandRing full — ${this.deferred.length - this.deferredHead} commands deferred; increase ringCapacity or maxDeferredCommands`);
         }
         return handle;
     }
@@ -172,25 +245,51 @@ export class World {
     destroy(handle: EntityHandle): void {
         this.assertAlive();
         if (!this.ids.isLive(handle)) throw new Error(`stale handle {id: ${handle.id}, gen: ${handle.gen}}`);
-        const desc: DestroyDesc = { id: handle.id, gen: handle.gen };
-        if (!this.ring.destroy(desc)) throw new Error('CommandRing full');
+        if (!this.enqueue({ k: 'destroy', d: { id: handle.id, gen: handle.gen } })) throw new Error('CommandRing full');
         this.ids.free(handle);
     }
 
     force(handle: EntityHandle, x: number, y: number, z: number): void {
         this.assertAlive();
         if (!this.ids.isLive(handle)) throw new Error(`stale handle {id: ${handle.id}, gen: ${handle.gen}}`);
-        const desc: ForceDesc = { id: handle.id, gen: handle.gen, x, y, z };
-        if (!this.ring.force(desc)) throw new Error('CommandRing full');
+        if (!this.enqueue({ k: 'force', d: { id: handle.id, gen: handle.gen, x, y, z } })) throw new Error('CommandRing full');
     }
 
-    /** The returned array is valid until the next `step()` in fallback mode. */
+    /**
+     * Ask the runtime to reallocate its buffers for `capacity` entities. Takes effect when the runtime
+     * processes the command; `onBufferGrowth` fires and `capacity` rises once this thread observes it.
+     */
+    requestGrow(capacity: number): void {
+        this.assertAlive();
+        const floor = Math.max(this.capacity, this.pendingGrow);
+        if (!Number.isInteger(capacity) || capacity <= floor || capacity > MAX_CAPACITY) {
+            throw new RangeError(`capacity must be an integer in (${floor}, ${MAX_CAPACITY}], got ${capacity}`);
+        }
+        if (!this.enqueue({ k: 'grow', capacity })) throw new Error('CommandRing full');
+        this.pendingGrow = capacity;
+    }
+
+    /** Valid until the next call to `readTransforms()` (and, in fallback mode, the next `step()`). */
     readTransforms(): Float32Array {
-        this.reacquireIfGrown();
-        return this.transforms.read();
+        if (this.fatal) throw new Error(`world unavailable: ${this.fatal}`);
+        this.syncLayout();
+        this.flush();
+        const buf = this.transforms.read();
+        if (this.transforms.epoch !== this.knownEpoch) this.applyEpoch();
+        return buf;
     }
 
-    get pendingCommands(): number { return this.ring.pendingCount; }
-    get backpressureDrops(): number { return this.ring.backpressureDrops; }
+    /** Counters the runtime publishes into shared memory; no WASM call involved. */
+    get runtimeCounters(): { ticks: number; staleDropped: number; malformedDropped: number } {
+        return this.transforms.counters();
+    }
+
+    get capacity(): number { return this.ids.capacityNow; }
+    get ringSize(): number { return this.ringCapacity; }
+    get pendingCommands(): number { return this.ring.pendingCount + this.deferred.length - this.deferredHead; }
+    get deferredCommands(): number { return this.deferred.length - this.deferredHead; }
+    get totalDeferred(): number { return this.deferredTotal; }
+    get backpressureDrops(): number { return this.rejected; }
+    get growthEvents(): number { return this.growths; }
     get allocatedEntities(): number { return this.ids.allocated; }
 }

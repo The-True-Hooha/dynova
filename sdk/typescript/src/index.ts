@@ -1,10 +1,10 @@
 export { TransformView, FLOATS_PER_TRANSFORM } from './TransformView.js';
-export { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SLOT_BYTES } from './CommandRing.js';
+export { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SLOT_BYTES, TAG_GROW, MAX_CAPACITY } from './CommandRing.js';
 export { EntityIdAllocator } from './EntityIdAllocator.js';
 export { World, layoutFromRuntime } from './World.js';
 export { launchWorld } from './launch.js';
 export { createMemory, detectMode } from './memory.js';
-export type { WorldConfig, WorldLayout, SpawnOptions, RuntimePointers, StepDriver } from './World.js';
+export type { WorldConfig, WorldLayout, SpawnOptions, RuntimePointers, StepDriver, GrowthEvent } from './World.js';
 export type { LaunchOptions, FallbackRuntime, SimInit, SimMessage } from './launch.js';
 export type { SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
 export type { EntityHandle } from './EntityIdAllocator.js';

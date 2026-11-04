@@ -1,26 +1,29 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { launchWorld, SharedMemoryUnavailableError, type FallbackRuntime } from '../launch.js';
-import { fakeLayout } from './helpers.js';
+import { FakeRuntime } from './helpers.js';
 
 const config = { capacity: 8, ringCapacity: 4 };
 const realSab = globalThis.SharedArrayBuffer;
 afterEach(() => { globalThis.SharedArrayBuffer = realSab; });
 
-function fakeRuntime(): FallbackRuntime & { stepped: number; physics: boolean } {
-    const { layout } = fakeLayout(config);
+function layoutOf(): { layout: import('../World.js').WorldLayout; memory: WebAssembly.Memory } {
+    const memory = new WebAssembly.Memory({ initial: 8, maximum: 32 });
+    return { layout: new FakeRuntime(memory, config).layout, memory };
+}
+
+function fakeRuntime(): FallbackRuntime & { stepped: number; physics: boolean; memory: WebAssembly.Memory } {
+    const { layout, memory } = layoutOf();
     return {
+        memory,
         stepped: 0,
         physics: false,
         step() { this.stepped++; },
         enable_physics() { this.physics = true; },
-        transforms_buf_a_ptr: () => layout.transformAByteOffset,
-        transforms_buf_b_ptr: () => layout.transformBByteOffset,
-        transforms_write_index_ptr: () => layout.writeIndexByteOffset,
+        header_ptr: () => layout.headerByteOffset,
         ring_slots_ptr: () => layout.ringSlotsByteOffset,
         ring_head_ptr: () => layout.ringHeadByteOffset,
         ring_tail_ptr: () => layout.ringTailByteOffset,
         id_counter_ptr: () => layout.idCounterByteOffset,
-        generations_ptr: () => layout.generationsByteOffset,
     };
 }
 
@@ -40,10 +43,9 @@ describe('launchWorld', () => {
         // @ts-expect-error simulate an old browser
         globalThis.SharedArrayBuffer = undefined;
         const rt = fakeRuntime();
-        const memory = new WebAssembly.Memory({ initial: 1, maximum: 2 });
         const world = await launchWorld({
             config, physics: true, createWorker: neverWorker,
-            loadFallback: async () => ({ runtime: rt, memory }),
+            loadFallback: async () => ({ runtime: rt, memory: rt.memory }),
         });
         expect(world.mode).toBe('fallback');
         expect(rt.physics).toBe(true);
@@ -69,10 +71,11 @@ describe('launchWorld', () => {
     });
 
     it('worker ready message resolves to a shared-mode world using the posted layout', async () => {
-        const { layout } = fakeLayout(config);
+        const memory = new WebAssembly.Memory({ initial: 8, maximum: 8, shared: true });
+        const { layout } = new FakeRuntime(memory, config);
         const worker = { postMessage() { this.onmessage?.({ data: { type: 'ready', layout } }); }, onmessage: null as ((e: unknown) => void) | null, onerror: null };
         const world = await launchWorld({
-            config, initialPages: 1, maximumPages: 1, createWorker: () => worker as unknown as Worker,
+            config, initialPages: 8, maximumPages: 8, createWorker: () => worker as unknown as Worker,
             loadFallback: async () => { throw new Error('unused'); },
         });
         expect(world.mode).toBe('shared');
@@ -104,7 +107,8 @@ describe('launchWorld', () => {
     });
 
     it('worker error after ready marks the world dead; dispose terminates the worker', async () => {
-        const { layout } = fakeLayout(config);
+        const memory = new WebAssembly.Memory({ initial: 8, maximum: 8, shared: true });
+        const { layout } = new FakeRuntime(memory, config);
         let terminated = 0;
         const worker = {
             postMessage() { this.onmessage?.({ data: { type: 'ready', layout } }); },
@@ -112,7 +116,7 @@ describe('launchWorld', () => {
             onmessage: null as ((e: unknown) => void) | null, onerror: null,
         };
         const world = await launchWorld({
-            config, initialPages: 1, maximumPages: 1, createWorker: () => worker as unknown as Worker,
+            config, initialPages: 8, maximumPages: 8, createWorker: () => worker as unknown as Worker,
             loadFallback: async () => { throw new Error('u'); },
         });
         worker.onmessage?.({ data: { type: 'error', message: 'unreachable executed' } });

@@ -110,10 +110,12 @@ impl CommandRing {
         true
     }
 
+    /// Id range and generation are checked when a command is applied, not here: an earlier command in the
+    /// same batch (Grow, Destroy) can change what is valid.
     pub fn note_stale(&mut self) { self.stale_dropped += 1; }
     pub fn note_malformed(&mut self) { self.malformed_dropped += 1; }
 
-    pub fn drain_commands(&mut self, id_capacity: usize, max: u32, out: &mut Vec<Command>) {
+    pub fn drain_commands(&mut self, max: u32, out: &mut Vec<Command>) {
         out.clear();
         loop {
             let head = self.head.load(Ordering::Acquire);
@@ -122,13 +124,7 @@ impl CommandRing {
 
             let slot = &self.slots[(head & self.mask) as usize];
             match decode_slot(&slot.0) {
-                Some(cmd) => {
-                    if cmd.target().is_none_or(|(id, _)| (id as usize) < id_capacity) {
-                        out.push(cmd);
-                    } else {
-                        self.stale_dropped += 1;
-                    }
-                }
+                Some(cmd) => out.push(cmd),
                 None => { self.malformed_dropped += 1; }
             }
             self.head.store(head.wrapping_add(1), Ordering::Release);
@@ -233,9 +229,9 @@ mod tests {
         Command::Spawn { id, generation, body: b }
     }
 
-    fn drain(ring: &mut CommandRing, generations: &[u8]) -> Vec<Command> {
+    fn drain(ring: &mut CommandRing, _generations: &[u8]) -> Vec<Command> {
         let mut out = Vec::new();
-        ring.drain_commands(generations.len(), 4096, &mut out);
+        ring.drain_commands(4096, &mut out);
         out
     }
 
@@ -336,21 +332,13 @@ mod tests {
     }
 
     #[test]
-    fn in_range_id_passes_through_with_any_generation() {
-        let mut ring = CommandRing::new(4);
-        ring.push(&spawn(0, 5, body(0.0, 0.0, 0.0)));
-        assert_eq!(drain(&mut ring, &[4]).len(), 1);
-        assert_eq!(ring.stale_dropped(), 0);
-    }
-
-    #[test]
-    fn hostile_ids_are_dropped_not_panicked() {
+    fn ring_does_not_filter_ids_or_generations() {
         let mut ring = CommandRing::new(8);
-        for id in [3u32, 4, u32::MAX, u32::MAX - 1, 1 << 31] {
-            ring.push(&Command::Destroy { id, generation: 0 });
+        for id in [3u32, u32::MAX, 1 << 31] {
+            ring.push(&Command::Destroy { id, generation: 9 });
         }
-        assert!(drain(&mut ring, &[0, 0, 0]).is_empty());
-        assert_eq!(ring.stale_dropped(), 5);
+        assert_eq!(drain(&mut ring, &[]).len(), 3);
+        assert_eq!(ring.stale_dropped(), 0);
     }
 
     #[test]
@@ -456,21 +444,21 @@ mod tests {
         for _ in 0..5 { ring.push(&Command::Destroy { id: 0, generation: 0 }); }
         let mut out = Vec::with_capacity(16);
         let ptr = out.as_ptr();
-        ring.drain_commands(1, 3, &mut out);
+        ring.drain_commands(3, &mut out);
         assert_eq!(out.len(), 3);
         assert_eq!(ring.len(), 2);
-        ring.drain_commands(1, 3, &mut out);
+        ring.drain_commands(3, &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(out.as_ptr(), ptr);
     }
 
     #[test]
-    fn grow_round_trips_and_ignores_id_capacity() {
+    fn grow_round_trips() {
         let mut ring = CommandRing::new(2);
         let g = Command::Grow { capacity: 4096 };
         assert!(ring.push(&g));
         let mut out = Vec::new();
-        ring.drain_commands(0, 8, &mut out);
+        ring.drain_commands(8, &mut out);
         assert_eq!(out, vec![g]);
         assert_eq!(ring.stale_dropped(), 0);
     }
@@ -483,7 +471,7 @@ mod tests {
         ring.push(&Command::Grow { capacity: u32::MAX });
         ring.push(&Command::Grow { capacity: MAX_CAPACITY });
         let mut out = Vec::new();
-        ring.drain_commands(1, 8, &mut out);
+        ring.drain_commands(8, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(ring.malformed_dropped(), 3);
     }
