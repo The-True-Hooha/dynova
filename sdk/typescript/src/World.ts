@@ -43,6 +43,7 @@ export interface SpawnOptions {
     hx?: number; hy?: number; hz?: number;
     invMass?: number;
     restitution?: number;
+    friction?: number;
 }
 
 export interface StepDriver {
@@ -233,7 +234,7 @@ export class World {
             x: opts.x ?? 0, y: opts.y ?? 0, z: opts.z ?? 0,
             qx: opts.qx ?? 0, qy: opts.qy ?? 0, qz: opts.qz ?? 0, qw: opts.qw ?? 1,
             shape: opts.shape, hx: opts.hx, hy: opts.hy, hz: opts.hz,
-            invMass: opts.invMass, restitution: opts.restitution,
+            invMass: opts.invMass, restitution: opts.restitution, friction: opts.friction,
         };
         if (!this.enqueue({ k: 'spawn', d: desc })) {
             this.ids.release(handle);
@@ -282,6 +283,11 @@ export class World {
     /** Counters the runtime publishes into shared memory; no WASM call involved. */
     get runtimeCounters(): { ticks: number; staleDropped: number; malformedDropped: number } {
         return this.transforms.counters();
+    }
+
+    /** Occupancy of each broadphase hash bucket; for the inspector. Valid until the layout is re-acquired. */
+    bucketHistogram(): Uint32Array {
+        return this.transforms.bucketCounts();
     }
 
     get capacity(): number { return this.ids.capacityNow; }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { TransformView, H_EPOCH, H_STATE, H_TICKS, H_STALE, H_MALFORMED, FLOATS_PER_TRANSFORM } from '../TransformView.js';
+import { TransformView, H_EPOCH, H_STATE, H_TICKS, H_STALE, H_MALFORMED, H_BUCKETS, H_BUCKET_LEN, FLOATS_PER_TRANSFORM } from '../TransformView.js';
 import { FakeRuntime } from './helpers.js';
 
 function setup(capacity = 4) {
@@ -174,5 +174,17 @@ describe('TransformView (triple buffer reader)', () => {
         Atomics.store(rt.header, H_EPOCH, 1);
         expect(() => view.read()).toThrow('layout update stuck');
         expect(() => view.reacquire()).toThrow('layout update stuck');
+    });
+
+    it('bucketCounts is a live view of the shared occupancy histogram', () => {
+        const { memory, rt, view } = setup();
+        const at = 4096;
+        new Uint32Array(memory.buffer, at, 4).set([0, 3, 0, 7]);
+        Atomics.store(rt.header, H_BUCKETS, at);
+        Atomics.store(rt.header, H_BUCKET_LEN, 4);
+        const counts = view.bucketCounts();
+        expect(Array.from(counts)).toEqual([0, 3, 0, 7]);
+        new Uint32Array(memory.buffer, at, 4)[2] = 9;
+        expect(counts[2]).toBe(9);
     });
 });

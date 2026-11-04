@@ -1,15 +1,23 @@
 import { TransformView } from '@dynova/sdk';
 
-const BOXES = 50;
-const TICKS = 600;
+const COLS = 5;
+const ROWS = 10;
+const BOXES = COLS * ROWS;
+const TICKS = 1500;
 
 async function run() {
     const glue = await import('../sdk/typescript/wasm-st/dynova_core.js');
     const exports = await glue.default() as unknown as { memory: WebAssembly.Memory };
     const rt = new glue.Runtime(BOXES + 1, 64);
     rt.enable_physics();
-    rt.spawn_box(0, 0, -0.5, 0, 20, 0.5, 20, 0, 0);
-    for (let i = 1; i <= BOXES; i++) rt.spawn_box(i, 0, 0.5 + (i - 1) * 1.02, 0, 0.5, 0.5, 0.5, 1, 0);
+    rt.spawn_box(0, 0, -0.5, 0, 30, 0.5, 30, 0, 0);
+    let id = 1;
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            const x = (c - (COLS - 1) / 2) * 1.02 + (r % 2 ? 0.5 : 0);
+            rt.spawn_box(id++, x, 0.5 + r * 1.02, 0, 0.5, 0.5, 0.5, 1, 0);
+        }
+    }
 
     const times: number[] = [];
     for (let t = 0; t < TICKS; t++) {
@@ -26,7 +34,7 @@ async function run() {
         p99Ms: sorted[Math.floor(sorted.length * 0.99)],
         maxMs: sorted[sorted.length - 1],
         finite: Array.from(buf).every(Number.isFinite),
-        topY: ys[BOXES - 1],
+        topY: Math.max(...ys),
         minY: Math.min(...ys),
         maxXZ: Math.max(...Array.from({ length: BOXES }, (_, i) => Math.max(Math.abs(buf[(i + 1) * 7]), Math.abs(buf[(i + 1) * 7 + 2])))),
         sleeping: rt.sleeping_count(),

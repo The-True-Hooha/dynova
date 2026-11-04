@@ -19,6 +19,7 @@ const OFF_SHAPE: usize      = 34;
 const OFF_HALF: usize       = 36;
 const OFF_INV_MASS: usize   = 48;
 const OFF_RESTITUTION: usize = 52;
+const OFF_FRICTION: usize = 56;
 
 #[repr(C, align(4))]
 struct Slot([u8; SLOT_BYTES]);
@@ -162,6 +163,7 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             wr_f32x(b, OFF_HALF, &body.half);
             wr_f32(b, OFF_INV_MASS, body.inv_mass);
             wr_f32(b, OFF_RESTITUTION, body.restitution);
+            wr_f32(b, OFF_FRICTION, body.friction);
         }
         Command::Destroy { .. } => b[0] = TAG_DESTROY,
         Command::Grow { capacity } => {
@@ -189,6 +191,7 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
                 shape: b[OFF_SHAPE],
                 inv_mass: rd_f32(b, OFF_INV_MASS),
                 restitution: rd_f32(b, OFF_RESTITUTION),
+                friction: rd_f32(b, OFF_FRICTION),
             };
             if !body.is_valid() { return None; }
             let inv_len = body.rot.iter().map(|q| q * q).sum::<f32>().sqrt().recip();
@@ -212,7 +215,7 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physics::{MAX_COORD, MIN_HALF, SHAPE_BOX, SHAPE_SPHERE};
+    use crate::physics::{MAX_COORD, MIN_HALF, SHAPE_BOX, SHAPE_CAPSULE, SHAPE_SPHERE};
 
     fn body(x: f32, y: f32, z: f32) -> BodyDesc {
         BodyDesc {
@@ -222,6 +225,7 @@ mod tests {
             shape: SHAPE_BOX,
             inv_mass: 1.0,
             restitution: 0.3,
+            friction: 0.5,
         }
     }
 
@@ -268,6 +272,7 @@ mod tests {
             shape: SHAPE_SPHERE,
             inv_mass: 2.0,
             restitution: 0.5,
+            friction: 0.5,
         });
         encode_slot(&cmd, &mut b);
         let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
@@ -281,7 +286,7 @@ mod tests {
         "01", "00",
         "0000003f", "0000803e", "0000003e",
         "00000040", "0000003f",
-        "0000000000000000",
+        "0000003f", "00000000",
     );
 
     #[test]
@@ -403,6 +408,9 @@ mod tests {
             ("restitution > 1", |b| b.restitution = 1.5),
             ("restitution < 0", |b| b.restitution = -0.1),
             ("unknown shape", |b| b.shape = 9),
+            ("nan friction", |b| b.friction = f32::NAN),
+            ("negative friction", |b| b.friction = -0.1),
+            ("huge friction", |b| b.friction = 50.0),
         ];
         let wrongly_accepted: Vec<&str> = cases.iter().filter(|(_, m)| accepted(*m)).map(|(n, _)| *n).collect();
         assert!(wrongly_accepted.is_empty(), "accepted: {wrongly_accepted:?}");
@@ -415,6 +423,9 @@ mod tests {
         assert!(accepted(|b| b.pos = [-MAX_COORD, MAX_COORD, 0.0]));
         assert!(accepted(|b| { b.restitution = 0.0; b.shape = SHAPE_SPHERE; }));
         assert!(accepted(|b| b.restitution = 1.0));
+        assert!(accepted(|b| b.friction = 0.0));
+        assert!(accepted(|b| b.friction = 2.0));
+        assert!(accepted(|b| b.shape = SHAPE_CAPSULE));
     }
 
     #[test]

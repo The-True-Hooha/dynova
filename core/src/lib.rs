@@ -6,6 +6,7 @@ pub use transform_buffers::TransformBuffers;
 pub mod command_ring;
 pub use command_ring::CommandRing;
 
+pub mod collision;
 pub mod physics;
 
 pub mod runtime;

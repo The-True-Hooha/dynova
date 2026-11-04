@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SLOT_BYTES } from '../CommandRing.js';
+import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, SLOT_BYTES } from '../CommandRing.js';
 
 function makeRing(capacity = 16) {
     const mem = new WebAssembly.Memory({ initial: 1 });
@@ -86,7 +86,7 @@ describe('CommandRing', () => {
             '01' + '00' +
             '0000003f' + '0000803e' + '0000003e' +
             '00000040' + '0000003f' +
-            '0000000000000000',
+            '0000003f' + '00000000',
         );
     });
 
@@ -111,5 +111,19 @@ describe('CommandRing', () => {
         const view = new DataView(mem.buffer);
         expect(view.getUint8(0)).toBe(TAG_DESTROY);
         expect(view.getUint32(1, true)).toBe(2);
+    });
+
+    it('spawn encodes friction and capsule shape', () => {
+        const { mem, ring } = makeRing();
+        ring.spawn({ id: 0, gen: 0, x: 0, y: 0, z: 0, qx: 0, qy: 0, qz: 0, qw: 1, shape: SHAPE_CAPSULE, friction: 1.25 });
+        const view = new DataView(mem.buffer);
+        expect(view.getUint8(34)).toBe(SHAPE_CAPSULE);
+        expect(view.getFloat32(56, true)).toBe(1.25);
+    });
+
+    it('spawn defaults friction to 0.5', () => {
+        const { mem, ring } = makeRing();
+        ring.spawn({ id: 0, gen: 0, x: 0, y: 0, z: 0, qx: 0, qy: 0, qz: 0, qw: 1 });
+        expect(new DataView(mem.buffer).getFloat32(56, true)).toBe(0.5);
     });
 });

@@ -7,6 +7,8 @@ export const H_STATE = 5;
 export const H_TICKS = 7;
 export const H_STALE = 8;
 export const H_MALFORMED = 9;
+export const H_BUCKETS = 10;
+export const H_BUCKET_LEN = 11;
 export const HEADER_WORDS = 12;
 
 const MAX_SPINS = 5_000_000;
@@ -30,6 +32,11 @@ export class TransformView {
 
     get epoch(): number { return this._epoch; }
     get capacity(): number { return this._capacity; }
+
+    /** Broadphase bucket occupancy, read straight from shared memory. */
+    bucketCounts(): Uint32Array {
+        return new Uint32Array(this.memory.buffer, Atomics.load(this.header, H_BUCKETS), Atomics.load(this.header, H_BUCKET_LEN));
+    }
 
     /** Runtime counters published by the worker each step. */
     counters(): { ticks: number; staleDropped: number; malformedDropped: number } {

@@ -12,6 +12,8 @@ const H_GENERATIONS: usize = 6;
 const H_TICKS: usize = 7;
 const H_STALE: usize = 8;
 const H_MALFORMED: usize = 9;
+const H_BUCKETS: usize = 10;
+const H_BUCKET_LEN: usize = 11;
 const HEADER_WORDS: usize = 12;
 
 #[wasm_bindgen]
@@ -45,7 +47,7 @@ impl Runtime {
         rt
     }
 
-    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, _, _].
+    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len].
     pub fn header_ptr(&self) -> *const u32 {
         self.header.as_ptr() as *const u32
     }
@@ -124,6 +126,21 @@ impl Runtime {
         restitution: f32,
     ) -> bool {
         self.spawn_direct(id, &BodyDesc::sphere_at([x, y, z], radius, inv_mass, restitution))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_capsule(
+        &mut self,
+        id: u32,
+        x: f32,
+        y: f32,
+        z: f32,
+        radius: f32,
+        half_len: f32,
+        inv_mass: f32,
+        restitution: f32,
+    ) -> bool {
+        self.spawn_direct(id, &BodyDesc::capsule_at([x, y, z], radius, half_len, inv_mass, restitution))
     }
 
     pub fn bucket_counts_ptr(&self) -> *const u32 {
@@ -210,6 +227,8 @@ impl Runtime {
             h[H_BUF0 + i].store(self.transforms.buf_ptr(i) as u32, Ordering::Release);
         }
         h[H_GENERATIONS].store(self.generations.as_ptr() as u32, Ordering::Release);
+        h[H_BUCKETS].store(self.physics.bucket_counts.as_ptr() as u32, Ordering::Release);
+        h[H_BUCKET_LEN].store(self.physics.bucket_counts.len() as u32, Ordering::Release);
     }
 
     fn grow_to(&mut self, capacity: u32) -> bool {
@@ -629,6 +648,33 @@ mod tests {
     }
 
     #[test]
+    fn header_publishes_the_occupancy_histogram_and_it_counts_gridded_bodies() {
+        let mut rt = Runtime::new(8, 8);
+        rt.enable_physics();
+        assert_eq!(header(&rt, H_BUCKETS), rt.physics.bucket_counts.as_ptr() as u32);
+        let len = header(&rt, H_BUCKET_LEN) as usize;
+        assert_eq!(len, rt.physics.bucket_counts.len());
+        rt.spawn_box(0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
+        rt.spawn_box(1, 0.1, 0.0, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
+        rt.spawn_sphere(2, 50.0, 0.0, 0.0, 0.5, 1.0, 0.0);
+        rt.step();
+        let counts = &rt.physics.bucket_counts;
+        assert_eq!(counts.iter().sum::<u32>(), 3);
+        assert_eq!(*counts.iter().max().unwrap(), 2);
+    }
+
+    #[test]
+    fn spawn_capsule_export_validates_and_creates_a_capsule() {
+        let mut rt = Runtime::new(2, 4);
+        rt.enable_physics();
+        assert!(rt.spawn_capsule(0, 0.0, 1.0, 0.0, 0.3, 0.5, 1.0, 0.1));
+        assert_eq!(rt.physics.shape[0], crate::physics::SHAPE_CAPSULE);
+        assert!(!rt.spawn_capsule(1, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 0.1));
+        assert!(!rt.spawn_capsule(1, 0.0, 0.0, 0.0, 0.3, f32::NAN, 1.0, 0.1));
+        assert!(!rt.spawn_capsule(5, 0.0, 0.0, 0.0, 0.3, 0.5, 1.0, 0.1));
+    }
+
+    #[test]
     fn step_with_empty_ring_and_no_bodies_is_stable() {
         let mut rt = Runtime::new(0, 1);
         rt.enable_physics();
@@ -654,7 +700,7 @@ mod tests {
             assert!(c.iter().all(|v| v.is_finite()), "entity {id}: {c:?}");
             assert!(id == 0 || (c[1] > -4.6 && c[1] < 6.0), "entity {id} left the scene: y={}", c[1]);
         }
-        assert_eq!(h, 16167635544258562182);
+        assert_eq!(h, 15518154949815444409);
         for (id, c) in buf.chunks(7).enumerate().take(30) {
             let len_sq: f32 = c[3..7].iter().map(|q| q * q).sum();
             assert!((len_sq - 1.0).abs() < 1e-4, "entity {id} quaternion not unit: {c:?}");

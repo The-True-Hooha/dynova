@@ -8,6 +8,7 @@ export const MAX_CAPACITY = 1 << 20;
 
 export const SHAPE_BOX    = 0;
 export const SHAPE_SPHERE = 1;
+export const SHAPE_CAPSULE = 2;
 
 export interface SpawnDesc {
     id: number;
@@ -18,6 +19,7 @@ export interface SpawnDesc {
     hx?: number; hy?: number; hz?: number;
     invMass?: number;
     restitution?: number;
+    friction?: number;
 }
 
 export interface DestroyDesc {
@@ -83,6 +85,8 @@ export class CommandRing {
         this.view.setFloat32(off + 44, desc.hz ?? 0.5, true);
         this.view.setFloat32(off + 48, desc.invMass ?? 1, true);
         this.view.setFloat32(off + 52, desc.restitution ?? 0.3, true);
+        this.view.setFloat32(off + 56, desc.friction ?? 0.5, true);
+        this.view.setFloat32(off + 60, 0, true);
         Atomics.add(this.tail, 0, 1);
         return true;
     }
