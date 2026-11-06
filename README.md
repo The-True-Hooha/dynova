@@ -119,6 +119,6 @@ Open `http://localhost:5173`.
 
 ## Status
 
-Phases 1 and 2 are complete: shared-memory worker runtime with a sync fallback, lock-free triple-buffered transforms with growth, bounded command backpressure, and a physics core (spheres, boxes, capsules, convex hulls, friction, warm starting, island sleeping, swept CCD). Next is Phase 3 (Three.js adapter, GLTF colliders, convex hulls). See [ROADMAP.md](./ROADMAP.md) and [PLAN.md](./PLAN.md).
+Phases 1 and 2 are complete: shared-memory worker runtime with a sync fallback, lock-free triple-buffered transforms with growth, bounded command backpressure, and a physics core (spheres, boxes, capsules, convex hulls, friction, warm starting, island sleeping, swept CCD). Phase 3 Stage 3A is done (Three.js instanced adapter, scene-to-collider fitting, convex hulls); Stage 3B (adapter contract and a second renderer) is next. Run `make dev` and open `/stage3a.html?live=1` for the live demo. See [ROADMAP.md](./ROADMAP.md) and [PLAN.md](./PLAN.md).
 
 Known limits: a single column of unit boxes buckles above about 20 high; dynamic-vs-dynamic CCD is not implemented; Firefox is configured in Playwright but was not verified in the development sandbox. A solver golden hash (single-threaded build) matches the native build in Chromium and WebKit; a sin/cos/atan2/sqrt probe also matches; a run on the shared (threaded) build is not done. The 30-body stress scene has no joints (bodies are contained by static walls).

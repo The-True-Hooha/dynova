@@ -93,7 +93,7 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 
 ## Phase 3 — Rendering + Assets
 
-### Stage 3A — Three.js adapter, GLTF in
+### Stage 3A — Three.js adapter, GLTF in  ✅ done (demo: `examples/stage3a.html`, `?live=1` for a live view; physics checks in `e2e/stage3a.spec.ts`)
 - `threeAdapter(transforms, instancedMesh)` — instance matrix update from buffer, no per-entity Three.js objects
 - Convex hull narrow phase (SAT, moved here from Stage 2B) so mesh-derived colliders work
 - GLTF load -> mesh extraction -> convex hull / primitive-fit collider generation -> spawn command
