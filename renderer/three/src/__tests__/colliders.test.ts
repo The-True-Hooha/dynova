@@ -4,7 +4,7 @@ import { ConvexHull } from 'three/examples/jsm/math/ConvexHull.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MAX_HULL_VERTS } from '@dynova/sdk';
 import { collidersFromScene, fitShape, spawnColliders, type ColliderWorld } from '../colliders.js';
-import { box, buildGlb, cube, inverted, lShape, merge, noisySphere, plane, prism, pyramid, tetra, translated, uvSphere, type Geometry } from './gltfFixture.js';
+import { box, buildGlb, cube, inverted, lShape, merge, noisySphere, plane, prism, pyramid, tetra, translated, uvSphere, type Geometry } from '../testing/gltfFixture.js';
 
 const fit = (g: Geometry) => fitShape(g.positions, g.indices);
 

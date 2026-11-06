@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8" /><title>Dynova GLB colliders</title>
+<style>
+body{margin:0;background:#111;color:#8f8;font:12px monospace;overflow:hidden}
+canvas{display:block}
+#out{position:fixed;bottom:6px;left:8px;white-space:pre;background:#000a;padding:2px 6px}
+#bar{position:fixed;top:6px;left:8px;background:#000a;padding:4px 8px}
+body.drag canvas{outline:3px dashed #8f8;outline-offset:-3px}
+</style></head>
+<body>
+<div id="bar">Drop a <b>.glb</b> anywhere or <input id="file" type="file" accept=".glb,model/gltf-binary" /> &nbsp; <span id="msg"></span></div>
+<canvas id="c" width="900" height="560"></canvas>
+<pre id="out">loading</pre>
+<script type="module" src="./gltf.ts"></script>
+</body>
+</html>

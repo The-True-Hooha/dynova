@@ -9,6 +9,21 @@ const { spawned, failed } = spawnColliders(world, colliders, {
 });
 ```
 
+## Loading a `.glb`
+
+```ts
+import { loadGltfScene, collidersFromScene } from '@dynova/three';
+
+const loaded = await loadGltfScene(urlOrArrayBuffer);
+if (loaded.ok) {
+  const { colliders } = collidersFromScene(loaded.scene);
+} else {
+  console.error(loaded.error);
+}
+```
+
+`loadGltfScene` takes a URL or the bytes of a `.glb` and returns `{ ok: true, scene }` or `{ ok: false, error }`; it does not throw. A `.gltf` with separate `.bin` or image files only works from a URL, and Draco or KTX2 compressed files are not supported. The browser demo `examples/gltf.html` loads a built-in level (a small GLB generated in memory and parsed by `GLTFLoader`), `?url=/path/to/file.glb`, a file picker, or a file dropped on the page; each load builds a fresh runtime.
+
 `collidersFromScene` walks every `Mesh`, bakes the node's world scale into its vertices and fits one shape per mesh:
 
 | Shape | When |

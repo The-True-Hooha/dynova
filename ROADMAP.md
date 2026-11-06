@@ -93,7 +93,7 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 
 ## Phase 3 — Rendering + Assets
 
-### Stage 3A — Three.js adapter, GLTF in  ✅ done with a deviation: scene graph (`Object3D`, e.g. `gltf.scene`) to colliders is implemented and a GLB is parsed with `GLTFLoader` in Node tests, but the browser demo (`examples/stage3a.html`, `?live=1`) builds its scene in code and loads no `.glb`
+### Stage 3A — Three.js adapter, GLTF in  ✅ done (`examples/gltf.html` loads a GLB through `GLTFLoader` from a URL, a file picker or drag-and-drop, with a built-in generated level by default; `examples/stage3a.html` is the procedural-scene variant)
 - `threeAdapter(transforms, instancedMesh)` — instance matrix update from buffer, no per-entity Three.js objects
 - Convex hull narrow phase (SAT, moved here from Stage 2B) so mesh-derived colliders work
 - GLTF load -> mesh extraction -> convex hull / primitive-fit collider generation -> spawn command

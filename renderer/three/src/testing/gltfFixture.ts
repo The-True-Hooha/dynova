@@ -9,6 +9,8 @@ export interface FixtureMesh extends Partial<Geometry> {
     rotation?: number[];
     scale?: number[];
     indexType?: 5123 | 5125;
+    /** Linear RGB base colour (0 to 1). */
+    color?: number[];
 }
 
 export interface FixtureTransform {
@@ -136,6 +138,17 @@ export function plane(hx = 5, hz = 5): Geometry {
     return { positions: [-hx, 0, -hz, hx, 0, -hz, hx, 0, hz, -hx, 0, hz], indices: [0, 2, 1, 0, 3, 2] };
 }
 
+export function rampGrid(n: number, rise: number): Geometry {
+    const positions: number[] = [];
+    for (let i = 0; i <= n; i++) for (let j = 0; j <= n; j++) positions.push(i, rise * i, j);
+    const indices: number[] = [];
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+        const a = i * (n + 1) + j, b = a + 1, c = a + n + 1, d = c + 1;
+        indices.push(a, b, c, b, d, c);
+    }
+    return { positions, indices };
+}
+
 export function lShape(): Geometry {
     return merge(translated(box(1, 0.5, 0.5), 1, 0.5, 0.5), translated(box(0.5, 0.5, 1), 0.5, 0.5, 2));
 }
@@ -154,6 +167,7 @@ export function buildGlb(meshes: FixtureMesh[], root: FixtureTransform = {}): Ar
     const bufferViews: object[] = [];
     const accessors: object[] = [];
     const gltfMeshes: object[] = [];
+    const materials: object[] = [];
     const meshNodes: object[] = [];
 
     meshes.forEach((m, i) => {
@@ -171,6 +185,10 @@ export function buildGlb(meshes: FixtureMesh[], root: FixtureTransform = {}): Ar
             bufferViews.push({ buffer: 0, byteOffset: idx.at, byteLength: idx.bytes });
             accessors.push({ bufferView: bufferViews.length - 1, componentType: type, count: m.indices.length, type: 'SCALAR' });
             primitive.indices = accessors.length - 1;
+        }
+        if (m.color) {
+            materials.push({ pbrMetallicRoughness: { baseColorFactor: [...m.color, 1], metallicFactor: 0, roughnessFactor: 0.9 } });
+            primitive.material = materials.length - 1;
         }
         gltfMeshes.push({ primitives: [primitive] });
         const node: Record<string, unknown> = { name: m.name ?? `mesh${i}`, mesh: i };
@@ -193,6 +211,7 @@ export function buildGlb(meshes: FixtureMesh[], root: FixtureTransform = {}): Ar
         scenes: [{ nodes: [0] }],
         nodes: [rootNode, ...meshNodes],
         meshes: gltfMeshes,
+        ...(materials.length ? { materials } : {}),
         accessors,
         bufferViews,
         buffers: [{ byteLength: data.length }],
