@@ -52,8 +52,8 @@ async function run() {
     sun.position.set(5, 12, 6);
     scene.add(sun);
     const camera = new PerspectiveCamera(50, 640 / 400, 0.1, 100);
-    camera.position.set(0, 9, 20);
-    camera.lookAt(0, 1, 0);
+    camera.position.set(0, 7, 17);
+    camera.lookAt(-1, 1.5, 0);
 
     let renderer: WebGLRenderer | null = null;
     try { renderer = new WebGLRenderer({ canvas: document.getElementById('c') as HTMLCanvasElement }); } catch { renderer = null; }
@@ -62,6 +62,18 @@ async function run() {
         for (const a of adapters) a.update();
         renderer?.render(scene, camera);
     };
+
+    if (live) {
+        let ticks = 0;
+        const loop = () => {
+            frame();
+            ticks++;
+            document.getElementById('out')!.textContent = `tick ${ticks}  asleep ${rt.sleeping_count()}/${dynamics.spawned.length}  contacts ${world.runtimeStats.contacts}  (reload to replay)`;
+            requestAnimationFrame(loop);
+        };
+        requestAnimationFrame(loop);
+        return { live: true };
+    }
 
     const ids = dynamics.spawned.map((s) => s.handle.id);
     const lowest = new Map<number, number>(ids.map((id) => [id, Infinity]));
@@ -98,11 +110,6 @@ async function run() {
         }
     }
 
-    if (live) {
-        const loop = () => { frame(); requestAnimationFrame(loop); };
-        requestAnimationFrame(loop);
-    }
-
     return {
         rendered: renderer !== null,
         staticKinds: levelScene.colliders.map((c) => `${c.name}:${c.shape.kind}`),
@@ -126,6 +133,9 @@ async function run() {
 }
 
 run().then(
-    (r) => { (window as any).__result = r; document.getElementById('out')!.textContent = JSON.stringify({ ...r, crate0: undefined, ball0: undefined, cone0: undefined }, null, 1); },
+    (r) => {
+        (window as any).__result = r;
+        if (!('live' in r)) document.getElementById('out')!.textContent = JSON.stringify({ ...r, crate0: undefined, ball0: undefined, cone0: undefined }, null, 1);
+    },
     (e) => { (window as any).__result = { error: String(e) }; document.getElementById('out')!.textContent = String(e); },
 );
