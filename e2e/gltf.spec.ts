@@ -1,4 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { box, buildGlb, cube, plane, rampGrid, uvSphere } from '../renderer/three/src/testing/gltfFixture';
 
 async function stats(page: Page, ticks = 1500) {
@@ -136,3 +138,79 @@ test('with two overlapping loads the last requested file wins even if the earlie
     expect(r.label).toBe('fast.glb');
     expect(r.levelKinds).toEqual(['fast-slab:box']);
 });
+
+const fixtureBytes = (name: string) => readFileSync(fileURLToPath(new URL(`../renderer/three/src/testing/fixtures/${name}`, import.meta.url)));
+const LEVEL = ['floor:box', 'wall-n:box', 'ramp:box', 'pillar:hull'];
+
+async function pick(page: Page, files: { name: string; buffer: Buffer }[]) {
+    await page.goto('/gltf.html?paused=1');
+    await stats(page, 10);
+    await page.setInputFiles('#file', files.map((f) => ({ ...f, mimeType: 'application/octet-stream' })));
+}
+
+for (const [name, what] of [['level-draco.glb', 'Draco'], ['level-meshopt.glb', 'Meshopt'], ['level-ktx2.glb', 'KTX2 (optional)']] as const) {
+    test(`${what}-compressed glb loads and builds the same colliders`, async ({ page }) => {
+        await pick(page, [{ name, buffer: fixtureBytes(name) }]);
+        await page.waitForFunction((n) => (window as any).__stats()?.label === n, name, { timeout: 30_000 });
+        await page.evaluate(() => (window as any).__step(120));
+        const r = await page.evaluate(() => (window as any).__stats());
+        expect(r.levelKinds).toEqual(LEVEL);
+        expect(r.failed).toEqual([]);
+        expect(r.skipped).toEqual([]);
+        expect(r.malformed).toBe(0);
+        expect(r.finite).toBe(true);
+        expect(r.propCount).toBe(26);
+        expect(await page.evaluate(() => (window as any).__error)).toBeUndefined();
+    });
+}
+
+test('a glb that requires KTX2 textures is rejected with a message naming ktx2Loader', async ({ page }) => {
+    await pick(page, [{ name: 'level-ktx2-required.glb', buffer: fixtureBytes('level-ktx2-required.glb') }]);
+    await page.waitForFunction(() => (window as any).__error !== undefined, null, { timeout: 30_000 });
+    expect(await page.locator('#msg').textContent()).toContain('options.ktx2Loader');
+});
+
+test('a .gltf with its .bin loads when both files are chosen together, and a missing .bin is reported', async ({ page }) => {
+    await pick(page, [{ name: 'level-split.bin', buffer: fixtureBytes('level-split.bin') }, { name: 'level-split.gltf', buffer: fixtureBytes('level-split.gltf') }]);
+    await page.waitForFunction(() => (window as any).__stats()?.label === '2 files', null, { timeout: 30_000 });
+    expect((await page.evaluate(() => (window as any).__stats())).levelKinds).toEqual(LEVEL);
+
+    await page.setInputFiles('#file', [{ name: 'level-split.gltf', mimeType: 'model/gltf+json', buffer: fixtureBytes('level-split.gltf') }]);
+    await page.waitForFunction(() => (window as any).__error !== undefined, null, { timeout: 30_000 });
+    expect(await page.locator('#msg').textContent()).toContain('level-split.bin');
+    expect((await page.evaluate(() => (window as any).__stats())).label).toBe('2 files');
+});
+
+const OBJ = 'o pyramid\nv 0 0 0\nv 4 0 0\nv 4 0 4\nv 0 0 4\nv 2 5 2\nf 1 3 2\nf 1 4 3\nf 1 2 5\nf 2 3 5\nf 3 4 5\nf 4 1 5\n';
+const PLY = 'ply\nformat ascii 1.0\nelement vertex 5\nproperty float x\nproperty float y\nproperty float z\nelement face 6\nproperty list uchar int vertex_indices\nend_header\n0 0 0\n4 0 0\n4 0 4\n0 0 4\n2 5 2\n3 0 2 1\n3 0 3 2\n3 0 1 4\n3 1 2 4\n3 2 3 4\n3 3 0 4\n';
+
+test('OBJ and PLY models load and props drop onto them', async ({ page }) => {
+    await pick(page, [{ name: 'pyramid.obj', buffer: Buffer.from(OBJ) }]);
+    await page.waitForFunction(() => (window as any).__stats()?.label === 'pyramid.obj', null, { timeout: 30_000 });
+    await page.evaluate(() => (window as any).__step(300));
+    let r = await page.evaluate(() => (window as any).__stats());
+    expect(r.levelKinds).toEqual(['pyramid:hull']);
+    expect(r.malformed).toBe(0);
+    expect(r.finite).toBe(true);
+
+    await page.setInputFiles('#file', [{ name: 'shape.ply', mimeType: 'application/octet-stream', buffer: Buffer.from(PLY) }]);
+    await page.waitForFunction(() => (window as any).__stats()?.label === 'shape.ply', null, { timeout: 30_000 });
+    r = await page.evaluate(() => (window as any).__stats());
+    expect(r.levelKinds).toEqual(['shape:hull']);
+});
+
+test('?url= loads Draco and OBJ files over HTTP', async ({ page }) => {
+    await page.route((u) => u.pathname === '/draco-level.glb', (route) => route.fulfill({ status: 200, contentType: 'model/gltf-binary', body: fixtureBytes('level-draco.glb') }));
+    await page.route((u) => u.pathname === '/pyr.obj', (route) => route.fulfill({ status: 200, contentType: 'text/plain', body: OBJ }));
+    await page.goto('/gltf.html?paused=1&url=/draco-level.glb');
+    expect((await stats(page, 60)).levelKinds).toEqual(LEVEL);
+    await page.goto('/gltf.html?paused=1&url=/pyr.obj');
+    expect((await stats(page, 60)).levelKinds).toEqual(['pyramid:hull']);
+});
+
+test('a PNG on its own is rejected with a clear message', async ({ page }) => {
+    await pick(page, [{ name: 'texture.png', buffer: Buffer.from([137, 80, 78, 71]) }]);
+    await page.waitForFunction(() => (window as any).__error !== undefined, null, { timeout: 30_000 });
+    expect(await page.locator('#msg').textContent()).toContain('no supported model file among: texture.png');
+});
+

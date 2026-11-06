@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./loaders": "./src/loaders.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -17,8 +18,9 @@
     "three": ">=0.160"
   },
   "devDependencies": {
-    "three": "^0.170.0",
+    "@types/node": "^26.6.6",
     "@types/three": "^0.170.0",
+    "three": "^0.170.0",
     "typescript": "^7.0",
     "vitest": "^4.0"
   }

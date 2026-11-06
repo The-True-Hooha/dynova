@@ -9,7 +9,7 @@ canvas{display:block}
 body.drag canvas{outline:3px dashed #8f8;outline-offset:-3px}
 </style></head>
 <body>
-<div id="bar">Drop a <b>.glb</b> anywhere or <input id="file" type="file" accept=".glb,model/gltf-binary" /> &nbsp; <span id="msg"></span></div>
+<div id="bar">Drop <b>.glb</b> / <b>.gltf + .bin + images</b> / <b>.obj</b> / <b>.stl</b> / <b>.ply</b> files anywhere or <input id="file" type="file" multiple accept=".glb,.gltf,.bin,.obj,.stl,.ply,.png,.jpg,.jpeg,.webp,.ktx2,.mtl" /> &nbsp; <span id="msg"></span></div>
 <canvas id="c" width="900" height="560"></canvas>
 <pre id="out">loading</pre>
 <script type="module" src="./gltf.ts"></script>

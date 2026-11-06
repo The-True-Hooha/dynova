@@ -1,6 +1,7 @@
 import { AmbientLight, Box3, BoxGeometry, DirectionalLight, InstancedMesh, Mesh, MeshStandardMaterial, PerspectiveCamera, Scene, SphereGeometry, Vector3, WebGLRenderer, type Object3D, type Texture } from 'three';
 import { World, layoutFromRuntime, TransformView } from '@dynova/sdk';
-import { collidersFromScene, loadGltfScene, spawnColliders, type ColliderDesc, type SceneColliders } from '@dynova/three';
+import { collidersFromScene, spawnColliders, type ColliderDesc, type SceneColliders } from '@dynova/three';
+import { loadModelFiles, loadModelUrl, type LoadOptions, type ModelFile } from '@dynova/three/loaders';
 import { threeAdapter } from '@dynova/three';
 import { box, buildGlb, cube, pyramid, rampGrid, translated, type FixtureMesh } from '../renderer/three/src/testing/gltfFixture';
 import { BALLS, CONES, CRATES, buildProps, pyramidGeometry } from './stageScene';
@@ -10,6 +11,7 @@ const paused = params.has('paused');
 const canvas = document.getElementById('c') as HTMLCanvasElement;
 const out = document.getElementById('out')!;
 const msg = document.getElementById('msg')!;
+const loadOptions: LoadOptions = { dracoDecoderPath: '/draco/' };
 
 function defaultLevel(): ArrayBuffer {
     const wall = (name: string, half: number[], at: number[]): FixtureMesh => ({ name, ...box(half[0], half[1], half[2]), translation: at, color: [0.45, 0.4, 0.35] });
@@ -139,19 +141,23 @@ function start(root: Object3D, label: string, levelScene: SceneColliders): void 
         dispose() {
             scene.remove(root, ...meshes.map((m) => m.mesh));
             for (const { mesh } of meshes) { mesh.geometry.dispose(); (mesh.material as MeshStandardMaterial).dispose(); }
-            root.traverse((n) => {
-                const m = n as Mesh;
-                if (!m.isMesh) return;
-                m.geometry.dispose();
-                for (const material of Array.isArray(m.material) ? m.material : [m.material]) {
-                    for (const value of Object.values(material)) if (value && (value as Texture).isTexture) (value as Texture).dispose();
-                    material.dispose();
-                }
-            });
+            disposeObject(root);
             world.dispose();
             runtime.free();
         },
     };
+}
+
+function disposeObject(root: Object3D): void {
+    root.traverse((n) => {
+        const m = n as Mesh;
+        if (!m.isMesh) return;
+        m.geometry.dispose();
+        for (const material of Array.isArray(m.material) ? m.material : [m.material]) {
+            for (const value of Object.values(material)) if (value && (value as Texture).isTexture) (value as Texture).dispose();
+            material.dispose();
+        }
+    });
 }
 
 function fail(text: string): void {
@@ -160,42 +166,47 @@ function fail(text: string): void {
     (window as any).__errorCount = ((window as any).__errorCount ?? 0) + 1;
 }
 
-async function load(input: string | ArrayBuffer, label: string): Promise<void> {
-    const mine = ++request;
-    const result = await loadGltfScene(input);
+async function load(source: () => ReturnType<typeof loadModelUrl>, label: string, token = ++request): Promise<void> {
+    const mine = token;
+    const result = await source();
     if (mine !== request) return;
     if (!result.ok) return fail(`could not load ${label}: ${result.error}`);
     const levelScene = collidersFromScene(result.scene);
     if (levelScene.colliders.length === 0) {
+        disposeObject(result.scene);
         return fail(`could not use ${label}: no meshes to collide with (${levelScene.skipped.length} skipped)`);
     }
     try {
         start(result.scene, label, levelScene);
     } catch (err) {
         running = null;
+        disposeObject(result.scene);
         return fail(`could not start ${label}: ${err instanceof Error ? err.message : String(err)}`);
     }
-    msg.textContent = label;
+    msg.textContent = `${label} (${result.format})`;
     (window as any).__error = undefined;
 }
 
-async function loadFile(file: File): Promise<void> {
-    await load(await file.arrayBuffer(), file.name);
+async function loadFiles(files: File[]): Promise<void> {
+    if (files.length === 0) return;
+    const token = ++request;
+    const models: ModelFile[] = await Promise.all(files.map(async (f) => ({ name: f.name, data: await f.arrayBuffer() })));
+    const label = files.length === 1 ? files[0].name : `${files.length} files`;
+    await load(() => loadModelFiles(models, loadOptions), label, token);
 }
 
 document.getElementById('file')!.addEventListener('change', (e) => {
     const input = e.target as HTMLInputElement;
-    const file = input.files?.[0];
+    const files = Array.from(input.files ?? []);
     input.value = '';
-    if (file) void loadFile(file);
+    void loadFiles(files);
 });
 addEventListener('dragover', (e) => { e.preventDefault(); document.body.classList.add('drag'); });
 addEventListener('dragleave', (e) => { if (!e.relatedTarget) document.body.classList.remove('drag'); });
 addEventListener('drop', (e) => {
     e.preventDefault();
     document.body.classList.remove('drag');
-    const file = e.dataTransfer?.files[0];
-    if (file) void loadFile(file);
+    void loadFiles(Array.from(e.dataTransfer?.files ?? []));
 });
 
 (window as any).__step = (n: number) => { for (let i = 0; i < n; i++) running?.step(); };
@@ -203,7 +214,9 @@ addEventListener('drop', (e) => {
 
 const url = params.get('url');
 try {
-    await (url ? load(url, url) : load(defaultLevel(), 'built-in level (loaded as GLB)'));
+    await (url
+        ? load(() => loadModelUrl(url, loadOptions), url)
+        : load(() => loadModelFiles([{ name: 'built-in.glb', data: defaultLevel() }], loadOptions), 'built-in level'));
 } finally {
     (window as any).__ready = true;
 }
