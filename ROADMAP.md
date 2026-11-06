@@ -100,7 +100,7 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 - Camera/scene ownership stays fully in user code — Dynova never creates a `THREE.Scene`
 - **Exit:** load a GLTF scene, spawn colliders matching visual meshes, drop them, watch them collide and render correctly.
 
-### Stage 3B — Adapter contract hardening + second renderer as proof
+### Stage 3B — Adapter contract hardening + second renderer as proof  ✅ done (`docs/adapter-contract.md`, `@dynova/canvas2d`, `examples/swap.html`; zero `core/` changes)
 - Formalize the adapter interface (buffer layout doc + TS type) so it's actually renderer-agnostic and not just "whatever Three.js needed"
 - Build a second adapter — raw WebGL2 or Canvas2D, doesn't matter which, the point is proving the contract holds without a second full renderer's worth of scope
 - **Exit:** same buffer, same World, swap Three.js adapter for the second one at runtime with zero core changes. If this requires touching `core/`, the Stage 3A contract was wrong — fix it here, not later.

@@ -28,6 +28,7 @@ dev:
 test:
 	pnpm --filter @dynova/sdk test
 	pnpm --filter @dynova/three test
+	pnpm --filter @dynova/canvas2d test
 
 # Watch mode for tests
 test-watch:
@@ -37,6 +38,7 @@ test-watch:
 check:
 	pnpm --filter @dynova/sdk typecheck
 	pnpm --filter @dynova/three typecheck
+	pnpm --filter @dynova/canvas2d typecheck
 
 # Full rebuild from scratch: release WASM + install deps
 all: build-release build-st install

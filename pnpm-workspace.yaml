@@ -1,4 +1,5 @@
 packages:
   - "sdk/typescript"
   - "renderer/three"
+  - "renderer/canvas2d"
   - "examples"

@@ -1,66 +1,28 @@
 import { DynamicDrawUsage, type InstancedMesh } from 'three';
-import { FLOATS_PER_TRANSFORM } from '@dynova/sdk';
+import { assertIdOffset, decodeTransforms, type AdapterOptions, type InstanceSink, type TransformSource, type UpdateResult } from '@dynova/sdk';
 
-export interface TransformSource {
-    readTransforms(): Float32Array;
-}
-
-export interface ThreeAdapterOptions {
-    /** Instance `i` shows entity `i + idOffset`. Non-negative integer, default 0. */
-    idOffset?: number;
-    /**
-     * Per-entity scale, 3 floats (x, y, z) per entity id, indexed by entity id. The transform buffer carries no
-     * size, so pass the dimensions you spawned with. Read on every update; missing entries mean 1.
-     */
-    scales?: ArrayLike<number>;
-}
-
-export interface UpdateResult {
-    /** Instances drawn this update. */
-    live: number;
-    /** Instances hidden because the entity is destroyed, empty or non-finite. */
-    hidden: number;
-    /** Entities that exist but have no instance because `mesh.count` is too small. */
-    truncated: number;
-}
+export type { TransformSource, UpdateResult };
+export type ThreeAdapterOptions = AdapterOptions;
 
 export interface ThreeAdapter {
     update(): UpdateResult;
 }
 
 export function threeAdapter(source: TransformSource, mesh: InstancedMesh, options: ThreeAdapterOptions = {}): ThreeAdapter {
-    const offset = options.idOffset ?? 0;
-    if (!Number.isInteger(offset) || offset < 0) throw new RangeError(`idOffset must be a non-negative integer, got ${offset}`);
+    assertIdOffset(options.idOffset ?? 0);
     mesh.instanceMatrix.setUsage(DynamicDrawUsage);
     // three caches the bounding sphere on first render; moving instances would be culled once they leave it.
     mesh.frustumCulled = false;
     return {
         update() {
-            const buf = source.readTransforms();
-            const entities = Math.max(0, Math.floor(buf.length / FLOATS_PER_TRANSFORM) - offset);
             const out = mesh.instanceMatrix.array as Float32Array;
-            const capacity = Math.min(mesh.count, out.length / 16);
-            const slots = Math.min(capacity, entities);
-            const scales = options.scales;
-            let live = 0;
-            for (let i = 0; i < slots; i++) {
-                const id = i + offset;
-                const o = id * FLOATS_PER_TRANSFORM;
-                const m = i * 16;
-                const qx = buf[o + 3], qy = buf[o + 4], qz = buf[o + 5], qw = buf[o + 6];
-                const sx = scales?.[id * 3] ?? 1, sy = scales?.[id * 3 + 1] ?? 1, sz = scales?.[id * 3 + 2] ?? 1;
-                const finite = Number.isFinite(buf[o] + buf[o + 1] + buf[o + 2] + qx + qy + qz + qw + sx + sy + sz);
-                if (!finite || (qw === 0 && qx === 0 && qy === 0 && qz === 0)) {
-                    hide(out, m);
-                    continue;
-                }
-                const inv = 1 / Math.hypot(qx, qy, qz, qw);
-                composeInto(out, m, buf[o], buf[o + 1], buf[o + 2], qx * inv, qy * inv, qz * inv, qw * inv, sx, sy, sz);
-                live++;
-            }
-            for (let i = slots; i < capacity; i++) hide(out, i * 16);
+            const sink: InstanceSink = {
+                show: (slot, _id, x, y, z, qx, qy, qz, qw, sx, sy, sz) => composeInto(out, slot * 16, x, y, z, qx, qy, qz, qw, sx, sy, sz),
+                hide: (slot) => hide(out, slot * 16),
+            };
+            const result = decodeTransforms(source, Math.min(mesh.count, out.length / 16), sink, options);
             mesh.instanceMatrix.needsUpdate = true;
-            return { live, hidden: slots - live, truncated: Math.max(0, entities - capacity) };
+            return result;
         },
     };
 }

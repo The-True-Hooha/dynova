@@ -9,7 +9,8 @@
   "dependencies": {
     "@dynova/sdk": "workspace:*",
     "@dynova/three": "workspace:*",
-    "three": "^0.170.0"
+    "three": "^0.170.0",
+    "@dynova/canvas2d": "workspace:*"
   },
   "devDependencies": {
     "vite": "^8.1.3"

@@ -9,3 +9,5 @@ export type { LaunchOptions, FallbackRuntime, SimInit, SimMessage } from './laun
 export type { SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
 export type { EntityHandle } from './EntityIdAllocator.js';
 export type { MemoryMode, MemoryResult } from './memory.js';
+export { decodeTransforms, assertIdOffset } from './adapter.js';
+export type { AdapterOptions, InstanceSink, TransformSource, UpdateResult } from './adapter.js';

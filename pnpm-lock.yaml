@@ -20,6 +20,9 @@ importers:
 
   examples:
     dependencies:
+      '@dynova/canvas2d':
+        specifier: workspace:*
+        version: link:../renderer/canvas2d
       '@dynova/sdk':
         specifier: workspace:*
         version: link:../sdk/typescript
@@ -33,6 +36,19 @@ importers:
       vite:
         specifier: ^8.1.3
         version: 8.1.3
+
+  renderer/canvas2d:
+    dependencies:
+      '@dynova/sdk':
+        specifier: workspace:*
+        version: link:../../sdk/typescript
+    devDependencies:
+      typescript:
+        specifier: ^7.0
+        version: 7.0.2
+      vitest:
+        specifier: ^4.0
+        version: 4.1.10(vite@8.1.3)
 
   renderer/three:
     dependencies:
