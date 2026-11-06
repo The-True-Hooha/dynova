@@ -1,5 +1,5 @@
 export { TransformView, FLOATS_PER_TRANSFORM } from './TransformView.js';
-export { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, SHAPE_HULL, SLOT_BYTES, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_VERTS } from './CommandRing.js';
+export { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, SHAPE_HULL, SLOT_BYTES, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_VERTS, MAX_HULL_COORD } from './CommandRing.js';
 export { EntityIdAllocator } from './EntityIdAllocator.js';
 export { World, layoutFromRuntime } from './World.js';
 export { launchWorld } from './launch.js';

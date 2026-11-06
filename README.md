@@ -54,12 +54,13 @@ Renderer Adapter (pure function: buffer -> draw calls, no entity knowledge)
 dynova/
   core/              # Rust: runtime, command ring, triple buffer, broadphase, solver, collision
   sdk/typescript/    # World, handles, command ring, buffer views, launchWorld, sim worker
+  renderer/three/    # Three.js instanced adapter and scene-to-collider helpers
   examples/          # Runnable demos and e2e pages
   e2e/               # Playwright cross-browser tests
   docs/              # Hosting notes (cross-origin isolation)
 ```
 
-Planned, not yet built: `renderer/three/` (Phase 3), `inspector/` (Phase 4).
+Planned, not yet built: `inspector/` (Phase 4).
 
 ---
 
