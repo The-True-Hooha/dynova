@@ -22,7 +22,7 @@ Classification uses the convex hull volume, so double-sided, overlapping or inco
 
 - Boxes and spheres are fitted in the mesh's own frame and posed with the node's world rotation, so rotated nodes give rotated boxes.
 - A hull body's origin is its volume centroid. `ColliderDesc.position` already includes that offset.
-- Hull ids are immutable, so identical geometry at identical scale uploads one hull.
+- Hull ids are immutable. Within one `spawnColliders` call, identical geometry at identical scale uploads one hull; separate calls upload again, and the runtime allows 1024 hulls in total.
 - Unusable meshes are returned in `skipped` with a reason: `no-geometry`, `unsupported` (instanced, skinned, indices not in triples), `non-finite`, `too-large` (above 1e4), `degenerate` (a point, a line, or a mesh thinner than 0.01 in two axes, e.g. a small prop under a centimetre).
 - Colliders are static unless `body(node)` returns `invMass`. Per-collider failures (ring full, hull limit) land in `failed` and do not stop the others.
 

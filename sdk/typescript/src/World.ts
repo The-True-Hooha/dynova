@@ -281,8 +281,8 @@ export class World {
 
     /**
      * Upload a convex hull from flat x,y,z points (4 to 32 vertices, |coordinate| <= 1e4) and return its id for
-     * `spawn({ shape: SHAPE_HULL, hull })`. The runtime recentres the hull on the mean of its points, so the body
-     * origin is that mean. Invalid geometry (for example coplanar points) is rejected by the runtime and counted
+     * `spawn({ shape: SHAPE_HULL, hull })`. The runtime recentres the hull on its volume centroid, so the body
+     * origin is that centroid. Invalid geometry (for example coplanar points) is rejected by the runtime and counted
      * in `runtimeCounters.malformedDropped`; spawns that reference it are dropped the same way.
      */
     registerHull(points: ArrayLike<number>): number {

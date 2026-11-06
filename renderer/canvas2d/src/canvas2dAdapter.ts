@@ -54,7 +54,6 @@ export function canvas2dAdapter(source: TransformSource, ctx: Canvas2DContext, o
             const sink: InstanceSink = {
                 show(_slot, id, x, y, _z, qx, qy, qz, qw, sx, sy) {
                     const style = options.style?.(id) ?? {};
-                    // Angle of the body's x axis projected onto the x/y plane.
                     const angle = Math.atan2(2 * (qx * qy + qw * qz), 1 - 2 * (qy * qy + qz * qz));
                     const w = sx * ppu, h = sy * ppu;
                     ctx.save();

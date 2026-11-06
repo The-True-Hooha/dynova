@@ -93,14 +93,14 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 
 ## Phase 3 — Rendering + Assets
 
-### Stage 3A — Three.js adapter, GLTF in  ✅ done (demo: `examples/stage3a.html`, `?live=1` for a live view; physics checks in `e2e/stage3a.spec.ts`)
+### Stage 3A — Three.js adapter, GLTF in  ✅ done with a deviation: scene graph (`Object3D`, e.g. `gltf.scene`) to colliders is implemented and a GLB is parsed with `GLTFLoader` in Node tests, but the browser demo (`examples/stage3a.html`, `?live=1`) builds its scene in code and loads no `.glb`
 - `threeAdapter(transforms, instancedMesh)` — instance matrix update from buffer, no per-entity Three.js objects
 - Convex hull narrow phase (SAT, moved here from Stage 2B) so mesh-derived colliders work
 - GLTF load -> mesh extraction -> convex hull / primitive-fit collider generation -> spawn command
 - Camera/scene ownership stays fully in user code — Dynova never creates a `THREE.Scene`
 - **Exit:** load a GLTF scene, spawn colliders matching visual meshes, drop them, watch them collide and render correctly.
 
-### Stage 3B — Adapter contract hardening + second renderer as proof  ✅ done (`docs/adapter-contract.md`, `@dynova/canvas2d`, `examples/swap.html`; zero `core/` changes)
+### Stage 3B — Adapter contract hardening + second renderer as proof  ✅ done (`docs/adapter-contract.md`, `@dynova/canvas2d`, `examples/swap.html`; Step 12 changed nothing under `core/`, the hull work in `core/` landed earlier in 3A)
 - Formalize the adapter interface (buffer layout doc + TS type) so it's actually renderer-agnostic and not just "whatever Three.js needed"
 - Build a second adapter — raw WebGL2 or Canvas2D, doesn't matter which, the point is proving the contract holds without a second full renderer's worth of scope
 - **Exit:** same buffer, same World, swap Three.js adapter for the second one at runtime with zero core changes. If this requires touching `core/`, the Stage 3A contract was wrong — fix it here, not later.

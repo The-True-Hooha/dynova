@@ -58,7 +58,7 @@ dynova/
   renderer/canvas2d/ # Canvas2D adapter (second renderer, proves the adapter contract)
   examples/          # Runnable demos and e2e pages
   e2e/               # Playwright cross-browser tests
-  docs/              # Hosting notes (cross-origin isolation)
+  docs/              # Hosting notes, adapter contract, Three.js adapter, scene colliders
 ```
 
 Planned, not yet built: `inspector/` (Phase 4).
@@ -120,6 +120,6 @@ Open `http://localhost:5173`.
 
 ## Status
 
-Phases 1 and 2 are complete: shared-memory worker runtime with a sync fallback, lock-free triple-buffered transforms with growth, bounded command backpressure, and a physics core (spheres, boxes, capsules, convex hulls, friction, warm starting, island sleeping, swept CCD). Phase 3 Stage 3A is done (Three.js instanced adapter, scene-to-collider fitting, convex hulls); Stage 3B is done (shared decode contract in the SDK, Canvas2D adapter, runtime swap demo at `/swap.html`; see [docs/adapter-contract.md](./docs/adapter-contract.md)). Phase 4 (inspector) is next. Run `make dev` and open `/stage3a.html?live=1` for the live demo. See [ROADMAP.md](./ROADMAP.md) and [PLAN.md](./PLAN.md).
+Phases 1, 2 and 3 are complete: shared-memory worker runtime with a sync fallback, lock-free triple-buffered transforms with growth, bounded command backpressure, and a physics core (spheres, boxes, capsules, convex hulls, friction, warm starting, island sleeping, swept CCD). Phase 3 Stage 3A is done (Three.js instanced adapter, scene-graph-to-collider fitting with GLB parsing tested in Node, convex hulls; the browser demo builds its scene in code and loads no `.glb`); Stage 3B is done (shared decode contract in the SDK, Canvas2D adapter, runtime swap demo at `/swap.html`; see [docs/adapter-contract.md](./docs/adapter-contract.md)). Phase 4 (inspector) is next. Run `make dev` and open `/stage3a.html?live=1` for the live demo. See [ROADMAP.md](./ROADMAP.md) and [PLAN.md](./PLAN.md).
 
 Known limits: a single column of unit boxes buckles above about 20 high; dynamic-vs-dynamic CCD is not implemented; Firefox is configured in Playwright but was not verified in the development sandbox. A solver golden hash (single-threaded build) matches the native build in Chromium and WebKit; a sin/cos/atan2/sqrt probe also matches; a run on the shared (threaded) build is not done. The 30-body stress scene has no joints (bodies are contained by static walls).
