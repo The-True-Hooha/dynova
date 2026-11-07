@@ -16,7 +16,10 @@ fn max_contacts_for(capacity: usize) -> usize {
     (capacity.min(MAX_BODIES) * CONTACTS_PER_BODY).max(MIN_MAX_CONTACTS)
 }
 const MIN_CELL_SIZE: f32 = 2.0;
+const BROAD_EPS: f32 = 1e-3;
 const SOLVER_ITERS: u32   = 12;
+// Largest velocity change (m/s) one contact update may still apply for the sweep to count as converged.
+const CONVERGED: f32 = 1e-4;
 const BIAS_FACTOR:  f32   = 0.2;
 const MAX_BIAS_VEL: f32   = 2.0;
 const CCD_MARGIN: f32 = 0.01;
@@ -56,6 +59,7 @@ pub struct PhysicsWorld {
     sleep_timer:     Vec<f32>,
     cell_heads: Vec<i32>,
     cell_next:  Vec<i32>,
+    reach: Vec<f32>,
     big_statics: Vec<u32>,
     targets: Vec<f32>,
     touching: Vec<bool>,
@@ -75,6 +79,7 @@ pub struct PhysicsWorld {
     pub dt: f32,
     pub cell_size: f32,
     pub narrow_calls: u32,
+    pub solver_iters_used: u32,
     pub dropped_contacts: u32,
     max_contacts: usize,
     max_dynamic_diameter: f32,
@@ -172,6 +177,7 @@ impl PhysicsWorld {
             sleep_timer: vec![0.0; capacity],
             cell_heads: vec![-1i32; bucket_count_for(capacity)],
             cell_next:  vec![-1i32; capacity],
+            reach: vec![0.0; capacity],
             big_statics: Vec::new(),
             targets: Vec::new(),
             touching: vec![false; capacity],
@@ -191,6 +197,7 @@ impl PhysicsWorld {
             dt: 1.0 / 60.0,
             cell_size: 2.0,
             narrow_calls: 0,
+            solver_iters_used: 0,
             dropped_contacts: 0,
             max_contacts: max_contacts_for(capacity),
             max_dynamic_diameter: 0.0,
@@ -205,6 +212,7 @@ impl PhysicsWorld {
               half_x = 0.5, half_y = 0.5, half_z = 0.5, radius = 0.5, inv_mass = 1.0, inv_inertia = 1.0,
               restitution = 0.3, friction = DEFAULT_FRICTION, shape = SHAPE_BOX, active = false, sleeping = false, sleep_timer = 0.0);
         self.cell_next.resize(new_capacity, -1);
+        self.reach.resize(new_capacity, 0.0);
         self.hull_of.resize(new_capacity, 0);
         self.touching.resize(new_capacity, false);
         self.penetrating.resize(new_capacity, false);
@@ -313,7 +321,6 @@ impl PhysicsWorld {
             }
         }
         self.sleep_quiet_islands();
-
         self.generate_contacts();
         if self.wake_disturbed_sleepers() {
             self.generate_contacts();
@@ -369,17 +376,21 @@ impl PhysicsWorld {
         }
 
         // Alternate sweep direction so the sequential solve does not bias one side of a manifold.
+        self.solver_iters_used = 0;
         for iter in 0..SOLVER_ITERS as usize {
+            self.solver_iters_used += 1;
             let count = self.contacts.len();
             let stride = { let mut st = 1 + (iter * 2 + 1) * 7 % count.max(2); while gcd(st, count.max(1)) != 1 { st += 1; } st };
+            let mut largest = 0.0f32;
             for k in 0..count {
                 let ci = (k * stride + iter) % count;
                 let mut m = Motion {
                     vx: &mut self.vel_x, vy: &mut self.vel_y, vz: &mut self.vel_z,
                     ax: &mut self.ang_x, ay: &mut self.ang_y, az: &mut self.ang_z,
                 };
-                solve_contact(&mut self.contacts[ci], self.targets[ci], &eff_mass, &mut m, &eff_inertia);
+                largest = worst(largest, solve_contact(&mut self.contacts[ci], self.targets[ci], &eff_mass, &mut m, &eff_inertia));
             }
+            if largest < CONVERGED { break; }
         }
 
         // Split impulse: recover penetration with pseudo-velocities that move positions but are discarded,
@@ -470,8 +481,10 @@ impl PhysicsWorld {
         // Cells must be at least as wide as the widest gridded body so overlapping bodies sit in adjacent cells.
         let mut widest = 0.0f32;
         for i in 0..cap {
-            if self.active[i] && self.inv_mass[i] != 0.0 {
-                widest = widest.max(2.0 * extent(self, i));
+            if !self.active[i] { continue; }
+            self.reach[i] = extent(self, i);
+            if self.inv_mass[i] != 0.0 {
+                widest = widest.max(2.0 * self.reach[i]);
             }
         }
         self.max_dynamic_diameter = widest;
@@ -482,7 +495,7 @@ impl PhysicsWorld {
         self.big_statics.clear();
         for i in 0..cap {
             if !self.active[i] { continue; }
-            let diameter = 2.0 * extent(self, i);
+            let diameter = 2.0 * self.reach[i];
             if self.inv_mass[i] == 0.0 && diameter > self.cell_size {
                 self.big_statics.push(i as u32);
                 continue;
@@ -512,6 +525,10 @@ impl PhysicsWorld {
                     if j == i { continue; }
                     let awake_dynamic = self.inv_mass[j] != 0.0 && !self.sleeping[j];
                     if awake_dynamic && j < i { continue; }
+                    // Bounding spheres that do not overlap cannot touch; this skips most of the narrow-phase calls in a dense pile.
+                    let (dx, dy, dz) = (self.pos_x[i] - self.pos_x[j], self.pos_y[i] - self.pos_y[j], self.pos_z[i] - self.pos_z[j]);
+                    let reach = self.reach[i] + self.reach[j] + BROAD_EPS;
+                    if dx * dx + dy * dy + dz * dz > reach * reach { continue; }
                     self.try_contact(i, j);
                 }
             }
@@ -783,7 +800,13 @@ fn apply_impulse_pair(c: &Contact, inv_mass: &[f32], m: &mut Motion, inv_i: &[f3
     apply_at(c, t2, c.lt2, inv_mass, m, inv_i);
 }
 
-fn solve_contact(c: &mut Contact, target: f32, inv_mass: &[f32], m: &mut Motion, inv_i: &[f32]) {
+/// Larger residual, where NaN wins: f32::max would drop it and report a diverged sweep as converged.
+fn worst(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() { f32::NAN } else { a.max(b) }
+}
+
+fn solve_contact(c: &mut Contact, target: f32, inv_mass: &[f32], m: &mut Motion, inv_i: &[f32]) -> f32 {
+    let mut residual = 0.0f32;
     let n = (c.nx, c.ny, c.nz);
     let (t1, t2) = tangents(n);
 
@@ -796,22 +819,27 @@ fn solve_contact(c: &mut Contact, target: f32, inv_mass: &[f32], m: &mut Motion,
         let new = (acc - vt / denom).clamp(-limit, limit);
         apply_at(c, t, new - acc, inv_mass, m, inv_i);
         if which == 0 { c.lt1 = new } else { c.lt2 = new }
+        residual = worst(residual, ((new - acc) * denom).abs());
     }
 
     let mut lambda = c.lambda;
-    solve_normal(c, &mut lambda, target, inv_mass, m, inv_i);
+    residual = worst(residual, solve_normal(c, &mut lambda, target, inv_mass, m, inv_i));
     c.lambda = lambda;
+    residual
 }
 
 /// One normal-constraint update on an accumulated impulse that may shrink but never goes below zero.
-fn solve_normal(c: &Contact, lambda: &mut f32, target: f32, inv_mass: &[f32], m: &mut Motion, inv_i: &[f32]) {
+/// Returns the velocity change the update applied, so convergence does not depend on body mass.
+fn solve_normal(c: &Contact, lambda: &mut f32, target: f32, inv_mass: &[f32], m: &mut Motion, inv_i: &[f32]) -> f32 {
     let n = (c.nx, c.ny, c.nz);
     let denom = effective_mass_inv(c, n, inv_mass, inv_i);
-    if denom < 1e-10 { return; }
+    if denom < 1e-10 { return 0.0; }
     let vn = relative_velocity(c, n, m);
     let new_lambda = (*lambda + (target - vn) / denom).max(0.0);
     apply_at(c, n, new_lambda - *lambda, inv_mass, m, inv_i);
+    let change = ((new_lambda - *lambda) * denom).abs();
     *lambda = new_lambda;
+    change
 }
 
 fn collide(a: usize, b: usize, w: &PhysicsWorld) -> Option<Manifold> {
@@ -1550,6 +1578,48 @@ mod tests {
         w.try_contact(0, 1);
         assert!(w.dropped_contacts >= 1, "dropped {}", w.dropped_contacts);
         assert_eq!(w.contacts.len(), cap);
+    }
+
+    #[test]
+    fn a_dense_lattice_needs_few_narrow_phase_calls_per_body() {
+        let side = 10usize;
+        let n = side * side * side;
+        let mut w = zero_g(n);
+        for i in 0..n {
+            let p = [(i % side) as f32 * 1.15, ((i / side) % side) as f32 * 1.15, (i / (side * side)) as f32 * 1.15];
+            w.spawn(i, &BodyDesc::sphere_at(p, 0.5, 1.0, 0.0));
+        }
+        w.step();
+        assert!(w.narrow_calls as usize <= 8 * n, "{} narrow calls for {n} bodies", w.narrow_calls);
+        assert_eq!(w.contacts.len(), 0, "spheres spaced 1.15 apart do not touch");
+    }
+
+    #[test]
+    fn the_solver_stops_early_once_a_resting_box_has_converged_without_sinking() {
+        let mut w = PhysicsWorld::new(2);
+        w.spawn(0, &BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.0));
+        w.spawn(1, &BodyDesc::box_at([0.0, 0.45, 0.0], [0.5; 3], 1.0, 0.0));
+        w.vel_y[1] = -8.0;
+        w.step();
+        let impact = w.solver_iters_used;
+        assert!(!w.contacts.is_empty() && impact > 1, "impact used {impact} iterations");
+        let mut early_while_touching = false;
+        for _ in 0..40 {
+            w.step();
+            early_while_touching |= !w.contacts.is_empty() && !w.sleeping[1] && w.solver_iters_used < impact;
+        }
+        assert!(early_while_touching, "no step with a live contact converged before the impact step's {impact} sweeps");
+        assert!((w.pos_y[1] - 0.5).abs() < 0.05, "box rests at y={}", w.pos_y[1]);
+    }
+
+    #[test]
+    fn a_nan_residual_does_not_count_as_converged() {
+        let mut w = zero_g(2);
+        w.spawn(0, &BodyDesc::box_at([0.0; 3], [0.5; 3], 1.0, 0.0));
+        w.spawn(1, &BodyDesc::box_at([0.0, 0.9, 0.0], [0.5; 3], 1.0, 0.0));
+        w.vel_x[0] = f32::NAN;
+        w.step();
+        assert_eq!(w.solver_iters_used, SOLVER_ITERS);
     }
 
     #[test]

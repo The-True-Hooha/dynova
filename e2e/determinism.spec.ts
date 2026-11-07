@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 
 // Pinned from the native host run of `physics_scene_matches_golden_hash` (core/src/runtime.rs).
-const HOST_HASH = '15518154949815444409';
+const HOST_HASH = '4599892428385582693';
 
 test('solver output is bit-identical to the native host build in this browser', async ({ page }) => {
     await page.goto('/determinism.html');
