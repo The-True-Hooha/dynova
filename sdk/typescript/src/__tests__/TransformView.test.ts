@@ -176,7 +176,7 @@ describe('TransformView (triple buffer reader)', () => {
         expect(() => view.reacquire()).toThrow('layout update stuck');
     });
 
-    it('bucketCounts is a live view of the shared occupancy histogram', () => {
+    it('bucketCounts is a snapshot of the shared occupancy histogram, not a live view', () => {
         const { memory, rt, view } = setup();
         const at = 4096;
         new Uint32Array(memory.buffer, at, 4).set([0, 3, 0, 7]);
@@ -185,6 +185,13 @@ describe('TransformView (triple buffer reader)', () => {
         const counts = view.bucketCounts();
         expect(Array.from(counts)).toEqual([0, 3, 0, 7]);
         new Uint32Array(memory.buffer, at, 4)[2] = 9;
-        expect(counts[2]).toBe(9);
+        expect(counts[2]).toBe(0);
+        expect(view.bucketCounts()[2]).toBe(9);
+    });
+
+    it('bucketCounts throws instead of reading a half-published layout', () => {
+        const { rt, view } = setup(2);
+        Atomics.store(rt.header, H_EPOCH, 1);
+        expect(() => view.bucketCounts()).toThrow('layout update stuck');
     });
 });

@@ -13,7 +13,8 @@ for (const n of [1000, 5000, 10000]) {
         expect(r.finite).toBe(true);
         expect(r.malformedDropped).toBe(0);
         expect(r.pending).toBe(0);
-        expect(r.sleeping).toBeLessThanOrEqual(n);
+        expect(r.droppedContacts).toBe(0);
+        expect(r.buckets.maxPerBucket).toBeLessThan(64);
         expect(r.buckets.used).toBeGreaterThan(0);
         info.annotations.push({ type: 'bench', description: JSON.stringify(r) });
         console.log(`[${info.project.name}] ${JSON.stringify(r)}`);

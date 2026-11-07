@@ -46,8 +46,16 @@ export class TransformView {
         };
     }
 
+    /** Copy of the occupancy histogram; the runtime frees and reallocates it when capacity grows, so a live view could go stale. */
     bucketCounts(): Uint32Array {
-        return new Uint32Array(this.memory.buffer, Atomics.load(this.header, H_BUCKETS), Atomics.load(this.header, H_BUCKET_LEN));
+        for (let spins = 0; ; spins++) {
+            if (spins > MAX_SPINS) throw new Error('layout update stuck: the runtime never finished growing its buffers');
+            const e = Atomics.load(this.header, H_EPOCH);
+            if (e & 1) continue;
+            const view = new Uint32Array(this.memory.buffer, Atomics.load(this.header, H_BUCKETS), Atomics.load(this.header, H_BUCKET_LEN));
+            const copy = view.slice();
+            if (Atomics.load(this.header, H_EPOCH) === e) return copy;
+        }
     }
 
     counters(): { ticks: number; staleDropped: number; malformedDropped: number } {

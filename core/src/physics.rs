@@ -1,9 +1,20 @@
 use crate::collision::{self as geo, Manifold};
 use crate::hull::{self, HullData, MAX_HULLS};
 
-const BUCKET_COUNT: usize = 4096;
-const BUCKET_MASK:  usize = BUCKET_COUNT - 1;
-const MAX_CONTACTS: usize = 16384;
+const MIN_BUCKETS: usize = 4096;
+const MAX_BODIES: usize = crate::command_ring::MAX_CAPACITY as usize;
+const MIN_MAX_CONTACTS: usize = 16384;
+// An aligned box lattice has about 12 contact points per body (3 face pairs of 4 points); the vector grows lazily, so the cap only bounds memory.
+const CONTACTS_PER_BODY: usize = 16;
+
+/// Power of two so the hash can be masked; at least two buckets per body keeps chains short.
+fn bucket_count_for(capacity: usize) -> usize {
+    (capacity.min(MAX_BODIES) * 2).next_power_of_two().max(MIN_BUCKETS)
+}
+
+fn max_contacts_for(capacity: usize) -> usize {
+    (capacity.min(MAX_BODIES) * CONTACTS_PER_BODY).max(MIN_MAX_CONTACTS)
+}
 const MIN_CELL_SIZE: f32 = 2.0;
 const SOLVER_ITERS: u32   = 12;
 const BIAS_FACTOR:  f32   = 0.2;
@@ -65,6 +76,7 @@ pub struct PhysicsWorld {
     pub cell_size: f32,
     pub narrow_calls: u32,
     pub dropped_contacts: u32,
+    max_contacts: usize,
     max_dynamic_diameter: f32,
 }
 
@@ -158,7 +170,7 @@ impl PhysicsWorld {
             shape: vec![SHAPE_BOX; capacity],
             active: vec![false; capacity], sleeping: vec![false; capacity],
             sleep_timer: vec![0.0; capacity],
-            cell_heads: vec![-1i32; BUCKET_COUNT],
+            cell_heads: vec![-1i32; bucket_count_for(capacity)],
             cell_next:  vec![-1i32; capacity],
             big_statics: Vec::new(),
             targets: Vec::new(),
@@ -171,15 +183,16 @@ impl PhysicsWorld {
             uf_parent: vec![0; capacity],
             island_ok: Vec::new(),
             island_of: vec![0; capacity],
-            contacts: Vec::with_capacity(MAX_CONTACTS),
+            contacts: Vec::with_capacity(MIN_MAX_CONTACTS),
             warm_cache: Vec::new(),
-            bucket_counts: vec![0u32; BUCKET_COUNT],
+            bucket_counts: vec![0u32; bucket_count_for(capacity)],
             capacity,
             gx: 0.0, gy: -9.81, gz: 0.0,
             dt: 1.0 / 60.0,
             cell_size: 2.0,
             narrow_calls: 0,
             dropped_contacts: 0,
+            max_contacts: max_contacts_for(capacity),
             max_dynamic_diameter: 0.0,
         }
     }
@@ -201,6 +214,10 @@ impl PhysicsWorld {
         }
         self.island_of.resize(new_capacity, 0);
         self.capacity = new_capacity;
+        self.max_contacts = max_contacts_for(new_capacity);
+        let buckets = bucket_count_for(new_capacity);
+        self.cell_heads.resize(buckets, -1);
+        self.bucket_counts.resize(buckets, 0);
     }
 
     /// Hulls are immutable once registered; returns false for an out-of-range or already used id.
@@ -437,11 +454,15 @@ impl PhysicsWorld {
         self.warm_cache.sort_unstable_by_key(|e| (e.a, e.b, e.k));
     }
 
+    fn bucket_mask(&self) -> usize {
+        self.cell_heads.len() - 1
+    }
+
     fn cell_hash(&self, x: f32, y: f32, z: f32) -> usize {
         let ix = (x / self.cell_size).floor() as i32;
         let iy = (y / self.cell_size).floor() as i32;
         let iz = (z / self.cell_size).floor() as i32;
-        hash3(ix, iy, iz) & BUCKET_MASK
+        hash3(ix, iy, iz) & self.bucket_mask()
     }
 
     fn generate_contacts(&mut self) {
@@ -657,7 +678,7 @@ impl PhysicsWorld {
         let pb = [self.pos_x[j], self.pos_y[j], self.pos_z[j]];
         let mu = (self.friction[i] * self.friction[j]).sqrt();
         for (k, (pt, depth)) in m.points().iter().enumerate() {
-            if self.contacts.len() >= MAX_CONTACTS {
+            if self.contacts.len() >= self.max_contacts {
                 self.dropped_contacts = self.dropped_contacts.saturating_add(1);
                 continue;
             }
@@ -680,12 +701,13 @@ impl PhysicsWorld {
         let ix = (x / self.cell_size).floor() as i32;
         let iy = (y / self.cell_size).floor() as i32;
         let iz = (z / self.cell_size).floor() as i32;
+        let mask = self.bucket_mask();
         let mut cells = [0usize; 27];
         let mut n = 0;
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
-                    let h = hash3(ix.wrapping_add(dx), iy.wrapping_add(dy), iz.wrapping_add(dz)) & BUCKET_MASK;
+                    let h = hash3(ix.wrapping_add(dx), iy.wrapping_add(dy), iz.wrapping_add(dz)) & mask;
                     if !cells[..n].contains(&h) {
                         cells[n] = h;
                         n += 1;
@@ -1523,10 +1545,50 @@ mod tests {
         let mut w = zero_g(2);
         w.spawn(0, &BodyDesc::box_at([0.0; 3], [0.5; 3], 1.0, 0.0));
         w.spawn(1, &BodyDesc::box_at([0.0, 0.9, 0.0], [0.5; 3], 1.0, 0.0));
-        w.contacts.resize(MAX_CONTACTS, w_dummy_contact());
+        let cap = w.max_contacts;
+        w.contacts.resize(cap, w_dummy_contact());
         w.try_contact(0, 1);
         assert!(w.dropped_contacts >= 1, "dropped {}", w.dropped_contacts);
-        assert_eq!(w.contacts.len(), MAX_CONTACTS);
+        assert_eq!(w.contacts.len(), cap);
+    }
+
+    #[test]
+    fn bucket_count_and_contact_cap_scale_with_capacity() {
+        assert_eq!(bucket_count_for(0), MIN_BUCKETS);
+        assert_eq!(bucket_count_for(1000), MIN_BUCKETS);
+        assert_eq!(bucket_count_for(2048), 4096);
+        assert_eq!(bucket_count_for(2049), 8192);
+        assert_eq!(bucket_count_for(10_000), 32_768);
+        assert_eq!(bucket_count_for(usize::MAX), 2 * MAX_BODIES);
+        assert_eq!(max_contacts_for(100), MIN_MAX_CONTACTS);
+        assert_eq!(max_contacts_for(10_000), 160_000);
+        assert_eq!(max_contacts_for(usize::MAX), MAX_BODIES * CONTACTS_PER_BODY);
+    }
+
+    #[test]
+    fn resize_grows_buckets_and_the_contact_cap_together() {
+        let mut w = PhysicsWorld::new(10);
+        assert_eq!((w.bucket_counts.len(), w.cell_heads.len(), w.max_contacts), (4096, 4096, MIN_MAX_CONTACTS));
+        w.resize(10_000);
+        assert_eq!((w.bucket_counts.len(), w.cell_heads.len(), w.max_contacts), (32_768, 32_768, 160_000));
+        assert_eq!(w.bucket_mask(), 32_767);
+        w.resize(100);
+        assert_eq!(w.bucket_counts.len(), 32_768, "shrinking is ignored");
+    }
+
+    #[test]
+    fn a_pile_larger_than_the_old_fixed_cap_drops_no_contacts() {
+        let n = 6000usize;
+        let mut w = zero_g(n + 1);
+        w.spawn(0, &BodyDesc::box_at([0.0, -0.5, 0.0], [60.0, 0.5, 60.0], 0.0, 0.0));
+        let side = 20usize;
+        for i in 0..n {
+            let (x, z, y) = ((i % side) as f32 * 0.99, ((i / side) % side) as f32 * 0.99, (i / (side * side)) as f32 * 0.99 + 0.5);
+            w.spawn(i + 1, &BodyDesc::sphere_at([x, y, z], 0.5, 1.0, 0.0));
+        }
+        w.step();
+        assert!(w.contacts.len() > 16384, "scene must exceed the old cap: {}", w.contacts.len());
+        assert_eq!(w.dropped_contacts, 0);
     }
 
     fn w_dummy_contact() -> Contact {

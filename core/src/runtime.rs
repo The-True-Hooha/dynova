@@ -198,8 +198,10 @@ impl Runtime {
         self.transforms.publish(&self.header[H_STATE]);
         self.header[H_STALE].store(self.ring.stale_dropped(), Ordering::Release);
         self.header[H_MALFORMED].store(self.ring.malformed_dropped(), Ordering::Release);
-        for (dst, src) in self.bucket_view.iter().zip(&self.physics.bucket_counts) {
-            dst.store(*src, Ordering::Relaxed);
+        if self.physics_enabled {
+            for (dst, src) in self.bucket_view.iter().zip(&self.physics.bucket_counts) {
+                dst.store(*src, Ordering::Relaxed);
+            }
         }
         self.header[H_RING_PENDING].store(self.ring.len(), Ordering::Release);
         self.header[H_DROPPED_CONTACTS].store(self.physics.dropped_contacts, Ordering::Release);
@@ -287,6 +289,9 @@ impl Runtime {
         self.generations.resize(capacity as usize, 0);
         self.live.resize(capacity as usize, false);
         self.physics.resize(capacity as usize);
+        if self.bucket_view.len() != self.physics.bucket_counts.len() {
+            self.bucket_view = (0..self.physics.bucket_counts.len()).map(|_| AtomicU32::new(0)).collect();
+        }
         self.publish_layout();
         self.header[H_EPOCH].fetch_add(1, Ordering::AcqRel);
         true
@@ -740,6 +745,29 @@ mod tests {
         let counts: Vec<u32> = rt.bucket_view.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         assert_eq!(counts.iter().sum::<u32>(), 3);
         assert_eq!(*counts.iter().max().unwrap(), 2);
+    }
+
+    #[test]
+    fn histogram_is_not_copied_while_physics_is_off() {
+        let mut rt = Runtime::new(8, 8);
+        rt.physics.bucket_counts[3] = 5;
+        rt.step();
+        assert!(rt.bucket_view.iter().all(|c| c.load(Ordering::Relaxed) == 0));
+    }
+
+    #[test]
+    fn growing_capacity_reallocates_and_republishes_the_histogram() {
+        let mut rt = Runtime::new(8, 8);
+        rt.enable_physics();
+        rt.ring.push(&Command::Grow { capacity: 10_000 });
+        rt.step();
+        assert_eq!(header(&rt, H_BUCKET_LEN), 32_768);
+        assert_eq!(header(&rt, H_BUCKETS), rt.bucket_view.as_ptr() as u32);
+        assert_eq!(rt.bucket_view.len(), rt.physics.bucket_counts.len());
+        rt.spawn_box(9_000, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
+        rt.step();
+        let total: u32 = rt.bucket_view.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        assert_eq!(total, 1);
     }
 
     #[test]
