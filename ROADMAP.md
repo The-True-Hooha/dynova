@@ -109,7 +109,7 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 
 ## Phase 4 — Tooling
 
-### Stage 4A — Inspector read-only
+### Stage 4A — Inspector read-only (done; see `docs/inspector.md`)
 - Entity list, transform/velocity readout, contact points, sleep state — all read from the same shared buffers the renderer uses, zero extra IPC
 - Profiler: FPS, frame time, swap rate, command queue depth, memory usage
 - **Exit:** inspector runs as a separate panel reading the same SAB the game does, live, no perf hit on the sim (verify: sim FPS unchanged with inspector open vs closed).
