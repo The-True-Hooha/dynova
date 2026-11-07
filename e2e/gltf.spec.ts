@@ -214,3 +214,44 @@ test('a PNG on its own is rejected with a clear message', async ({ page }) => {
     expect(await page.locator('#msg').textContent()).toContain('no supported model file among: texture.png');
 });
 
+test('a Draco file that fails to parse while the decoder is still loading leaves no decoder worker running', async ({ page }) => {
+    await page.addInitScript(() => {
+        const counts = { created: 0, terminated: 0 };
+        (window as any).__workers = counts;
+        const Native = window.Worker;
+        window.Worker = class extends Native {
+            constructor(...args: ConstructorParameters<typeof Worker>) {
+                super(...args);
+                counts.created++;
+            }
+            terminate() {
+                counts.terminated++;
+                super.terminate();
+            }
+        };
+    });
+    await pick(page, [{ name: 'level-draco-broken.glb', buffer: fixtureBytes('level-draco-broken.glb') }]);
+    await page.waitForFunction(() => (window as any).__error !== undefined, null, { timeout: 30_000 });
+    await page.waitForTimeout(1500);
+    const w = await page.evaluate(() => (window as any).__workers);
+    expect(w.created).toBeGreaterThan(0);
+    expect(w.terminated).toBe(w.created);
+});
+
+test('a start that throws after the runtime exists frees the runtime and keeps the page usable', async ({ page }) => {
+    await page.goto('/gltf.html?paused=1');
+    await stats(page, 10);
+    await page.evaluate(() => { (window as any).__failStartForTest = true; });
+    await page.setInputFiles('#file', [{ name: 'again.glb', mimeType: 'model/gltf-binary', buffer: fixtureBytes('level-meshopt.glb') }]);
+    await page.waitForFunction(() => (window as any).__error !== undefined, null, { timeout: 30_000 });
+    expect(await page.locator('#msg').textContent()).toContain('forced start failure');
+    const during = await page.evaluate(() => ({ ...(window as any).__runtimes }));
+    expect(during.created - during.freed).toBe(0);
+
+    await page.evaluate(() => { (window as any).__failStartForTest = false; });
+    await page.setInputFiles('#file', [{ name: 'level-meshopt.glb', mimeType: 'model/gltf-binary', buffer: fixtureBytes('level-meshopt.glb') }]);
+    await page.waitForFunction(() => (window as any).__stats()?.label === 'level-meshopt.glb', null, { timeout: 30_000 });
+    const after = await page.evaluate(() => ({ ...(window as any).__runtimes }));
+    expect(after.created - after.freed).toBe(1);
+});
+

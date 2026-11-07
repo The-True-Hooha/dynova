@@ -48,7 +48,20 @@ let running: Running | null = null;
 let generation = 0;
 let request = 0;
 
+const runtimes = { created: 0, freed: 0 };
+(window as any).__runtimes = runtimes;
+
 function start(root: Object3D, label: string, levelScene: SceneColliders): void {
+    const cleanups: (() => void)[] = [];
+    try {
+        startWith(root, label, levelScene, cleanups);
+    } catch (err) {
+        for (const cleanup of cleanups.reverse()) cleanup();
+        throw err;
+    }
+}
+
+function startWith(root: Object3D, label: string, levelScene: SceneColliders, cleanups: (() => void)[]): void {
     running?.dispose();
     running = null;
     const token = ++generation;
@@ -65,8 +78,12 @@ function start(root: Object3D, label: string, levelScene: SceneColliders): void 
 
     const config = { capacity: levelScene.colliders.length + propScene.colliders.length + 4, ringCapacity: 512 };
     const runtime = new glue.Runtime(config.capacity, config.ringCapacity);
+    runtimes.created++;
+    cleanups.push(() => { runtime.free(); runtimes.freed++; });
     runtime.enable_physics();
     const world = World.attachSync(config, exports.memory, 'fallback', layoutFromRuntime(runtime), runtime);
+    cleanups.push(() => world.dispose());
+    if ((window as any).__failStartForTest) throw new Error('forced start failure');
     const view = new TransformView(exports.memory, runtime.header_ptr());
     const statics = spawnColliders(world, levelScene.colliders);
     const dynamics = spawnColliders(world, propScene.colliders, { body: () => ({ invMass: 1, restitution: 0.1 }) });
@@ -144,6 +161,7 @@ function start(root: Object3D, label: string, levelScene: SceneColliders): void 
             disposeObject(root);
             world.dispose();
             runtime.free();
+            runtimes.freed++;
         },
     };
 }

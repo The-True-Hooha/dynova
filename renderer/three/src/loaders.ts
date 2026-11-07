@@ -46,12 +46,33 @@ function describe(err: unknown, what: string): string {
     return message;
 }
 
-function gltfLoader(options: LoadOptions, manager?: LoadingManager): { loader: GLTFLoader; dispose(): void } {
+/** DRACOLoader.dispose() terminates only the workers that exist; a decode still waiting for its worker would spawn one afterwards and leak it. */
+class SettlingDracoLoader extends DRACOLoader {
+    private readonly pending = new Set<Promise<unknown>>();
+
+    // decodeGeometry is the shared path of every Draco decode but is missing from @types/three.
+    decodeGeometry(buffer: ArrayBuffer, taskConfig: object): Promise<unknown> {
+        const base = DRACOLoader.prototype as unknown as { decodeGeometry(buffer: ArrayBuffer, taskConfig: object): Promise<unknown> };
+        const decoding = base.decodeGeometry.call(this, buffer, taskConfig);
+        this.pending.add(decoding);
+        const done = () => this.pending.delete(decoding);
+        decoding.then(done, done);
+        return decoding;
+    }
+
+    async disposeWhenIdle(): Promise<void> {
+        await Promise.allSettled([...this.pending]);
+        this.dispose();
+    }
+}
+
+function gltfLoader(options: LoadOptions, manager?: LoadingManager): { loader: GLTFLoader; dispose(): Promise<void> } {
     const loader = new GLTFLoader(manager);
     loader.setMeshoptDecoder(MeshoptDecoder);
-    let draco: DRACOLoader | null = null;
+    let draco: SettlingDracoLoader | null = null;
     if (options.dracoDecoderPath) {
-        draco = new DRACOLoader(manager).setDecoderPath(options.dracoDecoderPath.endsWith('/') ? options.dracoDecoderPath : `${options.dracoDecoderPath}/`);
+        draco = new SettlingDracoLoader(manager);
+        draco.setDecoderPath(options.dracoDecoderPath.endsWith('/') ? options.dracoDecoderPath : `${options.dracoDecoderPath}/`);
         loader.setDRACOLoader(draco);
     }
     if (options.ktx2Loader) loader.setKTX2Loader(options.ktx2Loader);
@@ -68,7 +89,7 @@ function gltfLoader(options: LoadOptions, manager?: LoadingManager): { loader: G
             },
         }));
     }
-    return { loader, dispose: () => draco?.dispose() };
+    return { loader, dispose: async () => { await draco?.disposeWhenIdle(); } };
 }
 
 interface ResourceIndex {
@@ -137,7 +158,7 @@ async function parseGltfFiles(primary: ModelFile, files: ModelFile[], options: L
         return fail(describe(err, 'glTF or glb'));
     } finally {
         for (const url of created) URL.revokeObjectURL(url);
-        dispose();
+        await dispose();
     }
 }
 
@@ -193,7 +214,7 @@ export async function loadModelUrl(url: string, options: LoadOptions = {}): Prom
     } catch (err) {
         return fail(err instanceof Error ? describe(err, 'glTF or glb') : `could not load ${url}`);
     } finally {
-        dispose();
+        await dispose();
     }
 }
 
