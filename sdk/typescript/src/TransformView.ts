@@ -37,7 +37,13 @@ export class TransformView {
     get epoch(): number { return this._epoch; }
     get capacity(): number { return this._capacity; }
 
+    // Any wasm allocation can grow memory and detach every view onto the old buffer, not only an explicit Grow command.
+    private live(): void {
+        if (this.header.buffer !== this.memory.buffer) this.reacquire();
+    }
+
     stats(): { ringPending: number; droppedContacts: number; workerOverruns: number; contacts: number } {
+        this.live();
         return {
             ringPending: Atomics.load(this.header, H_RING_PENDING) >>> 0,
             droppedContacts: Atomics.load(this.header, H_DROPPED_CONTACTS) >>> 0,
@@ -48,6 +54,7 @@ export class TransformView {
 
     /** Copy of the occupancy histogram; the runtime frees and reallocates it when capacity grows, so a live view could go stale. */
     bucketCounts(): Uint32Array {
+        this.live();
         for (let spins = 0; ; spins++) {
             if (spins > MAX_SPINS) throw new Error('layout update stuck: the runtime never finished growing its buffers');
             const e = Atomics.load(this.header, H_EPOCH);
@@ -59,6 +66,7 @@ export class TransformView {
     }
 
     counters(): { ticks: number; staleDropped: number; malformedDropped: number } {
+        this.live();
         return {
             ticks: Atomics.load(this.header, H_TICKS) >>> 0,
             staleDropped: Atomics.load(this.header, H_STALE) >>> 0,
@@ -70,7 +78,10 @@ export class TransformView {
      * Epoch the writer has published; differs from `epoch` when buffers were reallocated. The epoch is a
      * seqlock: odd while the runtime rewrites the layout, even when stable. Growth number = epoch / 2.
      */
-    peekEpoch(): number { return Atomics.load(this.header, H_EPOCH); }
+    peekEpoch(): number {
+        this.live();
+        return Atomics.load(this.header, H_EPOCH);
+    }
 
     reacquire(): void {
         for (let spins = 0; ; spins++) {
@@ -106,6 +117,7 @@ export class TransformView {
      * Never returns a half-written frame to that consumer.
      */
     read(): Float32Array {
+        this.live();
         for (let spins = 0; ; spins++) {
             if (spins > MAX_SPINS) throw new Error('layout update stuck: the runtime never finished growing its buffers');
             const e = Atomics.load(this.header, H_EPOCH);

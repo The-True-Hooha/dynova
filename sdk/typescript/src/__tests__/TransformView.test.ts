@@ -2,12 +2,20 @@ import { describe, it, expect } from 'vitest';
 import { TransformView, H_EPOCH, H_STATE, H_TICKS, H_STALE, H_MALFORMED, H_BUCKETS, H_BUCKET_LEN, FLOATS_PER_TRANSFORM } from '../TransformView.js';
 import { FakeRuntime } from './helpers.js';
 
-function setup(capacity = 4) {
-    const memory = new WebAssembly.Memory({ initial: 8, maximum: 32, shared: true });
+function setup(capacity = 4, shared = true) {
+    const memory = new WebAssembly.Memory({ initial: 8, maximum: 32, shared });
     const rt = new FakeRuntime(memory, { capacity, ringCapacity: 4 });
     const view = new TransformView(memory, rt.layout.headerByteOffset);
     return { memory, rt, view };
 }
+
+const accessors: [string, (v: TransformView) => unknown][] = [
+    ['read', (v) => v.read().length],
+    ['stats', (v) => v.stats()],
+    ['counters', (v) => v.counters()],
+    ['peekEpoch', (v) => v.peekEpoch()],
+    ['bucketCounts', (v) => v.bucketCounts().length],
+];
 
 const t = (x: number) => [x, 0, 0, 0, 0, 0, 1];
 
@@ -194,4 +202,18 @@ describe('TransformView (triple buffer reader)', () => {
         Atomics.store(rt.header, H_EPOCH, 1);
         expect(() => view.bucketCounts()).toThrow('layout update stuck');
     });
+
+    it.each(accessors)('%s keeps working after memory growth detaches the old buffer', (_name, call) => {
+        for (const shared of [false, true]) {
+            const { memory, rt, view } = setup(4, shared);
+            rt.writeTransform(0, t(7));
+            rt.publish();
+            const before = memory.buffer;
+            memory.grow(1);
+            expect(memory.buffer).not.toBe(before);
+            expect(() => call(view)).not.toThrow();
+            expect(view.read()[0]).toBe(7);
+        }
+    });
 });
+

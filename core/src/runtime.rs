@@ -1,5 +1,5 @@
 use crate::collision::V3;
-use crate::command_ring::{Command, CommandRing};
+use crate::command_ring::{Command, CommandRing, MAX_CAPACITY};
 use crate::hull::{HullData, MAX_HULL_VERTS};
 use crate::physics::{BodyDesc, PhysicsWorld, SHAPE_HULL};
 use crate::transform_buffers::{Transform, TransformBuffers, INITIAL_STATE};
@@ -43,6 +43,8 @@ pub struct Runtime {
 impl Runtime {
     #[wasm_bindgen(constructor)]
     pub fn new(capacity: u32, ring_capacity: u32) -> Self {
+        // A Grow command is limited to MAX_CAPACITY, so the constructor must not allocate beyond it either.
+        let capacity = capacity.min(MAX_CAPACITY);
         let rt = Self {
             header: Box::new(std::array::from_fn(|_| AtomicU32::new(0))),
             transforms: TransformBuffers::new(capacity),
@@ -745,6 +747,14 @@ mod tests {
         let counts: Vec<u32> = rt.bucket_view.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         assert_eq!(counts.iter().sum::<u32>(), 3);
         assert_eq!(*counts.iter().max().unwrap(), 2);
+    }
+
+    #[test]
+    fn constructor_clamps_capacity_to_the_grow_limit() {
+        let rt = Runtime::new(u32::MAX, 8);
+        assert_eq!(header(&rt, H_CAPACITY), MAX_CAPACITY);
+        assert_eq!(rt.generations.len(), MAX_CAPACITY as usize);
+        assert_eq!(rt.physics.capacity, MAX_CAPACITY as usize);
     }
 
     #[test]
