@@ -1,7 +1,8 @@
-import { TransformView, World, layoutFromRuntime, SHAPE_SPHERE } from '@dynova/sdk';
+import { InspectorView, TransformView, World, layoutFromRuntime, SHAPE_SPHERE } from '@dynova/sdk';
 
 const params = new URLSearchParams(location.search);
 const N = Number(params.get('n') ?? 1000);
+const INSPECT = params.get('inspector') === '1';
 const ACTIVE_TICKS = 120;
 const LATE_TICKS = 240;
 const DROP_HEIGHT = 6;
@@ -59,6 +60,10 @@ async function run() {
     let drainTicks = 0;
     while (world.pendingCommands > 0 && drainTicks < 10_000) { world.step(); drainTicks++; }
 
+    const inspector = new InspectorView(exports.memory, rt.header_ptr());
+    const snapshotMs: number[] = [];
+    let snapshotsOk = 0;
+    let lastSnapshotContacts = 0;
     let peakContacts = 0;
     const timed = (ticks: number) => {
         const samples = new Float64Array(ticks);
@@ -67,9 +72,22 @@ async function run() {
             world.step();
             samples[t] = performance.now() - t0;
             peakContacts = Math.max(peakContacts, world.runtimeStats.contacts);
+            if (INSPECT && t % 15 === 0) {
+                const r0 = performance.now();
+                const snap = inspector.snapshot();
+                snapshotMs.push(performance.now() - r0);
+                if (snap) {
+                    snapshotsOk++;
+                    lastSnapshotContacts = snap.contactCount;
+                }
+            }
         }
         return samples;
     };
+    if (INSPECT) {
+        world.setInspector(true);
+        world.step();
+    }
     const active = timed(ACTIVE_TICKS);
     const sleepingAfterActive = rt.sleeping_count();
     const late = timed(LATE_TICKS);
@@ -83,6 +101,12 @@ async function run() {
         active: summarize(active),
         late: summarize(late),
         peakContacts,
+        inspector: INSPECT,
+        snapshotMs: snapshotMs.length === 0 ? null : snapshotMs.reduce((a, b) => a + b, 0) / snapshotMs.length,
+        snapshotsTaken: snapshotMs.length,
+        snapshotsOk,
+        lastSnapshotContacts,
+        snapshotMissed: inspector.missedReads,
         sleepingAfterActive,
         droppedContacts: stats.droppedContacts,
         malformedDropped: counters.malformedDropped,

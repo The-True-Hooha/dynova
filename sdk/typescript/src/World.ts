@@ -1,4 +1,4 @@
-import { TransformView } from './TransformView.js';
+import { HEADER_WORDS, TransformView } from './TransformView.js';
 import { CommandRing, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import type { MemoryMode } from './memory.js';
@@ -24,9 +24,15 @@ export interface RuntimePointers {
     ring_head_ptr(): number;
     ring_tail_ptr(): number;
     id_counter_ptr(): number;
+    /** Header size the wasm build was compiled with; compared with this package's `HEADER_WORDS`. */
+    header_words?(): number;
 }
 
 export function layoutFromRuntime(rt: RuntimePointers): WorldLayout {
+    const words = rt.header_words?.();
+    if (words !== undefined && words !== HEADER_WORDS) {
+        throw new Error(`wasm header has ${words} words but the SDK expects ${HEADER_WORDS}: rebuild the wasm package (make build)`);
+    }
     return {
         headerByteOffset: rt.header_ptr(),
         ringSlotsByteOffset: rt.ring_slots_ptr(),
@@ -63,6 +69,7 @@ type Queued =
     | { k: 'force'; d: ForceDesc }
     | { k: 'grow'; capacity: number }
     | { k: 'gravity'; v: [number, number, number] }
+    | { k: 'inspect'; on: boolean }
     | { k: 'hullVerts'; hull: number; coords: number[] }
     | { k: 'hullCommit'; hull: number; count: number };
 
@@ -189,7 +196,9 @@ export class World {
 
     step(): void {
         if (!this.driver) throw new Error('step() is only available in fallback mode; the worker steps the runtime');
+        const t0 = performance.now();
         this.driver.step();
+        this.transforms.recordStep((performance.now() - t0) * 1000);
         this.syncLayout();
         this.flush();
     }
@@ -201,6 +210,7 @@ export class World {
             case 'force': return this.ring.force(c.d);
             case 'grow': return this.ring.grow(c.capacity);
             case 'gravity': return this.ring.gravity(...c.v);
+            case 'inspect': return this.ring.inspect(c.on);
             case 'hullVerts': return this.ring.hullVerts(c.hull, c.coords);
             case 'hullCommit': return this.ring.hullCommit(c.hull, c.count);
         }
@@ -312,6 +322,15 @@ export class World {
         this.assertAlive();
         if (![x, y, z].every((v) => Number.isFinite(v) && Math.abs(v) <= 1000)) throw new RangeError('gravity must be finite and within +-1000');
         if (!this.enqueue({ k: 'gravity', v: [x, y, z] })) throw new Error('CommandRing full');
+    }
+
+    /**
+     * Turn the debug snapshot on or off through the command ring. While off the runtime copies nothing; read it with
+     * `InspectorView`. Safe to call repeatedly.
+     */
+    setInspector(on: boolean): void {
+        this.assertAlive();
+        if (!this.enqueue({ k: 'inspect', on })) throw new Error('CommandRing full');
     }
 
     /** Valid until the next call to `readTransforms()` (and, in fallback mode, the next `step()`). */

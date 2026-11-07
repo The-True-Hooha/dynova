@@ -1,5 +1,6 @@
 import init, { Runtime } from '../wasm/dynova_core.js';
 import { layoutFromRuntime } from './World.js';
+import { H_STEP_LAST_US, H_STEP_TOTAL_US, HEADER_WORDS } from './TransformView.js';
 import type { SimInit, SimMessage } from './launch.js';
 
 const post = (m: SimMessage) => (self as unknown as Worker).postMessage(m);
@@ -20,7 +21,7 @@ self.onmessage = async (e: MessageEvent<SimInit>) => {
         post({ type: 'ready', layout: layoutFromRuntime(runtime) });
 
         if (!autoRun) return;
-        const stats = new Int32Array(memory.buffer, runtime.header_ptr(), 16);
+        const stats = new Int32Array(memory.buffer, runtime.header_ptr(), HEADER_WORDS);
         const stepMs = 1000 / hz;
         let next = performance.now();
         const loop = () => {
@@ -28,7 +29,11 @@ self.onmessage = async (e: MessageEvent<SimInit>) => {
                 const now = performance.now();
                 let steps = 0;
                 while (next <= now && steps < 5) {
+                    const t0 = performance.now();
                     runtime.step();
+                    const us = Math.min(0x7fffffff, Math.round((performance.now() - t0) * 1000));
+                    Atomics.store(stats, H_STEP_LAST_US, us);
+                    Atomics.add(stats, H_STEP_TOTAL_US, us);
                     steps++;
                     next += stepMs;
                 }

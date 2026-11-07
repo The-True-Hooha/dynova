@@ -13,7 +13,15 @@ export const H_RING_PENDING = 12;
 export const H_DROPPED_CONTACTS = 13;
 export const H_OVERRUNS = 14;
 export const H_CONTACTS = 15;
-export const HEADER_WORDS = 16;
+export const H_INSPECT_SEQ = 16;
+export const H_INSPECT_BODIES = 17;
+export const H_INSPECT_CONTACTS = 18;
+export const H_INSPECT_CONTACT_N = 19;
+export const H_STEP_LAST_US = 20;
+export const H_STEP_TOTAL_US = 21;
+export const H_INSPECT_TICK = 22;
+export const H_INSPECT_ON = 23;
+export const HEADER_WORDS = 24;
 
 const MAX_SPINS = 5_000_000;
 const NEW_FLAG = 0b100;
@@ -40,6 +48,14 @@ export class TransformView {
     // Any wasm allocation can grow memory and detach every view onto the old buffer, not only an explicit Grow command.
     private live(): void {
         if (this.header.buffer !== this.memory.buffer) this.reacquire();
+    }
+
+    /** Called by whoever owns the clock and drives `step()`; the runtime itself cannot time anything on wasm. */
+    recordStep(micros: number): void {
+        this.live();
+        const us = Number.isFinite(micros) ? Math.max(0, Math.min(0x7fffffff, Math.round(micros))) : 0;
+        Atomics.store(this.header, H_STEP_LAST_US, us);
+        Atomics.add(this.header, H_STEP_TOTAL_US, us);
     }
 
     stats(): { ringPending: number; droppedContacts: number; workerOverruns: number; contacts: number } {
