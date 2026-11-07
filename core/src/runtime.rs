@@ -1,6 +1,7 @@
 use crate::collision::V3;
 use crate::command_ring::{Command, CommandRing, MAX_CAPACITY};
 use crate::hull::{HullData, MAX_HULL_VERTS};
+use crate::inspector::Inspector;
 use crate::physics::{BodyDesc, PhysicsWorld, SHAPE_HULL};
 use crate::transform_buffers::{Transform, TransformBuffers, INITIAL_STATE};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -22,7 +23,19 @@ const H_DROPPED_CONTACTS: usize = 13;
 #[cfg_attr(not(test), allow(dead_code))]
 const H_OVERRUNS: usize = 14;
 const H_CONTACTS: usize = 15;
-const HEADER_WORDS: usize = 16;
+// Inspector snapshot, written by the runtime only after an Inspect command.
+const H_INSPECT_SEQ: usize = 16;
+const H_INSPECT_BODIES: usize = 17;
+const H_INSPECT_CONTACTS: usize = 18;
+const H_INSPECT_CONTACT_N: usize = 19;
+const H_INSPECT_TICK: usize = 22;
+const H_INSPECT_ON: usize = 23;
+// Written by the JS step driver, which owns a clock (wasm has none): microseconds of the last step and a wrapping total.
+#[allow(dead_code)]
+const H_STEP_LAST_US: usize = 20;
+#[allow(dead_code)]
+const H_STEP_TOTAL_US: usize = 21;
+pub const HEADER_WORDS: usize = 24;
 
 #[wasm_bindgen]
 pub struct Runtime {
@@ -37,6 +50,8 @@ pub struct Runtime {
     commands: Vec<Command>,
     physics: PhysicsWorld,
     physics_enabled: bool,
+    inspector: Option<Inspector>,
+    inspecting: bool,
 }
 
 #[wasm_bindgen]
@@ -57,6 +72,8 @@ impl Runtime {
             commands: Vec::new(),
             physics: PhysicsWorld::new(capacity as usize),
             physics_enabled: false,
+            inspector: None,
+            inspecting: false,
         };
         let mut rt = rt;
         rt.bucket_view = (0..rt.physics.bucket_counts.len()).map(|_| AtomicU32::new(0)).collect();
@@ -65,9 +82,14 @@ impl Runtime {
         rt
     }
 
-    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts].
+    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts, inspector seq, bodies ptr, contacts ptr, contact count, step last us and step total us (written by the JS step driver), inspector tick, inspector on].
     pub fn header_ptr(&self) -> *const u32 {
         self.header.as_ptr() as *const u32
+    }
+
+    /// Number of header words; JS compares it with its own constant so a stale wasm build fails loudly.
+    pub fn header_words(&self) -> u32 {
+        HEADER_WORDS as u32
     }
 
     pub fn transforms_capacity(&self) -> u32 {
@@ -139,6 +161,10 @@ impl Runtime {
                 }
                 _ => {}
             }
+            if let Command::Inspect { on } = cmd {
+                self.set_inspecting(on);
+                continue;
+            }
             if let Command::Gravity { x, y, z } = cmd {
                 self.physics.gx = x;
                 self.physics.gy = y;
@@ -151,7 +177,7 @@ impl Runtime {
                 continue;
             }
             match cmd {
-                Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } => {}
+                Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } => {}
                 Command::Spawn { body, .. } => {
                     if self.live[id as usize] || (body.shape == SHAPE_HULL && self.physics.hull(body.hull).is_none()) {
                         self.ring.note_malformed();
@@ -195,6 +221,11 @@ impl Runtime {
                     },
                 );
             }
+        }
+
+        if let (true, true, Some(inspector)) = (self.inspecting, self.physics_enabled, self.inspector.as_mut()) {
+            let tick = self.header[H_TICKS].load(Ordering::Acquire).wrapping_add(1);
+            inspector.write(&self.header[H_INSPECT_SEQ], &self.header[H_INSPECT_CONTACT_N], &self.header[H_INSPECT_TICK], tick, &self.physics);
         }
 
         self.transforms.publish(&self.header[H_STATE]);
@@ -279,6 +310,22 @@ impl Runtime {
         h[H_GENERATIONS].store(self.generations.as_ptr() as u32, Ordering::Release);
         h[H_BUCKETS].store(self.bucket_view.as_ptr() as u32, Ordering::Release);
         h[H_BUCKET_LEN].store(self.bucket_view.len() as u32, Ordering::Release);
+        let (bodies, contacts) = self.inspector.as_ref().map_or((0, 0), |i| (i.bodies.as_ptr() as u32, i.contacts.as_ptr() as u32));
+        h[H_INSPECT_BODIES].store(bodies, Ordering::Release);
+        h[H_INSPECT_CONTACTS].store(contacts, Ordering::Release);
+    }
+
+    /// The first Inspect(on) allocates the snapshot; later toggles only start and stop publishing, so a reader still
+    /// holding the pointers never sees freed memory.
+    fn set_inspecting(&mut self, on: bool) {
+        self.inspecting = on;
+        self.header[H_INSPECT_ON].store(on as u32, Ordering::Release);
+        if on && self.inspector.is_none() {
+            // No epoch bump: only inspector readers care, and they re-read the pointers around every copy. A bump
+            // would also count as a buffer growth.
+            self.inspector = Some(Inspector::new(self.transforms.capacity() as usize));
+            self.publish_layout();
+        }
     }
 
     fn grow_to(&mut self, capacity: u32) -> bool {
@@ -291,6 +338,12 @@ impl Runtime {
         self.generations.resize(capacity as usize, 0);
         self.live.resize(capacity as usize, false);
         self.physics.resize(capacity as usize);
+        if let Some(inspector) = self.inspector.as_mut() {
+            // Odd sequence while the rows move, so a reader holding the old pointer retries instead of accepting them.
+            self.header[H_INSPECT_SEQ].fetch_add(1, Ordering::AcqRel);
+            inspector.resize(capacity as usize);
+            self.header[H_INSPECT_SEQ].fetch_add(1, Ordering::AcqRel);
+        }
         if self.bucket_view.len() != self.physics.bucket_counts.len() {
             self.bucket_view = (0..self.physics.bucket_counts.len()).map(|_| AtomicU32::new(0)).collect();
         }
@@ -755,6 +808,159 @@ mod tests {
         assert_eq!(header(&rt, H_CAPACITY), MAX_CAPACITY);
         assert_eq!(rt.generations.len(), MAX_CAPACITY as usize);
         assert_eq!(rt.physics.capacity, MAX_CAPACITY as usize);
+    }
+
+    fn inspector_rows(rt: &Runtime) -> Vec<[f32; 6]> {
+        let ins = rt.inspector.as_ref().expect("inspector allocated");
+        ins.bodies.chunks(14).map(|r| std::array::from_fn(|k| f32::from_bits(r[7 + k].load(Ordering::Relaxed)))).collect()
+    }
+
+    fn inspector_states(rt: &Runtime) -> Vec<u32> {
+        rt.inspector.as_ref().unwrap().bodies.chunks(14).map(|r| r[13].load(Ordering::Relaxed)).collect()
+    }
+
+    #[test]
+    fn nothing_is_published_until_an_inspect_command_turns_the_inspector_on() {
+        let mut rt = Runtime::new(4, 8);
+        rt.enable_physics();
+        rt.spawn_box(0, 0.0, 5.0, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
+        for _ in 0..3 { rt.step(); }
+        assert!(rt.inspector.is_none());
+        assert_eq!((header(&rt, H_INSPECT_BODIES), header(&rt, H_INSPECT_CONTACTS), header(&rt, H_INSPECT_SEQ)), (0, 0, 0));
+    }
+
+    #[test]
+    fn inspector_publishes_velocity_state_contacts_and_a_tick_stamp() {
+        let mut rt = Runtime::new(4, 8);
+        rt.enable_physics();
+        rt.spawn_box(0, 0.0, -0.5, 0.0, 20.0, 0.5, 20.0, 0.0, 0.0);
+        rt.spawn_box(1, 3.0, 0.48, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
+        rt.spawn_sphere(2, 0.0, 30.0, 0.0, 0.5, 1.0, 0.0);
+        rt.ring.push(&Command::Inspect { on: true });
+        rt.step();
+        assert_ne!(header(&rt, H_INSPECT_BODIES), 0);
+        assert_eq!(header(&rt, H_INSPECT_SEQ) % 2, 0);
+        assert_ne!(header(&rt, H_INSPECT_SEQ), 0);
+        assert_eq!(header(&rt, H_INSPECT_TICK), header(&rt, H_TICKS));
+        assert_eq!(inspector_states(&rt), vec![3, 1, 1, 0]);
+        let rows = inspector_rows(&rt);
+        assert!(rows[2][1] < 0.0, "falling sphere has downward velocity: {:?}", rows[2]);
+        assert_eq!(rows[0], [0.0; 6], "a static body does not move");
+        assert_eq!(rows[3], [0.0; 6], "an unused slot is zero");
+        let ins = rt.inspector.as_ref().unwrap();
+        let pos = |id: usize| -> [f32; 3] { std::array::from_fn(|k| f32::from_bits(ins.bodies[id * 14 + k].load(Ordering::Relaxed))) };
+        assert!((pos(1)[0] - 3.0).abs() < 1e-3);
+        assert!(pos(2)[1] < 30.0 && pos(2)[1] > 29.0, "sphere position follows the fall: {:?}", pos(2));
+        assert_eq!(f32::from_bits(ins.bodies[2 * 14 + 6].load(Ordering::Relaxed)), 1.0, "qw of an unrotated body");
+
+        let n = header(&rt, H_INSPECT_CONTACT_N) as usize;
+        assert!(n >= 1 && n == rt.physics.contacts.len());
+        let c = &rt.inspector.as_ref().unwrap().contacts;
+        let row: Vec<u32> = c[..9].iter().map(|v| v.load(Ordering::Relaxed)).collect();
+        let (a, b) = (row[7], row[8]);
+        assert!(a == 1 && b == 0 || a == 0 && b == 1, "contact is between the box and the floor: {a} {b}");
+        let (x, y) = (f32::from_bits(row[0]), f32::from_bits(row[1]));
+        assert!(y > -0.1 && y < 0.1, "contact point lies on the floor surface: y={y}");
+        assert!((x - 3.0).abs() < 0.6, "contact point lies under the box: x={x}");
+        let depth = f32::from_bits(row[6]);
+        assert!(depth > 0.0 && depth < 0.1, "depth {depth}");
+        let ny = f32::from_bits(row[4]);
+        assert!(if a == 1 { ny > 0.9 } else { ny < -0.9 }, "normal points from b to a: a={a} ny={ny}");
+    }
+
+    #[test]
+    fn inspector_reports_sleeping_bodies_and_stops_publishing_when_switched_off() {
+        let mut rt = Runtime::new(4, 8);
+        rt.enable_physics();
+        rt.spawn_box(0, 0.0, -0.5, 0.0, 20.0, 0.5, 20.0, 0.0, 0.0);
+        rt.spawn_box(1, 0.0, 0.5, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
+        rt.ring.push(&Command::Inspect { on: true });
+        for _ in 0..120 { rt.step(); }
+        assert_eq!(inspector_states(&rt)[1], 2, "resting box sleeps");
+
+        let seq = header(&rt, H_INSPECT_SEQ);
+        let ptr = header(&rt, H_INSPECT_BODIES);
+        rt.ring.push(&Command::Inspect { on: false });
+        for _ in 0..3 { rt.step(); }
+        assert_eq!(header(&rt, H_INSPECT_SEQ), seq, "no writes while off");
+        assert_eq!(header(&rt, H_INSPECT_BODIES), ptr, "memory stays allocated so a reader never sees freed rows");
+        assert!(header(&rt, H_INSPECT_TICK) < header(&rt, H_TICKS), "tick stamp shows the snapshot is stale");
+
+        rt.ring.push(&Command::Inspect { on: true });
+        rt.step();
+        assert_eq!(header(&rt, H_INSPECT_TICK), header(&rt, H_TICKS));
+        assert_eq!(header(&rt, H_INSPECT_BODIES), ptr, "turning it on again does not reallocate");
+    }
+
+    #[test]
+    fn inspector_rows_survive_a_grow_and_new_slots_read_as_unused() {
+        let mut rt = Runtime::new(2, 8);
+        rt.enable_physics();
+        rt.ring.push(&Command::Inspect { on: true });
+        rt.spawn_sphere(1, 0.0, 10.0, 0.0, 0.5, 1.0, 0.0);
+        rt.step();
+        let before = inspector_rows(&rt)[1];
+        assert!(before[1] < 0.0);
+        let seq_before = header(&rt, H_INSPECT_SEQ);
+        // Call the grow directly, not through a step, so the rows are inspected before the next frame is written.
+        rt.grow_to(6);
+        assert_eq!(header(&rt, H_INSPECT_SEQ), seq_before + 2, "the grow brackets the move with the sequence word");
+        assert_eq!(header(&rt, H_INSPECT_SEQ) % 2, 0);
+        assert_eq!(rt.inspector.as_ref().unwrap().bodies.len(), 6 * 14);
+        assert_eq!(header(&rt, H_INSPECT_BODIES), rt.inspector.as_ref().unwrap().bodies.as_ptr() as u32);
+        assert_eq!(inspector_rows(&rt)[1], before, "the existing row is carried over");
+        assert_eq!(inspector_states(&rt)[1], 1);
+        assert_eq!(inspector_states(&rt)[5], 0);
+        assert_eq!(header(&rt, H_EPOCH), 2, "only the grow bumps the epoch, not allocating the inspector");
+    }
+
+    #[test]
+    fn contact_count_and_tick_are_written_inside_the_sequence_bracket() {
+        let mut w = crate::physics::PhysicsWorld::new(2);
+        w.spawn(0, &crate::physics::BodyDesc::box_at([0.0; 3], [0.5; 3], 1.0, 0.0));
+        w.spawn(1, &crate::physics::BodyDesc::box_at([0.0, 0.9, 0.0], [0.5; 3], 1.0, 0.0));
+        w.step();
+        let mut ins = Inspector::new(2);
+        let (seq, count, tick) = (AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0));
+        ins.write(&seq, &count, &tick, 9, &w);
+        assert_eq!(seq.load(Ordering::Relaxed), 2);
+        assert_eq!(tick.load(Ordering::Relaxed), 9);
+        assert!(count.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn inspect_on_flag_follows_the_command_and_header_size_is_exported() {
+        let mut rt = Runtime::new(2, 8);
+        assert_eq!(header(&rt, H_INSPECT_ON), 0);
+        rt.ring.push(&Command::Inspect { on: true });
+        rt.step();
+        assert_eq!(header(&rt, H_INSPECT_ON), 1);
+        rt.ring.push(&Command::Inspect { on: false });
+        rt.step();
+        assert_eq!(header(&rt, H_INSPECT_ON), 0);
+        assert_eq!(rt.header_words() as usize, HEADER_WORDS);
+    }
+
+    #[test]
+    fn inspector_contact_rows_are_capped_and_the_full_count_stays_in_the_contact_header() {
+        let mut w = crate::physics::PhysicsWorld::new(2);
+        w.spawn(0, &crate::physics::BodyDesc::box_at([0.0; 3], [0.5; 3], 1.0, 0.0));
+        w.spawn(1, &crate::physics::BodyDesc::box_at([0.0, 0.9, 0.0], [0.5; 3], 1.0, 0.0));
+        w.step();
+        let mut one = w.contacts[0];
+        one.rax = 2.0;
+        one.ray = 0.25;
+        w.contacts = vec![one; crate::inspector::MAX_INSPECT_CONTACTS + 50];
+        let mut ins = Inspector::new(2);
+        let seq = AtomicU32::new(0);
+        let (count, tick) = (AtomicU32::new(0), AtomicU32::new(0));
+        ins.write(&seq, &count, &tick, 77, &w);
+        assert_eq!((count.load(Ordering::Relaxed), tick.load(Ordering::Relaxed)), (crate::inspector::MAX_INSPECT_CONTACTS as u32, 77));
+        assert_eq!(ins.contact_count as usize, crate::inspector::MAX_INSPECT_CONTACTS);
+        assert_eq!(seq.load(Ordering::Relaxed), 2);
+        let first = |k: usize| f32::from_bits(ins.contacts[k].load(Ordering::Relaxed));
+        let a = one.a as usize;
+        assert_eq!((first(0), first(1)), (w.pos_x[a] + 2.0, w.pos_y[a] + 0.25), "world point is body a position plus the arm");
     }
 
     #[test]

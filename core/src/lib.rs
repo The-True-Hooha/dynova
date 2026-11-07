@@ -9,6 +9,7 @@ pub use command_ring::CommandRing;
 pub mod collision;
 pub mod hull;
 pub mod physics;
+pub mod inspector;
 
 pub mod runtime;
 pub use runtime::Runtime;

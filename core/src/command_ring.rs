@@ -12,6 +12,7 @@ pub const TAG_GROW: u8    = 3;
 pub const TAG_GRAVITY: u8 = 4;
 pub const TAG_HULL_VERTS: u8 = 5;
 pub const TAG_HULL_COMMIT: u8 = 6;
+pub const TAG_INSPECT: u8 = 7;
 pub const HULL_VERTS_PER_SLOT: usize = 4;
 /// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
 pub const MAX_CAPACITY: u32 = 1 << 18;
@@ -42,6 +43,7 @@ pub enum Command {
     Gravity { x: f32, y: f32, z: f32 },
     HullVerts { hull: u32, count: u8, verts: [V3; HULL_VERTS_PER_SLOT] },
     HullCommit { hull: u32, count: u8 },
+    Inspect { on: bool },
 }
 
 impl Command {
@@ -50,7 +52,7 @@ impl Command {
             Command::Spawn   { id, generation, .. }
             | Command::Destroy { id, generation }
             | Command::Force   { id, generation, .. } => Some((*id, *generation)),
-            Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } => None,
+            Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } => None,
         }
     }
 }
@@ -192,6 +194,10 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             b[OFF_ID..OFF_ID + 4].copy_from_slice(&hull.to_le_bytes());
             b[OFF_GEN] = *count;
         }
+        Command::Inspect { on } => {
+            b[0] = TAG_INSPECT;
+            b[OFF_POS] = *on as u8;
+        }
         Command::Gravity { x, y, z } => {
             b[0] = TAG_GRAVITY;
             wr_f32x(b, OFF_POS, &[*x, *y, *z]);
@@ -245,6 +251,11 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
             Some(Command::HullVerts { hull: id, count, verts })
         }
         TAG_HULL_COMMIT => Some(Command::HullCommit { hull: id, count: b[OFF_GEN] }),
+        TAG_INSPECT => match b[OFF_POS] {
+            0 => Some(Command::Inspect { on: false }),
+            1 => Some(Command::Inspect { on: true }),
+            _ => None,
+        },
         TAG_GRAVITY => {
             let v: [f32; 3] = rd_f32x(b, OFF_POS);
             (all_finite(&v) && v.iter().all(|f| f.abs() <= MAX_GRAVITY)).then_some(Command::Gravity { x: v[0], y: v[1], z: v[2] })
@@ -537,6 +548,19 @@ mod tests {
         ring.drain_commands(8, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(ring.malformed_dropped(), 3);
+    }
+
+    #[test]
+    fn inspect_round_trips_and_rejects_values_other_than_0_and_1() {
+        let mut ring = CommandRing::new(8);
+        ring.push(&Command::Inspect { on: true });
+        ring.push(&Command::Inspect { on: false });
+        raw_slot(&mut ring, |b| { b[0] = TAG_INSPECT; b[OFF_POS] = 2; });
+        raw_slot(&mut ring, |b| { b[0] = TAG_INSPECT; b[OFF_POS] = 255; });
+        let mut out = Vec::new();
+        ring.drain_commands(8, &mut out);
+        assert_eq!(out, vec![Command::Inspect { on: true }, Command::Inspect { on: false }]);
+        assert_eq!(ring.malformed_dropped(), 2);
     }
 
     #[test]
