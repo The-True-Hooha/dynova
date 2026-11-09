@@ -2,6 +2,7 @@ use crate::collision::V3;
 use crate::command_ring::{Command, CommandRing, MAX_CAPACITY};
 use crate::hull::{HullData, MAX_HULL_VERTS};
 use crate::inspector::Inspector;
+use crate::recorder::Recorder;
 use crate::physics::{BodyDesc, Fnv, PhysicsSnapshot, PhysicsWorld, SHAPE_HULL};
 use crate::transform_buffers::{Transform, TransformBuffers, INITIAL_STATE};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -35,7 +36,14 @@ const H_INSPECT_ON: usize = 23;
 const H_STEP_LAST_US: usize = 20;
 #[allow(dead_code)]
 const H_STEP_TOTAL_US: usize = 21;
-pub const HEADER_WORDS: usize = 24;
+// Recording state, zero while not recording. The hash is the state hash at tick `ticks`, refreshed every step and seek.
+const H_REC_ON: usize = 24;
+const H_REC_START: usize = 25;
+const H_REC_END: usize = 26;
+const H_HASH_LO: usize = 27;
+const H_HASH_HI: usize = 28;
+const H_KEYFRAMES: usize = 29;
+pub const HEADER_WORDS: usize = 30;
 
 #[wasm_bindgen]
 pub struct Runtime {
@@ -52,6 +60,9 @@ pub struct Runtime {
     physics_enabled: bool,
     inspector: Option<Inspector>,
     inspecting: bool,
+    recorder: Option<Recorder>,
+    /// Tick the world is at, ahead of the published `ticks` word while a step is still running (a seek moves it mid-step).
+    head: u32,
 }
 
 #[wasm_bindgen]
@@ -74,6 +85,8 @@ impl Runtime {
             physics_enabled: false,
             inspector: None,
             inspecting: false,
+            recorder: None,
+            head: 0,
         };
         let mut rt = rt;
         rt.bucket_view = (0..rt.physics.bucket_counts.len()).map(|_| AtomicU32::new(0)).collect();
@@ -82,7 +95,7 @@ impl Runtime {
         rt
     }
 
-    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts, inspector seq, bodies ptr, contacts ptr, contact count, step last us and step total us (written by the JS step driver), inspector tick, inspector on].
+    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts, inspector seq, bodies ptr, contacts ptr, contact count, step last us and step total us (written by the JS step driver), inspector tick, inspector on, recording on, recorded start tick, recorded end tick, state hash low and high words, keyframe count].
     pub fn header_ptr(&self) -> *const u32 {
         self.header.as_ptr() as *const u32
     }
@@ -143,95 +156,61 @@ impl Runtime {
     pub fn step(&mut self) {
         let mut commands = std::mem::take(&mut self.commands);
         self.ring.drain_commands(4096, &mut commands);
+        let mut seeked: Option<u32> = None;
+        let mut seek_tried = false;
+        // Logged only after the whole batch: a seek discards the world those commands were applied to.
+        let mut to_log: Vec<(u32, Command)> = Vec::new();
         for cmd in commands.drain(..) {
-            if let Command::Grow { capacity } = cmd {
-                if !self.grow_to(capacity) {
-                    self.ring.note_malformed();
-                }
-                continue;
-            }
             match cmd {
-                Command::HullVerts { hull, count, verts } => {
-                    self.stage_hull_verts(hull, &verts[..count as usize]);
+                Command::Record { on } => {
+                    self.set_recording(on);
                     continue;
                 }
-                Command::HullCommit { hull, count } => {
-                    self.commit_hull(hull, count);
+                Command::Seek { tick } => {
+                    // One replay per step bounds the work a burst of Seek commands can demand.
+                    if seek_tried {
+                        self.ring.note_malformed();
+                    } else if self.seek(tick) {
+                        seek_tried = true;
+                        seeked = Some(tick);
+                        to_log.clear();
+                    } else {
+                        self.ring.note_malformed();
+                        // A rejected seek must not turn into a live step that overwrites the recorded future.
+                        if self.recorder.as_ref().is_some_and(|r| !r.is_armed()) {
+                            seeked = seeked.or(Some(self.head));
+                        }
+                    }
                     continue;
                 }
                 _ => {}
             }
-            if let Command::Inspect { on } = cmd {
-                self.set_inspecting(on);
-                continue;
+            let keep = self.recorder.is_some() && Recorder::loggable(&cmd);
+            let copy = keep.then(|| cmd.clone());
+            if let (true, Some(c)) = (self.apply_command(cmd, false), copy) {
+                to_log.push((self.head, c));
             }
-            if let Command::Gravity { x, y, z } = cmd {
-                self.physics.gx = x;
-                self.physics.gy = y;
-                self.physics.gz = z;
-                continue;
-            }
-            let Some((id, generation)) = cmd.target() else { continue };
-            if (id as usize) >= self.generations.len() || self.generations[id as usize] != generation {
-                self.ring.note_stale();
-                continue;
-            }
-            match cmd {
-                Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } => {}
-                Command::Spawn { body, .. } => {
-                    if self.live[id as usize] || (body.shape == SHAPE_HULL && self.physics.hull(body.hull).is_none()) {
-                        self.ring.note_malformed();
-                        continue;
-                    }
-                    self.live[id as usize] = true;
-                    self.transforms.write_transform(id, Transform { pos: body.pos, rot: body.rot });
-                    if self.physics_enabled {
-                        self.physics.spawn(id as usize, &body);
-                    }
-                }
-                Command::Destroy { .. } => {
-                    self.live[id as usize] = false;
-                    self.generations[id as usize] = generation.wrapping_add(1);
-                    self.transforms.write_transform(id, Transform::TOMBSTONE);
-                    if self.physics_enabled {
-                        self.physics.deactivate(id as usize);
-                    }
-                }
-                Command::Force { x, y, z, .. } => {
-                    if self.physics_enabled {
-                        self.physics.apply_impulse(id as usize, x, y, z);
-                    }
-                }
-                Command::Teleport { x, y, z, .. } => {
-                    if self.physics_enabled {
-                        self.physics.teleport(id as usize, [x, y, z]);
-                    }
-                }
-            }
+        }
+        for (tick, cmd) in &to_log {
+            self.log_live(*tick, cmd);
         }
         self.commands = commands;
 
-        if self.physics_enabled {
-            self.physics.step();
-            let p = &self.physics;
-            for i in 0..p.capacity {
-                if !p.active[i] {
-                    continue;
-                }
-                self.transforms.write_transform(
-                    i as u32,
-                    Transform {
-                        pos: [p.pos_x[i], p.pos_y[i], p.pos_z[i]],
-                        rot: [p.qx[i], p.qy[i], p.qz[i], p.qw[i]],
-                    },
-                );
+        let new_tick = match seeked {
+            Some(tick) => tick,
+            None => {
+                self.fork_if_rewound();
+                self.advance_physics();
+                self.head.wrapping_add(1)
             }
-        }
+        };
+        self.head = new_tick;
 
         if let (true, true, Some(inspector)) = (self.inspecting, self.physics_enabled, self.inspector.as_mut()) {
-            let tick = self.header[H_TICKS].load(Ordering::Acquire).wrapping_add(1);
-            inspector.write(&self.header[H_INSPECT_SEQ], &self.header[H_INSPECT_CONTACT_N], &self.header[H_INSPECT_TICK], tick, &self.physics);
+            inspector.write(&self.header[H_INSPECT_SEQ], &self.header[H_INSPECT_CONTACT_N], &self.header[H_INSPECT_TICK], new_tick, &self.physics);
         }
+
+        self.record_tick(new_tick, seeked.is_some());
 
         self.transforms.publish(&self.header[H_STATE]);
         self.header[H_STALE].store(self.ring.stale_dropped(), Ordering::Release);
@@ -244,7 +223,7 @@ impl Runtime {
         self.header[H_RING_PENDING].store(self.ring.len(), Ordering::Release);
         self.header[H_DROPPED_CONTACTS].store(self.physics.dropped_contacts, Ordering::Release);
         self.header[H_CONTACTS].store(self.physics.contacts.len() as u32, Ordering::Release);
-        self.header[H_TICKS].fetch_add(1, Ordering::AcqRel);
+        self.header[H_TICKS].store(new_tick, Ordering::Release);
     }
 }
 
@@ -257,12 +236,20 @@ pub struct RuntimeSnapshot {
 
 impl RuntimeSnapshot {
     pub fn hash(&self) -> u64 {
-        let mut h = Fnv::new();
-        h.word(self.physics.hash());
-        for g in &self.generations { h.word(*g as u64); }
-        for l in &self.live { h.word(*l as u64); }
-        h.finish()
+        runtime_hash(self.physics.hash(), &self.generations, &self.live)
     }
+
+    pub fn approx_bytes(&self) -> usize {
+        self.physics.approx_bytes() + self.generations.len() * 2
+    }
+}
+
+fn runtime_hash(physics: u64, generations: &[u8], live: &[bool]) -> u64 {
+    let mut h = Fnv::new();
+    h.word(physics);
+    for g in generations { h.word(*g as u64); }
+    for l in live { h.word(*l as u64); }
+    h.finish()
 }
 
 impl Runtime {
@@ -300,7 +287,7 @@ impl Runtime {
     }
 
     pub fn state_hash(&self) -> Option<u64> {
-        self.capture().map(|s| s.hash())
+        self.physics_enabled.then(|| runtime_hash(self.physics.state_hash(), &self.generations, &self.live))
     }
 }
 
@@ -360,6 +347,166 @@ impl Runtime {
     #[cfg(test)]
     fn transforms_write_for_test(&self) -> usize {
         self.transforms.write_index_for_test()
+    }
+
+    /// True when the command passed validation, so it is part of the history a replay must reproduce; a rejected
+    /// command is not, because what rejected it (hull table, capacity) is not part of a snapshot.
+    fn apply_command(&mut self, cmd: Command, replay: bool) -> bool {
+        // Replayed commands re-run through the same checks, but the ring's diagnostic counters already counted them once.
+        match cmd {
+            Command::Grow { capacity } => {
+                if !self.grow_to(capacity) && !replay {
+                    self.ring.note_malformed();
+                }
+                return false;
+            }
+            Command::HullVerts { hull, count, verts } => {
+                self.stage_hull_verts(hull, &verts[..count as usize]);
+                return false;
+            }
+            Command::HullCommit { hull, count } => {
+                self.commit_hull(hull, count);
+                return false;
+            }
+            Command::Inspect { on } => {
+                self.set_inspecting(on);
+                return false;
+            }
+            Command::Gravity { x, y, z } => {
+                self.physics.gx = x;
+                self.physics.gy = y;
+                self.physics.gz = z;
+                return true;
+            }
+            Command::Record { .. } | Command::Seek { .. } => return false,
+            _ => {}
+        }
+        let Some((id, generation)) = cmd.target() else { return false };
+        if (id as usize) >= self.generations.len() || self.generations[id as usize] != generation {
+            if !replay {
+                self.ring.note_stale();
+            }
+            return false;
+        }
+        match cmd {
+            Command::Spawn { body, .. } => {
+                if self.live[id as usize] || (body.shape == SHAPE_HULL && self.physics.hull(body.hull).is_none()) {
+                    if !replay {
+                        self.ring.note_malformed();
+                    }
+                    return false;
+                }
+                self.live[id as usize] = true;
+                self.transforms.write_transform(id, Transform { pos: body.pos, rot: body.rot });
+                if self.physics_enabled {
+                    self.physics.spawn(id as usize, &body);
+                }
+            }
+            Command::Destroy { .. } => {
+                self.live[id as usize] = false;
+                self.generations[id as usize] = generation.wrapping_add(1);
+                self.transforms.write_transform(id, Transform::TOMBSTONE);
+                if self.physics_enabled {
+                    self.physics.deactivate(id as usize);
+                }
+            }
+            Command::Force { x, y, z, .. } if self.physics_enabled => self.physics.apply_impulse(id as usize, x, y, z),
+            Command::Teleport { x, y, z, .. } if self.physics_enabled => self.physics.teleport(id as usize, [x, y, z]),
+            _ => {}
+        }
+        true
+    }
+
+    fn advance_physics(&mut self) {
+        if !self.physics_enabled {
+            return;
+        }
+        self.physics.step();
+        let p = &self.physics;
+        for i in 0..p.capacity {
+            if !p.active[i] {
+                continue;
+            }
+            self.transforms.write_transform(
+                i as u32,
+                Transform {
+                    pos: [p.pos_x[i], p.pos_y[i], p.pos_z[i]],
+                    rot: [p.qx[i], p.qy[i], p.qz[i], p.qw[i]],
+                },
+            );
+        }
+    }
+
+    fn set_recording(&mut self, on: bool) {
+        if !on {
+            self.recorder = None;
+        } else if !self.physics_enabled {
+            self.ring.note_malformed();
+        } else if self.recorder.is_none() {
+            self.recorder = Some(Recorder::new());
+        }
+    }
+
+    /// A live command after a seek replaces the recorded future from that tick on.
+    fn log_live(&mut self, tick: u32, cmd: &Command) {
+        let Some(rec) = self.recorder.as_mut().filter(|r| !r.is_armed()) else { return };
+        if rec.end() > tick {
+            rec.truncate_to(tick);
+        }
+        rec.push_command(tick, cmd);
+    }
+
+    fn fork_if_rewound(&mut self) {
+        let tick = self.head;
+        if let Some(rec) = self.recorder.as_mut().filter(|r| !r.is_armed() && r.end() > tick) {
+            rec.truncate_to(tick);
+        }
+    }
+
+    /// Restores the nearest keyframe and replays the log up to `target`. False, with the world untouched, when
+    /// nothing is recorded or `target` is outside the recorded range.
+    fn seek(&mut self, target: u32) -> bool {
+        let Some(rec) = self.recorder.take() else { return false };
+        let done = match rec.plan(target) {
+            Some((kf, cmds)) if self.restore(&kf.snapshot) => {
+                self.head = target;
+                let mut next = cmds.iter().peekable();
+                for t in kf.tick..target {
+                    while let Some((_, cmd)) = next.next_if(|(key, _)| *key == t) {
+                        self.apply_command(cmd.clone(), true);
+                    }
+                    self.advance_physics();
+                }
+                true
+            }
+            _ => false,
+        };
+        self.recorder = Some(rec);
+        done
+    }
+
+    fn record_tick(&mut self, tick: u32, seeked: bool) {
+        let Some(want) = self.recorder.as_ref().map(|r| !seeked && r.wants_keyframe(tick)) else {
+            for w in H_REC_ON..HEADER_WORDS {
+                self.header[w].store(0, Ordering::Release);
+            }
+            return;
+        };
+        let snapshot = if want { self.capture() } else { None };
+        let hash = self.state_hash().unwrap_or(0);
+        let Some(rec) = self.recorder.as_mut() else { return };
+        match snapshot {
+            Some(s) => rec.push_keyframe(tick, s),
+            None if !seeked => rec.advance_end(tick),
+            None => {}
+        }
+        let h = &self.header;
+        h[H_HASH_LO].store(hash as u32, Ordering::Release);
+        h[H_HASH_HI].store((hash >> 32) as u32, Ordering::Release);
+        h[H_REC_START].store(rec.start(), Ordering::Release);
+        h[H_REC_END].store(rec.end(), Ordering::Release);
+        h[H_KEYFRAMES].store(rec.keyframe_count() as u32, Ordering::Release);
+        h[H_REC_ON].store(1, Ordering::Release);
     }
 
     fn publish_layout(&self) {
@@ -1639,5 +1786,327 @@ mod tests {
         rt.ring.push(&Command::Teleport { id: 0, generation: 0, x: 9.0, y: 9.0, z: 9.0 });
         rt.step();
         assert_eq!(entity(&rt, 0)[..3], [1.0, 2.0, 3.0]);
+    }
+
+    fn hash_header(rt: &Runtime) -> u64 {
+        header(rt, H_HASH_LO) as u64 | (header(rt, H_HASH_HI) as u64) << 32
+    }
+
+    struct Take {
+        hash: u64,
+        frame: Vec<u32>,
+    }
+
+    fn take(rt: &Runtime) -> Take {
+        Take { hash: hash_header(rt), frame: frame_bits(rt) }
+    }
+
+    /// Commands issued before the step that produces tick `t + 1`.
+    fn script(rt: &mut Runtime, t: u32) {
+        let f = |id, y| Command::Force { id, generation: 0, x: 0.0, y, z: 0.0 };
+        match t {
+            0 => {
+                rt.ring.push(&Command::Record { on: true });
+                rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.1)));
+                for i in 1..5u32 {
+                    rt.ring.push(&spawn_cmd(i, 0, unit_box(0.1 * i as f32, 0.5 + 1.2 * (i - 1) as f32, 0.0)));
+                }
+                rt.ring.push(&spawn_cmd(5, 0, BodyDesc::sphere_at([3.0, 4.0, 0.2], 0.4, 1.0, 0.4)));
+                rt.ring.push(&spawn_cmd(6, 0, BodyDesc::capsule_at([-3.0, 2.0, 0.0], 0.3, 0.5, 1.0, 0.2)));
+                upload_hull(rt, 0, &cube(0.4));
+                rt.ring.push(&hull_spawn(7, 0, 3.0));
+            }
+            20 => { rt.ring.push(&f(2, 40.0)); }
+            35 => { rt.ring.push(&Command::Teleport { id: 3, generation: 0, x: 6.0, y: 3.0, z: 0.0 }); }
+            50 => { rt.ring.push(&Command::Force { id: 2, generation: 9, x: 0.0, y: 1.0, z: 0.0 }); }
+            60 => { rt.ring.push(&Command::Gravity { x: 0.0, y: -4.0, z: 0.0 }); }
+            80 => { rt.ring.push(&spawn_cmd(8, 0, unit_box(1.0, 6.0, 0.0))); }
+            100 => { rt.ring.push(&Command::Destroy { id: 4, generation: 0 }); }
+            110 => { rt.ring.push(&spawn_cmd(4, 1, unit_box(-1.0, 7.0, 0.0))); }
+            140 => { rt.ring.push(&f(8, 25.0)); }
+            _ => {}
+        }
+    }
+
+    const RUN: u32 = 240;
+
+    fn recorded_run() -> (Runtime, Vec<Take>) {
+        let mut rt = Runtime::new(16, 256);
+        rt.enable_physics();
+        let mut takes = vec![Take { hash: 0, frame: Vec::new() }];
+        for t in 0..RUN {
+            script(&mut rt, t);
+            rt.step();
+            takes.push(take(&rt));
+        }
+        (rt, takes)
+    }
+
+    fn seek_to(rt: &mut Runtime, tick: u32) {
+        rt.ring.push(&Command::Seek { tick });
+        rt.step();
+    }
+
+    #[test]
+    fn seeking_anywhere_in_the_recording_reproduces_the_live_hash_and_frame() {
+        let (mut rt, takes) = recorded_run();
+        assert_eq!((header(&rt, H_REC_ON), header(&rt, H_REC_START), header(&rt, H_REC_END)), (1, 1, RUN));
+        let (stale, malformed) = (rt.stale_dropped(), rt.malformed_dropped());
+        assert_eq!(stale, 1);
+        for t in [1, RUN, 100, 61, 60, 59, 239, 2, 120, 121, 180, 90, 90, 1, RUN] {
+            seek_to(&mut rt, t);
+            assert_eq!(header(&rt, H_TICKS), t, "tick after seeking to {t}");
+            assert_eq!(hash_header(&rt), takes[t as usize].hash, "hash at {t}");
+            assert_eq!(rt.state_hash(), Some(takes[t as usize].hash));
+            assert_eq!(frame_bits(&rt), takes[t as usize].frame, "published frame at {t}");
+            assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (stale, malformed), "replay re-counted diagnostics at {t}");
+            assert_eq!((header(&rt, H_REC_START), header(&rt, H_REC_END)), (1, RUN), "seeking keeps the recorded range");
+        }
+    }
+
+    #[test]
+    fn keyframes_are_taken_every_interval_and_the_hash_word_follows_every_step() {
+        let (rt, takes) = recorded_run();
+        assert_eq!(header(&rt, H_KEYFRAMES), 1 + RUN / 60, "ticks 1, 60, 120, 180, 240");
+        assert_eq!(hash_header(&rt), takes[RUN as usize].hash);
+        assert_ne!(takes[100].hash, takes[101].hash);
+    }
+
+    #[test]
+    fn a_seek_outside_the_range_is_rejected_leaves_the_world_and_does_not_advance() {
+        let (mut rt, takes) = recorded_run();
+        seek_to(&mut rt, 100);
+        let before = rt.malformed_dropped();
+        for bad in [0, RUN + 1, u32::MAX] {
+            seek_to(&mut rt, bad);
+            assert_eq!(header(&rt, H_TICKS), 100, "rejected seek to {bad} must not step the world");
+            assert_eq!(hash_header(&rt), takes[100].hash);
+            assert_eq!(header(&rt, H_REC_END), RUN, "the recorded future survives a rejected seek");
+        }
+        assert_eq!(rt.malformed_dropped(), before + 3);
+        seek_to(&mut rt, RUN);
+        assert_eq!(hash_header(&rt), takes[RUN as usize].hash);
+    }
+
+    #[test]
+    fn seek_without_recording_is_malformed_and_the_world_keeps_stepping() {
+        let mut rt = snapshot_scene();
+        let t = header(&rt, H_TICKS);
+        rt.ring.push(&Command::Seek { tick: 0 });
+        rt.step();
+        assert_eq!((rt.malformed_dropped(), header(&rt, H_TICKS)), (1, t + 1));
+        assert_eq!(header(&rt, H_REC_ON), 0);
+    }
+
+    #[test]
+    fn record_needs_physics_and_record_off_clears_the_published_state() {
+        let mut off = Runtime::new(4, 8);
+        off.ring.push(&Command::Record { on: true });
+        off.step();
+        assert_eq!((off.malformed_dropped(), header(&off, H_REC_ON)), (1, 0));
+
+        let (mut rt, _) = recorded_run();
+        rt.ring.push(&Command::Record { on: false });
+        rt.step();
+        for w in [H_REC_ON, H_REC_START, H_REC_END, H_HASH_LO, H_HASH_HI, H_KEYFRAMES] {
+            assert_eq!(header(&rt, w), 0, "header word {w}");
+        }
+        seek_to(&mut rt, 10);
+        assert_eq!(rt.malformed_dropped(), 1, "the seek after Record(off) is malformed");
+    }
+
+    #[test]
+    fn recording_again_restarts_the_range_at_the_current_tick() {
+        let (mut rt, _) = recorded_run();
+        rt.ring.push(&Command::Record { on: false });
+        rt.step();
+        rt.ring.push(&Command::Record { on: true });
+        rt.step();
+        assert_eq!((header(&rt, H_REC_START), header(&rt, H_REC_END), header(&rt, H_KEYFRAMES)), (RUN + 2, RUN + 2, 1));
+    }
+
+    #[test]
+    fn a_live_step_after_a_seek_forks_the_timeline() {
+        let (mut rt, takes) = recorded_run();
+        seek_to(&mut rt, 105);
+        rt.step();
+        assert_eq!((header(&rt, H_TICKS), header(&rt, H_REC_END)), (106, 106), "the old future is gone");
+        assert_eq!(hash_header(&rt), takes[106].hash, "no new command: the fork follows the same trajectory");
+        seek_to(&mut rt, 150);
+        assert_eq!(header(&rt, H_TICKS), 106, "tick 150 no longer exists");
+        rt.ring.push(&Command::Force { id: 2, generation: 0, x: 0.0, y: 90.0, z: 0.0 });
+        let mut fork = Vec::new();
+        for _ in 0..60 {
+            rt.step();
+            fork.push(take(&rt));
+        }
+        assert_eq!(header(&rt, H_REC_END), 166);
+        assert_ne!(fork[59].hash, takes[166].hash, "a new command changed the trajectory");
+        for t in [107u32, 110, 130, 166, 107] {
+            seek_to(&mut rt, t);
+            let live = &fork[(t - 107) as usize];
+            assert_eq!((hash_header(&rt), frame_bits(&rt)), (live.hash, live.frame.clone()), "forked tick {t}");
+        }
+    }
+
+    #[test]
+    fn a_command_in_the_same_batch_after_a_seek_forks_at_the_seek_target() {
+        let (mut rt, takes) = recorded_run();
+        rt.ring.push(&Command::Seek { tick: 100 });
+        rt.ring.push(&Command::Force { id: 2, generation: 0, x: 0.0, y: 60.0, z: 0.0 });
+        rt.step();
+        assert_eq!((header(&rt, H_TICKS), header(&rt, H_REC_END)), (100, 100));
+        assert_ne!(rt.state_hash(), Some(takes[100].hash), "the force landed on the seeked state");
+        rt.step();
+        let after = take(&rt);
+        seek_to(&mut rt, 101);
+        assert_eq!((hash_header(&rt), frame_bits(&rt)), (after.hash, after.frame));
+    }
+
+    #[test]
+    fn hull_uploads_inspect_and_grow_are_not_logged_and_do_not_break_replay() {
+        let mut rt = Runtime::new(16, 64);
+        rt.enable_physics();
+        rt.ring.push(&Command::Record { on: true });
+        rt.ring.push(&floor());
+        rt.step();
+        let mut takes = vec![take(&rt)];
+        let n0 = rt.recorder.as_ref().unwrap().log_len();
+        upload_hull(&mut rt, 0, &cube(0.4));
+        rt.ring.push(&Command::Inspect { on: true });
+        rt.ring.push(&Command::Grow { capacity: 32 });
+        rt.step();
+        takes.push(take(&rt));
+        assert_eq!(rt.recorder.as_ref().unwrap().log_len(), n0, "none of these are loggable");
+        rt.ring.push(&hull_spawn(1, 0, 2.0));
+        for _ in 0..30 { rt.step(); takes.push(take(&rt)); }
+        let malformed = rt.malformed_dropped();
+        for t in [2u32, 20, 5, 32, 1, 32] {
+            seek_to(&mut rt, t);
+            assert_ne!(hash_header(&rt), 0);
+            if t >= 2 {
+                assert_eq!(frame_bits(&rt)[..7 * 16], takes[(t - 1) as usize].frame[..7 * 16], "tick {t}");
+            }
+        }
+        assert_eq!(rt.malformed_dropped(), malformed, "replay must not re-run hull commits or growth");
+    }
+
+    #[test]
+    fn replay_after_growth_matches_the_live_slots_before_and_after_the_grow() {
+        let mut rt = snapshot_scene();
+        rt.ring.push(&Command::Record { on: true });
+        rt.step();
+        let mut takes: Vec<Vec<[f32; 7]>> = Vec::new();
+        let slots = |rt: &Runtime| -> Vec<[f32; 7]> {
+            [0usize, 1, 2, 3, 4, 5, 6, 7, 20].iter().map(|&i| if i < rt.transforms.capacity() as usize { entity(rt, i) } else { [0.0; 7] }).collect()
+        };
+        takes.push(slots(&rt));
+        for t in 1..=70u32 {
+            if t == 20 { rt.ring.push(&Command::Grow { capacity: 32 }); }
+            if t == 25 { rt.ring.push(&spawn_cmd(20, 0, unit_box(1.0, 9.0, 0.0))); }
+            rt.step();
+            takes.push(slots(&rt));
+        }
+        let base = header(&rt, H_REC_START) as usize;
+        for t in [30usize, 10, 70, 24, 26, 40] {
+            seek_to(&mut rt, (base + t) as u32);
+            assert_eq!(slots(&rt), takes[t], "slot rows at recorded offset {t}");
+        }
+    }
+
+    #[test]
+    fn the_inspector_tick_stamp_follows_a_seek() {
+        let (mut rt, _) = recorded_run();
+        rt.ring.push(&Command::Inspect { on: true });
+        rt.step();
+        seek_to(&mut rt, 77);
+        assert_eq!((header(&rt, H_INSPECT_TICK), header(&rt, H_INSPECT_SEQ) % 2), (77, 0));
+        assert_eq!(header(&rt, H_TICKS), 77);
+    }
+
+    #[test]
+    fn a_pending_hull_upload_survives_a_seek() {
+        let (mut rt, _) = recorded_run();
+        rt.ring.push(&Command::HullVerts { hull: 5, count: 4, verts: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] });
+        rt.step();
+        seek_to(&mut rt, 50);
+        rt.ring.push(&Command::HullCommit { hull: 5, count: 4 });
+        rt.step();
+        assert!(rt.physics.hull(5).is_some(), "chunks staged before the seek still commit");
+    }
+
+    #[test]
+    fn a_force_before_a_seek_in_the_same_batch_does_not_enter_the_log() {
+        let (mut rt, _) = recorded_run();
+        rt.ring.push(&Command::Force { id: 2, generation: 0, x: 0.0, y: 200.0, z: 0.0 });
+        rt.ring.push(&Command::Seek { tick: 100 });
+        rt.step();
+        seek_to(&mut rt, RUN);
+        rt.step();
+        let live = take(&rt);
+        assert_eq!(header(&rt, H_TICKS), RUN + 1);
+        seek_to(&mut rt, 1);
+        seek_to(&mut rt, RUN + 1);
+        assert_eq!((hash_header(&rt), frame_bits(&rt)), (live.hash, live.frame));
+    }
+
+    #[test]
+    fn a_hull_spawn_rejected_for_a_missing_hull_is_not_resurrected_by_a_replay_after_the_upload() {
+        let mut rt = Runtime::new(16, 64);
+        rt.enable_physics();
+        rt.ring.push(&Command::Record { on: true });
+        rt.ring.push(&floor());
+        rt.step();
+        rt.ring.push(&hull_spawn(1, 0, 2.0));
+        for _ in 0..5 { rt.step(); }
+        assert!(!rt.live[1]);
+        upload_hull(&mut rt, 0, &cube(0.4));
+        for _ in 0..5 { rt.step(); }
+        let end = header(&rt, H_TICKS);
+        let live = take(&rt);
+        seek_to(&mut rt, 1);
+        seek_to(&mut rt, end);
+        assert!(!rt.live[1], "the rejected spawn must stay rejected");
+        assert_eq!((hash_header(&rt), frame_bits(&rt)), (live.hash, live.frame));
+    }
+
+    #[test]
+    fn a_spawn_dropped_as_out_of_range_is_not_accepted_by_a_replay_after_the_world_grew() {
+        let mut rt = Runtime::new(4, 64);
+        rt.enable_physics();
+        rt.ring.push(&Command::Record { on: true });
+        rt.ring.push(&floor());
+        rt.step();
+        rt.ring.push(&spawn_cmd(6, 0, unit_box(0.0, 3.0, 0.0)));
+        rt.step();
+        rt.ring.push(&Command::Grow { capacity: 16 });
+        for _ in 0..5 { rt.step(); }
+        assert!(!rt.live[6]);
+        let end = header(&rt, H_TICKS);
+        let live = take(&rt);
+        seek_to(&mut rt, 1);
+        seek_to(&mut rt, end);
+        assert!(!rt.live[6] && !rt.physics.active[6]);
+        assert_eq!((hash_header(&rt), frame_bits(&rt)), (live.hash, live.frame));
+    }
+
+    #[test]
+    fn only_the_first_seek_in_a_batch_replays_and_the_rest_are_counted_malformed() {
+        let (mut rt, takes) = recorded_run();
+        for t in [50, 60, 70] { rt.ring.push(&Command::Seek { tick: t }); }
+        rt.step();
+        assert_eq!((header(&rt, H_TICKS), rt.malformed_dropped()), (50, 2));
+        assert_eq!(hash_header(&rt), takes[50].hash);
+    }
+
+    #[test]
+    fn record_and_a_seek_in_the_same_batch_still_start_the_recording_and_step() {
+        let mut rt = snapshot_scene();
+        let t = header(&rt, H_TICKS);
+        rt.ring.push(&Command::Record { on: true });
+        rt.ring.push(&Command::Seek { tick: 3 });
+        rt.step();
+        assert_eq!((header(&rt, H_TICKS), header(&rt, H_KEYFRAMES), rt.malformed_dropped()), (t + 1, 1, 1));
+        assert_eq!((header(&rt, H_REC_START), header(&rt, H_REC_END)), (t + 1, t + 1));
     }
 }

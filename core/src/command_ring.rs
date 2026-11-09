@@ -14,6 +14,8 @@ pub const TAG_HULL_VERTS: u8 = 5;
 pub const TAG_HULL_COMMIT: u8 = 6;
 pub const TAG_INSPECT: u8 = 7;
 pub const TAG_TELEPORT: u8 = 8;
+pub const TAG_RECORD: u8 = 9;
+pub const TAG_SEEK: u8 = 10;
 pub const HULL_VERTS_PER_SLOT: usize = 4;
 /// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
 pub const MAX_CAPACITY: u32 = 1 << 18;
@@ -46,6 +48,8 @@ pub enum Command {
     HullCommit { hull: u32, count: u8 },
     Inspect { on: bool },
     Teleport { id: u32, generation: u8, x: f32, y: f32, z: f32 },
+    Record { on: bool },
+    Seek { tick: u32 },
 }
 
 impl Command {
@@ -55,7 +59,7 @@ impl Command {
             | Command::Destroy { id, generation }
             | Command::Force   { id, generation, .. }
             | Command::Teleport { id, generation, .. } => Some((*id, *generation)),
-            Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } => None,
+            Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } | Command::Record { .. } | Command::Seek { .. } => None,
         }
     }
 }
@@ -213,6 +217,14 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             b[0] = TAG_FORCE;
             wr_f32x(b, OFF_POS, &[*x, *y, *z]);
         }
+        Command::Record { on } => {
+            b[0] = TAG_RECORD;
+            b[OFF_POS] = *on as u8;
+        }
+        Command::Seek { tick } => {
+            b[0] = TAG_SEEK;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&tick.to_le_bytes());
+        }
         Command::Teleport { x, y, z, .. } => {
             b[0] = TAG_TELEPORT;
             wr_f32x(b, OFF_POS, &[*x, *y, *z]);
@@ -276,6 +288,12 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
             if !all_finite(&v) || v.iter().any(|f| f.abs() > MAX_FORCE) { return None; }
             Some(Command::Force { id, generation, x: v[0], y: v[1], z: v[2] })
         }
+        TAG_RECORD => match b[OFF_POS] {
+            0 => Some(Command::Record { on: false }),
+            1 => Some(Command::Record { on: true }),
+            _ => None,
+        },
+        TAG_SEEK => Some(Command::Seek { tick: id }),
         TAG_TELEPORT => {
             let v: [f32; 3] = rd_f32x(b, OFF_POS);
             if !all_finite(&v) || v.iter().any(|f| f.abs() > MAX_COORD) { return None; }
@@ -587,6 +605,23 @@ mod tests {
         ring.drain_commands(8, &mut out);
         assert_eq!(out, vec![t]);
         assert_eq!(ring.malformed_dropped(), 3);
+    }
+
+    #[test]
+    fn record_and_seek_round_trip_and_record_rejects_values_other_than_0_and_1() {
+        let mut ring = CommandRing::new(8);
+        ring.push(&Command::Record { on: true });
+        ring.push(&Command::Record { on: false });
+        ring.push(&Command::Seek { tick: 0 });
+        ring.push(&Command::Seek { tick: u32::MAX });
+        raw_slot(&mut ring, |b| { b[0] = TAG_RECORD; b[OFF_POS] = 2; });
+        let mut out = Vec::new();
+        ring.drain_commands(8, &mut out);
+        assert_eq!(out, vec![
+            Command::Record { on: true }, Command::Record { on: false },
+            Command::Seek { tick: 0 }, Command::Seek { tick: u32::MAX },
+        ]);
+        assert_eq!(ring.malformed_dropped(), 1);
     }
 
     #[test]

@@ -21,7 +21,13 @@ export const H_STEP_LAST_US = 20;
 export const H_STEP_TOTAL_US = 21;
 export const H_INSPECT_TICK = 22;
 export const H_INSPECT_ON = 23;
-export const HEADER_WORDS = 24;
+export const H_REC_ON = 24;
+export const H_REC_START = 25;
+export const H_REC_END = 26;
+export const H_HASH_LO = 27;
+export const H_HASH_HI = 28;
+export const H_KEYFRAMES = 29;
+export const HEADER_WORDS = 30;
 
 const MAX_SPINS = 5_000_000;
 const NEW_FLAG = 0b100;

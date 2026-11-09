@@ -92,37 +92,70 @@ impl PhysicsSnapshot {
         self.capacity
     }
 
-    /// FNV-1a over the raw bit patterns, so two snapshots hash alike exactly when every stored value is bit-identical.
     pub fn hash(&self) -> u64 {
-        let mut h = Fnv::new();
-        h.word(self.capacity as u64);
-        for col in &self.f32_cols {
-            for v in col { h.word(v.to_bits() as u64); }
-        }
-        for v in self.hull_of.iter().chain(&self.island_of) { h.word(*v as u64); }
-        for v in &self.shape { h.word(*v as u64); }
-        for flag in &self.flags {
-            for v in flag { h.word(*v as u64); }
-        }
-        h.word(self.contacts.len() as u64);
-        for c in &self.contacts {
-            h.word(c.a as u64);
-            h.word(c.b as u64);
-            h.word(c.key as u64);
-            for v in [c.nx, c.ny, c.nz, c.depth, c.rax, c.ray, c.raz, c.rbx, c.rby, c.rbz, c.lambda, c.lt1, c.lt2, c.mu] {
-                h.word(v.to_bits() as u64);
-            }
-        }
-        h.word(self.warm_cache.len() as u64);
-        for e in &self.warm_cache {
-            h.word(e.a as u64);
-            h.word(e.b as u64);
-            h.word(e.k as u64);
-            for v in [e.lambda, e.lt1, e.lt2] { h.word(v.to_bits() as u64); }
-        }
-        for v in self.gravity { h.word(v.to_bits() as u64); }
-        h.finish()
+        let cols: Vec<&[f32]> = self.f32_cols.iter().map(|c| c.as_slice()).collect();
+        hash_state(self.capacity, &cols, &self.hull_of, &self.island_of, &self.shape,
+            [&self.flags[0], &self.flags[1], &self.flags[2], &self.flags[3]], &self.contacts, &self.warm_cache, self.gravity)
     }
+
+    /// Heap bytes held, so a keyframe store can bound its memory.
+    pub fn approx_bytes(&self) -> usize {
+        self.capacity * (F32_COLUMNS * 4 + 4 + 4 + 1 + 4)
+            + self.contacts.len() * std::mem::size_of::<Contact>()
+            + self.warm_cache.len() * std::mem::size_of::<WarmEntry>()
+    }
+}
+
+impl PhysicsWorld {
+    /// Same value as `capture().hash()` without copying the columns, so a recorder can publish it every tick.
+    pub fn state_hash(&self) -> u64 {
+        let cols: Vec<&[f32]> = self.f32_cols().iter().map(|c| c.as_slice()).collect();
+        hash_state(self.capacity, &cols, &self.hull_of, &self.island_of, &self.shape,
+            [&self.active, &self.sleeping, &self.touching, &self.penetrating], &self.contacts, &self.warm_cache, [self.gx, self.gy, self.gz])
+    }
+}
+
+/// FNV-1a over the raw bit patterns, so two states hash alike exactly when every stored value is bit-identical.
+#[allow(clippy::too_many_arguments)]
+fn hash_state(
+    capacity: usize,
+    f32_cols: &[&[f32]],
+    hull_of: &[u32],
+    island_of: &[u32],
+    shape: &[u8],
+    flags: [&[bool]; 4],
+    contacts: &[Contact],
+    warm_cache: &[WarmEntry],
+    gravity: [f32; 3],
+) -> u64 {
+    let mut h = Fnv::new();
+    h.word(capacity as u64);
+    for col in f32_cols {
+        for v in *col { h.word(v.to_bits() as u64); }
+    }
+    for v in hull_of.iter().chain(island_of) { h.word(*v as u64); }
+    for v in shape { h.word(*v as u64); }
+    for flag in flags {
+        for v in flag { h.word(*v as u64); }
+    }
+    h.word(contacts.len() as u64);
+    for c in contacts {
+        h.word(c.a as u64);
+        h.word(c.b as u64);
+        h.word(c.key as u64);
+        for v in [c.nx, c.ny, c.nz, c.depth, c.rax, c.ray, c.raz, c.rbx, c.rby, c.rbz, c.lambda, c.lt1, c.lt2, c.mu] {
+            h.word(v.to_bits() as u64);
+        }
+    }
+    h.word(warm_cache.len() as u64);
+    for e in warm_cache {
+        h.word(e.a as u64);
+        h.word(e.b as u64);
+        h.word(e.k as u64);
+        for v in [e.lambda, e.lt1, e.lt2] { h.word(v.to_bits() as u64); }
+    }
+    for v in gravity { h.word(v.to_bits() as u64); }
+    h.finish()
 }
 
 pub(crate) struct Fnv(u64);
@@ -191,6 +224,24 @@ mod tests {
             assert!(w.restore(&base.capture()));
             assert_eq!(w.capture().hash(), want, "{name} was not restored");
         }
+    }
+
+    #[test]
+    fn the_streaming_world_hash_equals_the_snapshot_hash() {
+        let mut w = world();
+        assert_eq!(w.state_hash(), w.capture().hash());
+        for _ in 0..2 { w.step(); }
+        assert!(!w.contacts.is_empty());
+        assert_eq!(w.state_hash(), w.capture().hash());
+        w.gx = 1.0;
+        assert_eq!(w.state_hash(), w.capture().hash());
+    }
+
+    #[test]
+    fn a_snapshot_reports_a_size_that_grows_with_capacity_and_contacts() {
+        let small = PhysicsWorld::new(8).capture().approx_bytes();
+        assert!(PhysicsWorld::new(64).capture().approx_bytes() > small * 4);
+        assert!(world().capture().approx_bytes() > PhysicsWorld::new(8).capture().approx_bytes());
     }
 
     #[test]
