@@ -1,6 +1,6 @@
 use crate::collision::V3;
 use crate::hull::MAX_HULL_COORD;
-use crate::physics::BodyDesc;
+use crate::physics::{BodyDesc, MAX_COORD};
 use std::sync::atomic::{AtomicU32, Ordering};
 use wasm_bindgen::prelude::*;
 
@@ -13,6 +13,7 @@ pub const TAG_GRAVITY: u8 = 4;
 pub const TAG_HULL_VERTS: u8 = 5;
 pub const TAG_HULL_COMMIT: u8 = 6;
 pub const TAG_INSPECT: u8 = 7;
+pub const TAG_TELEPORT: u8 = 8;
 pub const HULL_VERTS_PER_SLOT: usize = 4;
 /// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
 pub const MAX_CAPACITY: u32 = 1 << 18;
@@ -44,6 +45,7 @@ pub enum Command {
     HullVerts { hull: u32, count: u8, verts: [V3; HULL_VERTS_PER_SLOT] },
     HullCommit { hull: u32, count: u8 },
     Inspect { on: bool },
+    Teleport { id: u32, generation: u8, x: f32, y: f32, z: f32 },
 }
 
 impl Command {
@@ -51,7 +53,8 @@ impl Command {
         match self {
             Command::Spawn   { id, generation, .. }
             | Command::Destroy { id, generation }
-            | Command::Force   { id, generation, .. } => Some((*id, *generation)),
+            | Command::Force   { id, generation, .. }
+            | Command::Teleport { id, generation, .. } => Some((*id, *generation)),
             Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } => None,
         }
     }
@@ -210,6 +213,10 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             b[0] = TAG_FORCE;
             wr_f32x(b, OFF_POS, &[*x, *y, *z]);
         }
+        Command::Teleport { x, y, z, .. } => {
+            b[0] = TAG_TELEPORT;
+            wr_f32x(b, OFF_POS, &[*x, *y, *z]);
+        }
     }
 }
 
@@ -268,6 +275,11 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
             let v: [f32; 3] = rd_f32x(b, OFF_POS);
             if !all_finite(&v) || v.iter().any(|f| f.abs() > MAX_FORCE) { return None; }
             Some(Command::Force { id, generation, x: v[0], y: v[1], z: v[2] })
+        }
+        TAG_TELEPORT => {
+            let v: [f32; 3] = rd_f32x(b, OFF_POS);
+            if !all_finite(&v) || v.iter().any(|f| f.abs() > MAX_COORD) { return None; }
+            Some(Command::Teleport { id, generation, x: v[0], y: v[1], z: v[2] })
         }
         _ => None,
     }
@@ -561,6 +573,20 @@ mod tests {
         ring.drain_commands(8, &mut out);
         assert_eq!(out, vec![Command::Inspect { on: true }, Command::Inspect { on: false }]);
         assert_eq!(ring.malformed_dropped(), 2);
+    }
+
+    #[test]
+    fn teleport_round_trips_and_rejects_non_finite_or_out_of_range_positions() {
+        let mut ring = CommandRing::new(8);
+        let t = Command::Teleport { id: 3, generation: 1, x: 1.5, y: -2.0, z: MAX_COORD };
+        ring.push(&t);
+        ring.push(&Command::Teleport { id: 3, generation: 1, x: f32::NAN, y: 0.0, z: 0.0 });
+        ring.push(&Command::Teleport { id: 3, generation: 1, x: 0.0, y: f32::INFINITY, z: 0.0 });
+        ring.push(&Command::Teleport { id: 3, generation: 1, x: 0.0, y: 0.0, z: MAX_COORD * 2.0 });
+        let mut out = Vec::new();
+        ring.drain_commands(8, &mut out);
+        assert_eq!(out, vec![t]);
+        assert_eq!(ring.malformed_dropped(), 3);
     }
 
     #[test]

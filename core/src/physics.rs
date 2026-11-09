@@ -1,6 +1,10 @@
 use crate::collision::{self as geo, Manifold};
 use crate::hull::{self, HullData, MAX_HULLS};
 
+mod snapshot;
+pub(crate) use snapshot::Fnv;
+pub use snapshot::PhysicsSnapshot;
+
 const MIN_BUCKETS: usize = 4096;
 const MAX_BODIES: usize = crate::command_ring::MAX_CAPACITY as usize;
 const MIN_MAX_CONTACTS: usize = 16384;
@@ -282,6 +286,27 @@ impl PhysicsWorld {
     pub fn deactivate(&mut self, id: usize) {
         if id >= self.capacity { return; }
         self.active[id] = false;
+        self.wake_touching(id);
+        self.forget_pairs(id as u32);
+    }
+
+    /// Moves a body and clears its motion. Sleepers resting on its old position lose their support, so they wake.
+    pub fn teleport(&mut self, id: usize, to: [f32; 3]) {
+        if id >= self.capacity || !self.active[id] { return; }
+        self.wake_touching(id);
+        self.wake(id);
+        [self.pos_x[id], self.pos_y[id], self.pos_z[id]] = to;
+        self.vel_x[id] = 0.0; self.vel_y[id] = 0.0; self.vel_z[id] = 0.0;
+        self.ang_x[id] = 0.0; self.ang_y[id] = 0.0; self.ang_z[id] = 0.0;
+        self.sleep_timer[id] = 0.0;
+        self.touching[id] = false;
+        self.penetrating[id] = false;
+        self.forget_pairs(id as u32);
+        // A static body generates no pairs, so a sleeper under its new position would stay embedded unless woken here.
+        self.wake_touching(id);
+    }
+
+    fn wake_touching(&mut self, id: usize) {
         // A sleeper has no contact with its support (only awake bodies generate pairs), so use an AABB scan.
         const MARGIN: f32 = 0.1;
         for o in 0..self.capacity {
@@ -291,7 +316,11 @@ impl PhysicsWorld {
                 && (self.pos_z[o] - self.pos_z[id]).abs() <= self.half_z[o] + self.half_z[id] + MARGIN;
             if touches { self.wake(o); }
         }
-        self.forget_pairs(id as u32);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn warm_pairs(&self) -> Vec<(u32, u32)> {
+        self.warm_cache.iter().map(|e| (e.a, e.b)).collect()
     }
 
     fn forget_pairs(&mut self, id: u32) {

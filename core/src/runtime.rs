@@ -2,7 +2,7 @@ use crate::collision::V3;
 use crate::command_ring::{Command, CommandRing, MAX_CAPACITY};
 use crate::hull::{HullData, MAX_HULL_VERTS};
 use crate::inspector::Inspector;
-use crate::physics::{BodyDesc, PhysicsWorld, SHAPE_HULL};
+use crate::physics::{BodyDesc, Fnv, PhysicsSnapshot, PhysicsWorld, SHAPE_HULL};
 use crate::transform_buffers::{Transform, TransformBuffers, INITIAL_STATE};
 use std::sync::atomic::{AtomicU32, Ordering};
 use wasm_bindgen::prelude::*;
@@ -202,6 +202,11 @@ impl Runtime {
                         self.physics.apply_impulse(id as usize, x, y, z);
                     }
                 }
+                Command::Teleport { x, y, z, .. } => {
+                    if self.physics_enabled {
+                        self.physics.teleport(id as usize, [x, y, z]);
+                    }
+                }
             }
         }
         self.commands = commands;
@@ -240,6 +245,62 @@ impl Runtime {
         self.header[H_DROPPED_CONTACTS].store(self.physics.dropped_contacts, Ordering::Release);
         self.header[H_CONTACTS].store(self.physics.contacts.len() as u32, Ordering::Release);
         self.header[H_TICKS].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Complete simulation state at a tick boundary: restoring it and stepping must match a run that never stopped.
+pub struct RuntimeSnapshot {
+    physics: PhysicsSnapshot,
+    generations: Vec<u8>,
+    live: Vec<bool>,
+}
+
+impl RuntimeSnapshot {
+    pub fn hash(&self) -> u64 {
+        let mut h = Fnv::new();
+        h.word(self.physics.hash());
+        for g in &self.generations { h.word(*g as u64); }
+        for l in &self.live { h.word(*l as u64); }
+        h.finish()
+    }
+}
+
+impl Runtime {
+    /// None without physics: transforms are only derivable from the physics columns, and a runtime that
+    /// writes transforms directly has no other state a snapshot could rebuild them from.
+    pub fn capture(&self) -> Option<RuntimeSnapshot> {
+        self.physics_enabled.then(|| RuntimeSnapshot {
+            physics: self.physics.capture(),
+            generations: self.generations.clone(),
+            live: self.live.clone(),
+        })
+    }
+
+    /// Rewrites every transform row into the write buffer; the next `step` publishes it. Does not touch the ring, the
+    /// hull table (hulls are immutable and never removed) or the id counter (JS ids stay unique across a restore).
+    pub fn restore(&mut self, s: &RuntimeSnapshot) -> bool {
+        if !self.physics_enabled || s.generations.len() > self.generations.len() || !self.physics.restore(&s.physics) {
+            return false;
+        }
+        let n = s.generations.len();
+        self.generations[..n].copy_from_slice(&s.generations);
+        self.generations[n..].fill(0);
+        self.live[..n].copy_from_slice(&s.live);
+        self.live[n..].fill(false);
+        let p = &self.physics;
+        for i in 0..p.capacity {
+            let t = if p.active[i] {
+                Transform { pos: [p.pos_x[i], p.pos_y[i], p.pos_z[i]], rot: [p.qx[i], p.qy[i], p.qz[i], p.qw[i]] }
+            } else {
+                Transform::TOMBSTONE
+            };
+            self.transforms.write_transform(i as u32, t);
+        }
+        true
+    }
+
+    pub fn state_hash(&self) -> Option<u64> {
+        self.capture().map(|s| s.hash())
     }
 }
 
@@ -1300,5 +1361,257 @@ mod tests {
             let len_sq: f32 = c[3..7].iter().map(|q| q * q).sum();
             assert!((len_sq - 1.0).abs() < 1e-4, "entity {id} quaternion not unit: {c:?}");
         }
+    }
+
+    fn snapshot_scene() -> Runtime {
+        let mut rt = Runtime::new(16, 128);
+        rt.enable_physics();
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.1)));
+        for i in 1..5u32 {
+            rt.ring.push(&spawn_cmd(i, 0, unit_box(0.1 * i as f32, 0.5 + 1.2 * (i - 1) as f32, 0.0)));
+        }
+        rt.ring.push(&spawn_cmd(5, 0, BodyDesc::sphere_at([3.0, 4.0, 0.2], 0.4, 1.0, 0.4)));
+        rt.ring.push(&spawn_cmd(6, 0, BodyDesc::capsule_at([-3.0, 2.0, 0.0], 0.3, 0.5, 1.0, 0.2)));
+        upload_hull(&mut rt, 0, &cube(0.4));
+        rt.ring.push(&hull_spawn(7, 0, 3.0));
+        rt.step();
+        rt
+    }
+
+    fn frame_bits(rt: &Runtime) -> Vec<u32> {
+        read_buf(rt).iter().map(|v| v.to_bits()).collect()
+    }
+
+    fn run(rt: &mut Runtime, ticks: usize) -> Vec<(u64, Vec<u32>)> {
+        (0..ticks).map(|_| { rt.step(); (rt.state_hash().unwrap(), frame_bits(rt)) }).collect()
+    }
+
+    #[test]
+    fn restore_then_stepping_matches_the_run_that_never_stopped_mid_motion() {
+        let mut rt = snapshot_scene();
+        run(&mut rt, 25);
+        let snap = rt.capture().unwrap();
+        let expected = run(&mut rt, 90);
+        assert!(rt.restore(&snap));
+        assert_eq!(rt.state_hash(), Some(snap.hash()));
+        assert_eq!(run(&mut rt, 90), expected);
+    }
+
+    #[test]
+    fn restore_matches_when_the_snapshot_holds_sleeping_bodies_and_warm_impulses() {
+        let mut rt = snapshot_scene();
+        run(&mut rt, 600);
+        assert!(rt.sleeping_count() >= 3, "scene should have settled: {}", rt.sleeping_count());
+        let snap = rt.capture().unwrap();
+        rt.ring.push(&Command::Force { id: 2, generation: 0, x: 0.0, y: 30.0, z: 0.0 });
+        let expected = run(&mut rt, 120);
+        assert!(rt.restore(&snap));
+        rt.ring.push(&Command::Force { id: 2, generation: 0, x: 0.0, y: 30.0, z: 0.0 });
+        assert_eq!(run(&mut rt, 120), expected);
+    }
+
+    #[test]
+    fn restore_rewinds_spawns_destroys_generations_and_liveness() {
+        let mut rt = snapshot_scene();
+        run(&mut rt, 10);
+        let snap = rt.capture().unwrap();
+        rt.ring.push(&Command::Destroy { id: 3, generation: 0 });
+        rt.ring.push(&spawn_cmd(8, 0, unit_box(5.0, 5.0, 5.0)));
+        run(&mut rt, 5);
+        assert!(!rt.live[3] && rt.live[8] && rt.generations[3] == 1);
+        assert!(rt.restore(&snap));
+        assert!(rt.live[3] && !rt.live[8] && rt.generations[3] == 0);
+        rt.step();
+        assert_eq!(entity(&rt, 8), [0.0; 7], "a slot spawned after the snapshot reads as empty");
+        assert_ne!(entity(&rt, 3), [0.0; 7]);
+    }
+
+    #[test]
+    fn restore_into_a_grown_world_resets_the_new_slots_to_their_never_spawned_state() {
+        let mut a = snapshot_scene();
+        let mut b = snapshot_scene();
+        run(&mut a, 20);
+        run(&mut b, 20);
+        let snap = a.capture().unwrap();
+        a.ring.push(&Command::Grow { capacity: 32 });
+        a.ring.push(&spawn_cmd(20, 0, unit_box(1.0, 9.0, 0.0)));
+        run(&mut a, 3);
+        assert!(a.restore(&snap));
+        b.ring.push(&Command::Grow { capacity: 32 });
+        b.step();
+        a.step();
+        assert!(!a.live[20] && a.generations[20] == 0);
+        assert_eq!(entity(&a, 20), [0.0; 7]);
+        assert_eq!(a.physics.capture().hash(), b.physics.capture().hash(), "grown-then-restored equals grown-only, slot for slot");
+    }
+
+    #[test]
+    fn a_snapshot_larger_than_the_world_is_refused_and_leaves_the_world_alone() {
+        let mut big = Runtime::new(32, 8);
+        big.enable_physics();
+        let snap = big.capture().unwrap();
+        let mut small = snapshot_scene();
+        run(&mut small, 5);
+        let before = small.state_hash();
+        assert!(!small.restore(&snap));
+        assert_eq!(small.state_hash(), before);
+    }
+
+    #[test]
+    fn without_physics_there_is_nothing_to_capture_and_restore_is_refused() {
+        let mut on = Runtime::new(4, 8);
+        on.enable_physics();
+        let snap = on.capture().unwrap();
+        let mut off = Runtime::new(4, 8);
+        assert!(off.capture().is_none() && off.state_hash().is_none());
+        assert!(!off.restore(&snap));
+    }
+
+    #[test]
+    fn a_snapshot_does_not_change_when_the_world_moves_on() {
+        let mut rt = snapshot_scene();
+        run(&mut rt, 10);
+        let snap = rt.capture().unwrap();
+        let h = snap.hash();
+        run(&mut rt, 40);
+        assert_eq!(snap.hash(), h);
+        assert_ne!(rt.state_hash(), Some(h));
+    }
+
+    #[test]
+    fn restore_keeps_the_hull_table_and_the_id_counter() {
+        let mut rt = snapshot_scene();
+        run(&mut rt, 5);
+        let snap = rt.capture().unwrap();
+        rt.id_counter.store(9, Ordering::Release);
+        run(&mut rt, 5);
+        assert!(rt.restore(&snap));
+        assert!(rt.physics.hull(0).is_some());
+        assert_eq!(rt.allocated_ids(), 9);
+    }
+
+    #[test]
+    fn restoring_a_snapshot_taken_with_the_inspector_on_republishes_a_consistent_frame() {
+        let mut rt = snapshot_scene();
+        rt.ring.push(&Command::Inspect { on: true });
+        run(&mut rt, 10);
+        let snap = rt.capture().unwrap();
+        run(&mut rt, 10);
+        assert!(rt.restore(&snap));
+        rt.step();
+        assert_eq!(header(&rt, H_INSPECT_SEQ) % 2, 0);
+        assert_eq!(header(&rt, H_INSPECT_TICK), header(&rt, H_TICKS));
+    }
+
+    fn at_rest() -> Runtime {
+        let mut rt = Runtime::new(8, 32);
+        rt.enable_physics();
+        rt.spawn_box(0, 0.0, -0.5, 0.0, 20.0, 0.5, 20.0, 0.0, 0.0);
+        rt.spawn_box(1, 0.0, 0.48, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
+        rt.spawn_box(2, 0.0, 1.46, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
+        run(&mut rt, 400);
+        assert_eq!(rt.sleeping_count(), 2);
+        rt
+    }
+
+    #[test]
+    fn teleport_moves_the_body_zeroes_its_motion_and_keeps_its_rotation() {
+        let mut rt = Runtime::new(4, 16);
+        rt.enable_physics();
+        rt.spawn_sphere(0, 0.0, 50.0, 0.0, 0.5, 1.0, 0.0);
+        run(&mut rt, 20);
+        assert!(rt.physics.vel_y[0] < -1.0);
+        rt.physics.qx[0] = 0.6; rt.physics.qw[0] = 0.8;
+        rt.ring.push(&Command::Teleport { id: 0, generation: 0, x: 4.0, y: 80.0, z: -2.0 });
+        rt.step();
+        let p = &rt.physics;
+        assert_eq!([p.pos_x[0], p.pos_z[0]], [4.0, -2.0]);
+        assert!((p.pos_y[0] - 80.0).abs() < 0.01, "only one gravity tick of fall remains: {}", p.pos_y[0]);
+        assert!(p.vel_y[0] > -0.2 && p.vel_x[0] == 0.0);
+        assert_eq!([p.qx[0], p.qw[0]], [0.6, 0.8]);
+        assert_eq!(entity(&rt, 0)[..3], [4.0, p.pos_y[0], -2.0]);
+    }
+
+    #[test]
+    fn teleporting_a_body_off_a_sleeping_stack_wakes_the_stack() {
+        let mut rt = at_rest();
+        rt.ring.push(&Command::Teleport { id: 1, generation: 0, x: 8.0, y: 5.0, z: 0.0 });
+        rt.step();
+        assert!(!rt.physics.sleeping[2], "the body that rested on the moved one is awake");
+        assert!(!rt.physics.sleeping[1]);
+    }
+
+    #[test]
+    fn teleporting_a_sleeper_wakes_its_island_mates() {
+        let mut rt = at_rest();
+        rt.ring.push(&Command::Teleport { id: 2, generation: 0, x: -8.0, y: 5.0, z: 0.0 });
+        rt.step();
+        assert!(!rt.physics.sleeping[1] && !rt.physics.sleeping[2]);
+    }
+
+    #[test]
+    fn a_static_body_teleported_onto_a_sleeper_wakes_it() {
+        let mut rt = at_rest();
+        rt.spawn_box(3, 30.0, 30.0, 30.0, 0.5, 0.5, 0.5, 0.0, 0.0);
+        rt.step();
+        rt.ring.push(&Command::Teleport { id: 3, generation: 0, x: 0.0, y: 0.48, z: 0.2 });
+        rt.step();
+        assert!(!rt.physics.sleeping[1], "the sleeper the static body landed on is awake");
+    }
+
+    #[test]
+    fn destroying_the_support_of_a_sleeper_wakes_it() {
+        let mut rt = at_rest();
+        rt.ring.push(&Command::Destroy { id: 1, generation: 0 });
+        rt.step();
+        assert!(!rt.physics.sleeping[2]);
+    }
+
+    #[test]
+    fn teleport_clears_the_moved_bodys_warm_impulses() {
+        let mut rt = Runtime::new(4, 16);
+        rt.enable_physics();
+        rt.spawn_box(0, 0.0, -0.5, 0.0, 20.0, 0.5, 20.0, 0.0, 0.0);
+        rt.spawn_box(1, 0.0, 0.48, 0.0, 0.5, 0.5, 0.5, 1.0, 0.0);
+        run(&mut rt, 4);
+        assert!(!rt.physics.sleeping[1] && rt.physics.warm_pairs().iter().any(|&(a, b)| a == 1 || b == 1));
+        rt.physics.teleport(1, [9.0, 9.0, 9.0]);
+        assert!(rt.physics.warm_pairs().iter().all(|&(a, b)| a != 1 && b != 1));
+    }
+
+    #[test]
+    fn teleport_of_a_stale_dead_or_never_spawned_target_changes_nothing() {
+        let mut rt = Runtime::new(4, 16);
+        rt.enable_physics();
+        rt.spawn_sphere(0, 0.0, 10.0, 0.0, 0.5, 1.0, 0.0);
+        rt.ring.push(&spawn_cmd(1, 0, unit_box(5.0, 5.0, 5.0)));
+        rt.ring.push(&Command::Destroy { id: 1, generation: 0 });
+        rt.step();
+        let before = rt.state_hash();
+        rt.ring.push(&Command::Teleport { id: 0, generation: 9, x: 1.0, y: 1.0, z: 1.0 });
+        rt.ring.push(&Command::Teleport { id: 1, generation: 1, x: 1.0, y: 1.0, z: 1.0 });
+        rt.ring.push(&Command::Teleport { id: 2, generation: 0, x: 1.0, y: 1.0, z: 1.0 });
+        rt.ring.push(&Command::Teleport { id: 99, generation: 0, x: 1.0, y: 1.0, z: 1.0 });
+        let mut twin = Runtime::new(4, 16);
+        twin.enable_physics();
+        twin.spawn_sphere(0, 0.0, 10.0, 0.0, 0.5, 1.0, 0.0);
+        twin.ring.push(&spawn_cmd(1, 0, unit_box(5.0, 5.0, 5.0)));
+        twin.ring.push(&Command::Destroy { id: 1, generation: 0 });
+        twin.step();
+        assert_eq!(before, twin.state_hash());
+        rt.step();
+        twin.step();
+        assert_eq!(rt.state_hash(), twin.state_hash());
+        assert_eq!(rt.stale_dropped(), 2, "a wrong generation and an id past capacity are stale; a dead or never-spawned slot is a no-op");
+    }
+
+    #[test]
+    fn teleport_without_physics_is_ignored() {
+        let mut rt = Runtime::new(4, 16);
+        rt.ring.push(&spawn_cmd(0, 0, unit_box(1.0, 2.0, 3.0)));
+        rt.step();
+        rt.ring.push(&Command::Teleport { id: 0, generation: 0, x: 9.0, y: 9.0, z: 9.0 });
+        rt.step();
+        assert_eq!(entity(&rt, 0)[..3], [1.0, 2.0, 3.0]);
     }
 }
