@@ -175,7 +175,7 @@ Out-of-plan observations. Do not act on these without approval.
 
 - (Phase 3 closeout, parked) A shared hull cache across `spawnColliders` calls; `ThreeAdapterOptions` is an alias of `AdapterOptions`; skinned and instanced meshes (collider generation) and folder drops; the demo drops its prop set at a scale chosen from the scene bounds, so very non-flat or very large scenes may place props outside any container.
 
-- (Step 20a, parked) A snapshot as a serialized byte format (save-to-file, import via chunked ring commands) is not built; keyframes are in-memory structs inside Rust. After `restore` the published `dropped_contacts` header word and the histogram stay stale until the next step (seek will run inside a step in 20b). `PhysicsWorld::spawn` does not reset `island_of`, so a reused slot can carry a stale island number into `wake` (suspected, not reproduced).
+- (Step 20a, parked) A snapshot as a serialized byte format (save-to-file, import via chunked ring commands) is not built; keyframes are in-memory structs inside Rust. After `restore` the published `dropped_contacts` header word and the histogram stay stale until the next step (seek will run inside a step in 20b). `PhysicsWorld::spawn` does not reset `island_of`, so a reused slot can carry a stale island number into `wake` (suspected, not reproduced). Replayed commands will re-count `stale`/`malformed` and `HullCommit` on a registered hull counts malformed after a restore; the 20b state hash must not cover those counters and replay must skip hull commands. The wasm `Teleport` tag has no TS mirror until 20c.
 
 ## Plan changes
 

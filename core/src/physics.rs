@@ -298,7 +298,6 @@ impl PhysicsWorld {
         [self.pos_x[id], self.pos_y[id], self.pos_z[id]] = to;
         self.vel_x[id] = 0.0; self.vel_y[id] = 0.0; self.vel_z[id] = 0.0;
         self.ang_x[id] = 0.0; self.ang_y[id] = 0.0; self.ang_z[id] = 0.0;
-        self.sleep_timer[id] = 0.0;
         self.touching[id] = false;
         self.penetrating[id] = false;
         self.forget_pairs(id as u32);
@@ -1196,6 +1195,21 @@ mod tests {
         let mut peak = 0.0f32;
         for _ in 0..120 { soft.step(); peak = peak.max(soft.vel_y[1].abs()); }
         assert!(peak < 0.5, "resting contact bounced at {peak}");
+    }
+
+    #[test]
+    fn teleport_clears_linear_and_angular_motion_timers_and_contact_flags() {
+        let mut w = zero_g(2);
+        w.spawn(0, &BodyDesc::box_at([0.0, 0.0, 0.0], [0.5; 3], 1.0, 0.0));
+        w.vel_x[0] = 1.0; w.vel_y[0] = 2.0; w.vel_z[0] = 3.0;
+        w.ang_x[0] = 4.0; w.ang_y[0] = 5.0; w.ang_z[0] = 6.0;
+        w.sleep_timer[0] = 0.1;
+        w.touching[0] = true;
+        w.penetrating[0] = true;
+        w.teleport(0, [7.0, 8.0, 9.0]);
+        assert_eq!([w.pos_x[0], w.pos_y[0], w.pos_z[0]], [7.0, 8.0, 9.0]);
+        assert_eq!([w.vel_x[0], w.vel_y[0], w.vel_z[0], w.ang_x[0], w.ang_y[0], w.ang_z[0]], [0.0; 6]);
+        assert_eq!((w.sleep_timer[0], w.touching[0], w.penetrating[0]), (0.0, false, false));
     }
 
     #[test]

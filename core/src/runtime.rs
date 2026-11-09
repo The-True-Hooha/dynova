@@ -1435,14 +1435,40 @@ mod tests {
         let snap = a.capture().unwrap();
         a.ring.push(&Command::Grow { capacity: 32 });
         a.ring.push(&spawn_cmd(20, 0, unit_box(1.0, 9.0, 0.0)));
+        a.ring.push(&spawn_cmd(21, 0, unit_box(2.0, 9.0, 0.0)));
         run(&mut a, 3);
+        a.ring.push(&Command::Destroy { id: 21, generation: 0 });
+        run(&mut a, 1);
+        assert_eq!((a.generations[21], a.live[21], a.live[20]), (1, false, true));
         assert!(a.restore(&snap));
         b.ring.push(&Command::Grow { capacity: 32 });
         b.step();
         a.step();
-        assert!(!a.live[20] && a.generations[20] == 0);
+        assert!(!a.live[20] && a.generations[20] == 0 && a.generations[21] == 0);
         assert_eq!(entity(&a, 20), [0.0; 7]);
         assert_eq!(a.physics.capture().hash(), b.physics.capture().hash(), "grown-then-restored equals grown-only, slot for slot");
+    }
+
+    #[test]
+    fn generations_and_liveness_reach_the_runtime_hash() {
+        let mut rt = snapshot_scene();
+        run(&mut rt, 3);
+        let base = rt.capture().unwrap().hash();
+        rt.generations[3] = 1;
+        assert_ne!(rt.capture().unwrap().hash(), base);
+        rt.generations[3] = 0;
+        rt.live[3] = !rt.live[3];
+        assert_ne!(rt.capture().unwrap().hash(), base);
+        rt.live[3] = !rt.live[3];
+        assert_eq!(rt.capture().unwrap().hash(), base);
+    }
+
+    #[test]
+    fn a_static_support_teleported_away_wakes_the_sleeper_it_held_up() {
+        let mut rt = at_rest();
+        rt.ring.push(&Command::Teleport { id: 0, generation: 0, x: 500.0, y: 0.0, z: 0.0 });
+        rt.step();
+        assert!(!rt.physics.sleeping[1] && !rt.physics.sleeping[2]);
     }
 
     #[test]
