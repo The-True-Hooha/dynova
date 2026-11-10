@@ -944,6 +944,9 @@ fn hash3(x: i32, y: i32, z: i32) -> usize {
 }
 
 #[cfg(test)]
+mod scene_data;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
