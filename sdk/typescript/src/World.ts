@@ -1,6 +1,6 @@
 import { HEADER_WORDS, TransformView } from './TransformView.js';
 import type { RecordingState } from './TransformView.js';
-import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc } from './CommandRing.js';
+import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc, KIN_SAMPLES_PER_SLOT, MAX_KIN_TICKS, KinematicSample } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import type { MemoryMode } from './memory.js';
 
@@ -55,6 +55,13 @@ export interface SpawnOptions {
     hull?: number;
 }
 
+export interface KinematicTarget {
+    handle: EntityHandle;
+    x: number; y: number; z: number;
+    /** Ticks to arrive in, an integer from 1 to `MAX_KIN_TICKS`. */
+    ticks: number;
+}
+
 export interface JointOptions {
     /** One of `JOINT_BALL`, `JOINT_HINGE`, `JOINT_FIXED`, `JOINT_SLIDER`. */
     kind: number;
@@ -97,6 +104,7 @@ type Queued =
     | { k: 'jointCreate'; d: JointCreateDesc }
     | { k: 'jointDestroy'; id: number }
     | { k: 'jointMotor'; id: number; velocity: number; maxForce: number }
+    | { k: 'kinematic'; samples: KinematicSample[] }
     | { k: 'hullVerts'; hull: number; coords: number[] }
     | { k: 'hullCommit'; hull: number; count: number };
 
@@ -257,6 +265,7 @@ export class World {
             case 'jointCreate': return this.ring.jointCreate(c.d);
             case 'jointDestroy': return this.ring.jointDestroy(c.id);
             case 'jointMotor': return this.ring.jointMotor(c.id, c.velocity, c.maxForce);
+            case 'kinematic': return this.ring.kinematicBatch(c.samples);
             case 'hullVerts': return this.ring.hullVerts(c.hull, c.coords);
             case 'hullCommit': return this.ring.hullCommit(c.hull, c.count);
         }
@@ -378,6 +387,29 @@ export class World {
         this.assertAlive();
         this.assertMotor(velocity, maxForce);
         if (!this.enqueue({ k: 'jointMotor', id: joint.id, velocity, maxForce })) throw new Error('CommandRing full');
+    }
+
+    /**
+     * Glide static bodies to telemetry samples: each body moves at constant speed and arrives after `ticks` ticks, pushing and
+     * carrying dynamic bodies on the way. A new sample for a body replaces its unfinished one. Every sample is checked before
+     * any is queued, and the batch is queued whole or not at all.
+     */
+    moveKinematic(samples: readonly KinematicTarget[]): void {
+        this.assertAlive();
+        for (const s of samples) {
+            if (!this.ids.isLive(s.handle)) throw new Error(`stale handle {id: ${s.handle.id}, gen: ${s.handle.gen}}`);
+            if (![s.x, s.y, s.z].every((v) => Number.isFinite(v) && Math.abs(v) <= MAX_TELEPORT_COORD)) throw new RangeError(`kinematic target must be finite and within +-${MAX_TELEPORT_COORD}`);
+            if (!Number.isInteger(s.ticks) || s.ticks < 1 || s.ticks > MAX_KIN_TICKS) throw new RangeError(`kinematic ticks must be an integer in 1..${MAX_KIN_TICKS}, got ${s.ticks}`);
+        }
+        const slots = Math.ceil(samples.length / KIN_SAMPLES_PER_SLOT);
+        if (slots > this.ringCapacity - this.ring.pendingCount + this.maxDeferred - this.deferredCommands) {
+            this.rejected += slots;
+            throw new Error('CommandRing full: not enough room for this batch');
+        }
+        for (let i = 0; i < samples.length; i += KIN_SAMPLES_PER_SLOT) {
+            const chunk = samples.slice(i, i + KIN_SAMPLES_PER_SLOT).map((s) => ({ id: s.handle.id, gen: s.handle.gen, x: s.x, y: s.y, z: s.z, ticks: s.ticks }));
+            if (!this.enqueue({ k: 'kinematic', samples: chunk })) throw new Error('CommandRing full');
+        }
     }
 
     destroyJoint(joint: JointHandle): void {

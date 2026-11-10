@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { World } from '../World.js';
 import { makeWorld, makeSyncWorld } from './helpers.js';
 import { H_GENERATIONS, H_LIVE, H_SEEKS, H_PAUSED, H_TICKS } from '../TransformView.js';
-import { SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, JOINT_BALL, JOINT_HINGE, JOINT_FIXED, JOINT_SLIDER } from '../CommandRing.js';
+import { SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, JOINT_BALL, JOINT_HINGE, JOINT_FIXED, JOINT_SLIDER } from '../CommandRing.js';
 
 const config = { capacity: 128, ringCapacity: 64 };
 const tight = { capacity: 8, ringCapacity: 2, maxDeferredCommands: 0 };
@@ -580,3 +580,80 @@ describe('World joints', () => {
     });
 });
 
+describe('World kinematic targets', () => {
+    function bodies(n: number, cfg = { capacity: 64, ringCapacity: 64 }) {
+        const made = makeWorld(cfg);
+        const handles = Array.from({ length: n }, () => made.world.spawn({ invMass: 0 }));
+        return { ...made, handles };
+    }
+    const slot = (rt: { dv: DataView; layout: { ringSlotsByteOffset: number } }, n: number) => {
+        const off = rt.layout.ringSlotsByteOffset + n * SLOT_BYTES;
+        return { tag: rt.dv.getUint8(off), count: rt.dv.getUint8(off + 1), first: rt.dv.getUint32(off + 4, true), ticks: rt.dv.getUint16(off + 10, true) };
+    };
+
+    it('splits a bulk update into slots of three samples, in order', () => {
+        const { world, rt, handles } = bodies(7);
+        const before = world.pendingCommands;
+        world.moveKinematic(handles.map((handle, i) => ({ handle, x: i, y: 0, z: 0, ticks: 10 + i })));
+        expect(world.pendingCommands - before).toBe(3);
+        const slots = [0, 1, 2].map((n) => slot(rt, before + n));
+        expect(slots.map((s) => [s.tag, s.count])).toEqual([[TAG_KINEMATIC_BATCH, 3], [TAG_KINEMATIC_BATCH, 3], [TAG_KINEMATIC_BATCH, 1]]);
+        expect(slots.map((s) => s.first)).toEqual([handles[0].id, handles[3].id, handles[6].id]);
+        expect(slots[2].ticks).toBe(16);
+    });
+
+    it('an empty update queues nothing', () => {
+        const { world } = bodies(1);
+        const before = world.pendingCommands;
+        world.moveKinematic([]);
+        expect(world.pendingCommands).toBe(before);
+    });
+
+    it('rejects a bad sample before queueing any of the batch', () => {
+        const { world, handles } = bodies(3);
+        const ok = { handle: handles[0], x: 1, y: 2, z: 3, ticks: 5 };
+        const bad: Array<[object, RegExp | typeof RangeError]> = [
+            [{ ticks: 0 }, RangeError], [{ ticks: -1 }, RangeError], [{ ticks: 1.5 }, RangeError], [{ ticks: 65_536 }, RangeError], [{ ticks: NaN }, RangeError],
+            [{ x: NaN }, RangeError], [{ y: Infinity }, RangeError], [{ z: 2e6 }, RangeError], [{ x: -2e6 }, RangeError],
+            [{ handle: { id: 99, gen: 0 } }, /stale handle/], [{ handle: { id: handles[1].id, gen: 7 } }, /stale handle/],
+        ];
+        const before = world.pendingCommands;
+        for (const [patch, expected] of bad) {
+            expect(() => world.moveKinematic([ok, { ...ok, handle: handles[1] }, { ...ok, ...patch } as never]), JSON.stringify(patch)).toThrow(expected);
+        }
+        expect(world.pendingCommands).toBe(before);
+        expect(() => world.moveKinematic([{ ...ok, ticks: 65_535, x: 1e6, z: -1e6 }])).not.toThrow();
+    });
+
+    it('a destroyed body cannot be moved', () => {
+        const { world, handles } = bodies(2);
+        world.destroy(handles[1]);
+        expect(() => world.moveKinematic([{ handle: handles[1], x: 0, y: 0, z: 0, ticks: 1 }])).toThrow(/stale handle/);
+    });
+
+    it('queues the whole batch or none of it when the ring and the deferred queue are short of room', () => {
+        const { world, handles } = bodies(2, { capacity: 64, ringCapacity: 4, maxDeferredCommands: 2 } as never);
+        const s = (i: number) => ({ handle: handles[i % 2], x: i, y: 0, z: 0, ticks: 3 });
+        const before = world.pendingCommands;
+        expect(() => world.moveKinematic(Array.from({ length: 30 }, (_, i) => s(i)))).toThrow(/not enough room/);
+        expect(world.pendingCommands).toBe(before);
+        expect(() => world.moveKinematic(Array.from({ length: 6 }, (_, i) => s(i)))).not.toThrow();
+    });
+
+    it('accepts a batch that fills the room exactly and refuses one slot more, counting the slots it refused', () => {
+        const { world, handles } = bodies(2, { capacity: 64, ringCapacity: 16, maxDeferredCommands: 4 } as never);
+        const room = 16 - world.pendingCommands + 4;
+        const batch = (slots: number) => Array.from({ length: slots * 3 }, (_, i) => ({ handle: handles[i % 2], x: i, y: 0, z: 0, ticks: 3 }));
+        const drops = world.backpressureDrops;
+        expect(() => world.moveKinematic(batch(room + 1))).toThrow(/not enough room/);
+        expect(world.backpressureDrops - drops).toBe(room + 1);
+        expect(() => world.moveKinematic(batch(room))).not.toThrow();
+    });
+
+    it('throws once the world is destroyed', () => {
+        const { world, handles } = bodies(1);
+        world.destroy(handles[0]);
+        world.dispose?.();
+        expect(() => world.moveKinematic([])).toThrow();
+    });
+});

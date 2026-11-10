@@ -2,6 +2,7 @@ use crate::collision::V3;
 use crate::command_ring::{Command, CommandRing, MAX_CAPACITY};
 use crate::hull::{HullData, MAX_HULL_VERTS};
 use crate::inspector::Inspector;
+use crate::command_ring::KinSample;
 use crate::physics::{BodyDesc, Fnv, JointDesc, PhysicsSnapshot, PhysicsWorld, SHAPE_HULL};
 use crate::recorder::Recorder;
 use crate::transform_buffers::{Transform, TransformBuffers, INITIAL_STATE};
@@ -477,6 +478,7 @@ impl Runtime {
                 return found;
             }
             Command::JointMotor { id, vel, max } => return self.apply_joint_motor(id, vel, max),
+            Command::KinematicBatch { count, samples } => return self.apply_kinematic_batch(&samples[..count as usize]),
             _ => {}
         }
         let Some((id, generation)) = cmd.target() else { return false };
@@ -525,6 +527,21 @@ impl Runtime {
             self.ring.note_malformed();
         }
         ok
+    }
+
+    /// Each sample stands alone: a stale or invalid one is counted and skipped, the rest of the slot still applies.
+    fn apply_kinematic_batch(&mut self, samples: &[KinSample]) -> bool {
+        let mut applied = false;
+        for s in samples {
+            if !self.body_is_live(s.id, s.generation) {
+                self.ring.note_stale();
+            } else if self.physics_enabled && self.physics.set_kinematic_target(s.id as usize, s.ticks, s.to) {
+                applied = true;
+            } else {
+                self.ring.note_malformed();
+            }
+        }
+        applied
     }
 
     fn apply_joint_motor(&mut self, id: u32, vel: f32, max: f32) -> bool {
@@ -599,6 +616,8 @@ impl Runtime {
         let done = match rec.plan(target) {
             Some((kf, cmds)) if self.restore(&kf.snapshot) => {
                 self.head = target;
+                // A logged batch can hold a rejected sample next to accepted ones; replaying it must not count that sample again.
+                let counted = self.ring.counters();
                 let mut next = cmds.iter().peekable();
                 for t in kf.tick..target {
                     while let Some((_, cmd)) = next.next_if(|(key, _)| *key == t) {
@@ -606,6 +625,7 @@ impl Runtime {
                     }
                     self.advance_physics();
                 }
+                self.ring.restore_counters(counted);
                 true
             }
             _ => false,
@@ -2741,6 +2761,98 @@ mod tests {
         }
     }
 
+    fn kin_batch(samples: &[KinSample]) -> Command {
+        let mut all = [KinSample { id: 0, generation: 0, ticks: 1, to: [0.0; 3] }; 3];
+        all[..samples.len()].copy_from_slice(samples);
+        Command::KinematicBatch { count: samples.len() as u8, samples: all }
+    }
+
+    fn kin_to(id: u32, generation: u8, ticks: u16, to: [f32; 3]) -> KinSample {
+        KinSample { id, generation, ticks, to }
+    }
+
+    #[test]
+    fn a_kinematic_batch_moves_static_bodies_and_counts_each_bad_sample_without_dropping_the_rest() {
+        let mut rt = Runtime::new(8, 64);
+        rt.enable_physics();
+        rt.set_gravity(0.0, 0.0, 0.0);
+        for id in 0..2 {
+            rt.ring.push(&spawn_cmd(id, 0, BodyDesc::box_at([id as f32 * 10.0, 0.0, 0.0], [0.5; 3], 0.0, 0.0)));
+        }
+        rt.ring.push(&spawn_cmd(2, 0, BodyDesc::sphere_at([0.0, 20.0, 0.0], 0.5, 1.0, 0.0)));
+        rt.step();
+        rt.ring.push(&kin_batch(&[kin_to(0, 0, 4, [4.0, 0.0, 0.0]), kin_to(1, 9, 4, [0.0; 3]), kin_to(2, 0, 4, [1.0; 3])]));
+        rt.step();
+        assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (1, 1), "stale generation and a dynamic target");
+        for _ in 0..3 { rt.step(); }
+        assert_eq!(rt.physics_position(0), Some([4.0, 0.0, 0.0]), "the valid sample next to two bad ones still applied");
+        assert_eq!(rt.physics_position(1), Some([10.0, 0.0, 0.0]));
+        assert_eq!(rt.physics_position(2).map(|p| p[1] < 20.0 || p == [0.0, 20.0, 0.0]), Some(true));
+    }
+
+    #[test]
+    fn a_batch_whose_samples_are_all_rejected_is_counted_and_not_logged() {
+        let mut rt = Runtime::new(4, 64);
+        rt.enable_physics();
+        rt.ring.push(&Command::Record { on: true });
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::sphere_at([0.0, 5.0, 0.0], 0.5, 1.0, 0.0)));
+        rt.step();
+        let logged = rt.recorder.as_ref().unwrap().log_len();
+        rt.ring.push(&kin_batch(&[kin_to(0, 0, 3, [1.0; 3]), kin_to(3, 0, 3, [1.0; 3])]));
+        rt.step();
+        assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (1, 1));
+        assert_eq!(rt.recorder.as_ref().unwrap().log_len(), logged, "nothing was accepted, so nothing is logged");
+        rt.ring.push(&kin_batch(&[kin_to(0, 0, 3, [1.0; 3])]));
+        rt.step();
+        assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (1, 2));
+        for t in [1, 2, 1, 2] { seek_to(&mut rt, t); }
+        assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (1, 2), "a replay neither re-counts nor applies them");
+    }
+
+    #[test]
+    fn a_batch_on_a_world_without_physics_is_malformed() {
+        let mut rt = Runtime::new(4, 16);
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0; 3], [0.5; 3], 0.0, 0.0)));
+        rt.ring.push(&kin_batch(&[kin_to(0, 0, 3, [1.0; 3])]));
+        rt.step();
+        assert_eq!(rt.malformed_dropped(), 1);
+    }
+
+    #[test]
+    fn a_recorded_telemetry_run_replays_to_the_same_hash_and_frame_at_every_tick() {
+        let mut rt = Runtime::new(12, 256);
+        rt.enable_physics();
+        let mut takes = vec![Take { hash: 0, frame: Vec::new() }];
+        let total = 400u32;
+        for t in 0..total {
+            if t == 0 {
+                rt.ring.push(&Command::Record { on: true });
+                rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, 0.0, 0.0], [3.0, 0.25, 3.0], 0.0, 0.0)));
+                rt.ring.push(&spawn_cmd(1, 0, BodyDesc::box_at([30.0, 0.0, 0.0], [0.4; 3], 0.0, 0.0)));
+                for i in 2..8u32 {
+                    rt.ring.push(&spawn_cmd(i, 0, BodyDesc::box_at([(i as f32 - 5.0) * 0.6, 1.0 + i as f32 * 0.1, 0.0], [0.25; 3], 1.0, 0.1)));
+                }
+            }
+            // A sample every 40 ticks glides the platform; one more targets a dead generation, one a body that is not static.
+            if t % 40 == 20 {
+                let k = (t / 40) as f32;
+                rt.ring.push(&kin_batch(&[kin_to(0, 0, 40, [k.sin() * 4.0, (k * 0.5).cos() * 0.5, k.cos() * 2.0]), kin_to(1, 0, 25, [30.0, k, 0.0]), kin_to(3, 0, 5, [0.0; 3])]));
+            }
+            if t == 150 { rt.ring.push(&kin_batch(&[kin_to(1, 3, 5, [0.0; 3])])); }
+            if t == 250 { rt.ring.push(&Command::Teleport { id: 0, generation: 0, x: 1.0, y: 0.0, z: 0.0 }); }
+            rt.step();
+            takes.push(take(&rt));
+        }
+        let (stale, malformed) = (rt.stale_dropped(), rt.malformed_dropped());
+        assert!(stale >= 1 && malformed >= 9, "stale {stale} malformed {malformed}");
+        for t in [1, 2, 21, 22, 60, 61, 100, 151, 250, 251, 252, 399, total, 21, 330, total] {
+            seek_to(&mut rt, t);
+            assert_eq!(hash_header(&rt), takes[t as usize].hash, "hash at {t}");
+            assert_eq!(frame_bits(&rt), takes[t as usize].frame, "frame at {t}");
+            assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (stale, malformed), "replay re-counted at {t}");
+        }
+    }
+
     #[test]
     fn a_rejected_joint_is_not_resurrected_by_a_replay() {
         let mut rt = Runtime::new(8, 64);
@@ -2756,5 +2868,35 @@ mod tests {
         seek_to(&mut rt, 3);
         assert!(rt.physics.joints.is_empty());
         assert_eq!(rt.state_hash(), want);
+    }
+
+    #[test]
+    fn five_thousand_kinematic_bodies_fed_in_slots_of_three_all_land_on_their_samples() {
+        let n = 5000u32;
+        let mut rt = Runtime::new(n + 8, 4096);
+        rt.enable_physics();
+        let side = 71u32;
+        let home = |i: u32| [(i % side) as f32 * 3.0, 0.0, (i / side) as f32 * 3.0];
+        for id in 0..n {
+            rt.ring.push(&spawn_cmd(id, 0, BodyDesc::box_at(home(id), [0.5; 3], 0.0, 0.0)));
+            if id % 1000 == 999 { rt.step(); }
+        }
+        rt.step();
+        let mut id = 0;
+        while id < n {
+            let c = (n - id).min(3);
+            let mut all = [KinSample { id: 0, generation: 0, ticks: 1, to: [0.0; 3] }; 3];
+            for k in 0..c {
+                let i = id + k;
+                all[k as usize] = KinSample { id: i, generation: 0, ticks: 1 + (i % 12) as u16, to: [home(i)[0] + 1.0, i as f32 * 0.001, home(i)[2]] };
+            }
+            if rt.ring.push(&Command::KinematicBatch { count: c as u8, samples: all }) { id += c; } else { rt.step(); }
+        }
+        for _ in 0..16 { rt.step(); }
+        assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (0, 0));
+        for i in (0..n).step_by(37).chain([n - 1]) {
+            assert_eq!(rt.physics_position(i as usize), Some([home(i)[0] + 1.0, i as f32 * 0.001, home(i)[2]]), "body {i}");
+        }
+        assert_eq!(rt.physics.kin.len(), 0);
     }
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, SHAPE_HULL, SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, JOINT_HINGE } from '../CommandRing.js';
+import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, SHAPE_HULL, SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, KIN_SAMPLES_PER_SLOT, JOINT_HINGE } from '../CommandRing.js';
 
 function makeRing(capacity = 16) {
     const mem = new WebAssembly.Memory({ initial: 1 });
@@ -259,5 +259,34 @@ describe('CommandRing', () => {
         for (let i = 0; i < 12; i++) expect(view.getFloat32(6 + i * 4, true)).toBe(i + 1);
         expect(view.getFloat32(54, true)).toBe(0);
         expect(view.getUint8(5)).toBe(4);
+    });
+
+    it('pins the kinematic batch tag and slot capacity', () => {
+        expect([TAG_KINEMATIC_BATCH, KIN_SAMPLES_PER_SLOT]).toEqual([15, 3]);
+    });
+
+    // Same bytes as KIN_FIXTURE_HEX in core/src/command_ring.rs.
+    it('kinematic batch bytes match the Rust cross-language fixture', () => {
+        const { mem, ring } = makeRing();
+        new Uint8Array(mem.buffer, 0, SLOT_BYTES).fill(0xff);
+        expect(ring.kinematicBatch([
+            { id: 5, gen: 1, ticks: 30, x: 1, y: 2, z: 3 },
+            { id: 70_000, gen: 255, ticks: 65_535, x: -0.5, y: 0, z: 4 },
+        ])).toBe(true);
+        const hex = Array.from(new Uint8Array(mem.buffer, 0, SLOT_BYTES)).map((b) => b.toString(16).padStart(2, '0')).join('');
+        expect(hex).toBe('0f' + '02' + '0000' + '05000000' + '01' + '00' + '1e00' + '0000803f' + '00000040' + '00004040'
+            + '70110100' + 'ff' + '00' + 'ffff' + '000000bf' + '00000000' + '00008040' + '00000000'.repeat(5));
+    });
+
+    it('a kinematic batch takes one to three samples and reports a full ring without writing', () => {
+        const { mem, ring } = makeRing(2);
+        const s = { id: 1, gen: 0, ticks: 1, x: 0, y: 0, z: 0 };
+        expect(() => ring.kinematicBatch([])).toThrow(RangeError);
+        expect(() => ring.kinematicBatch([s, s, s, s])).toThrow(RangeError);
+        expect(ring.kinematicBatch([s, s, s])).toBe(true);
+        expect(ring.kinematicBatch([s])).toBe(true);
+        const before = new Uint8Array(mem.buffer, 0, 2 * SLOT_BYTES).slice();
+        expect(ring.kinematicBatch([{ ...s, id: 9 }])).toBe(false);
+        expect(new Uint8Array(mem.buffer, 0, 2 * SLOT_BYTES)).toEqual(before);
     });
 });

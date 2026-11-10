@@ -8,6 +8,8 @@ const paused = params.has('paused');
 const withPanel = params.get('panel') !== '0';
 const withControls = params.get('controls') !== '0';
 const withJoints = params.has('joints');
+const CAPACITY = Number(params.get('capacity') ?? 0);
+const RING = Number(params.get('ring') ?? 512);
 
 const PPU = 16;
 const ARENA_HALF = 12;
@@ -16,7 +18,7 @@ const COLUMNS = 20;
 async function run() {
     const glue = await import('../sdk/typescript/wasm-st/dynova_core.js');
     const exports = await glue.default() as unknown as { memory: WebAssembly.Memory };
-    const config = { capacity: N + 8, ringCapacity: 512 };
+    const config = { capacity: Math.max(N + 8, CAPACITY), ringCapacity: RING };
     const rt = new glue.Runtime(config.capacity, config.ringCapacity);
     rt.enable_physics();
     const world = World.attachSync(config, exports.memory, 'fallback', layoutFromRuntime(rt), rt);

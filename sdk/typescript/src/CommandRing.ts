@@ -15,6 +15,9 @@ export const TAG_PAUSE = 11;
 export const TAG_JOINT_CREATE = 12;
 export const TAG_JOINT_DESTROY = 13;
 export const TAG_JOINT_MOTOR = 14;
+export const TAG_KINEMATIC_BATCH = 15;
+export const KIN_SAMPLES_PER_SLOT = 3;
+export const MAX_KIN_TICKS = 65535;
 export const HULL_VERTS_PER_SLOT = 4;
 export const MAX_HULL_VERTS = 32;
 export const MAX_HULLS = 1024;
@@ -58,6 +61,13 @@ export interface TeleportDesc {
     id: number;
     gen: number;
     x: number; y: number; z: number;
+}
+
+/** One telemetry sample: glide static body `id` to (x, y, z), arriving after `ticks` ticks. */
+export interface KinematicSample {
+    id: number; gen: number;
+    x: number; y: number; z: number;
+    ticks: number;
 }
 
 export interface JointCreateDesc {
@@ -274,6 +284,28 @@ export class CommandRing {
         this.view.setUint32(off + 1, id, true);
         this.view.setFloat32(off + 6, velocity, true);
         this.view.setFloat32(off + 10, maxForce, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    /** Writes up to `KIN_SAMPLES_PER_SLOT` samples into one slot. */
+    kinematicBatch(samples: readonly KinematicSample[]): boolean {
+        if (samples.length < 1 || samples.length > KIN_SAMPLES_PER_SLOT) throw new RangeError(`a slot holds 1..${KIN_SAMPLES_PER_SLOT} kinematic samples, got ${samples.length}`);
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_KINEMATIC_BATCH);
+        this.view.setUint8(off + 1, samples.length);
+        samples.forEach((s, k) => {
+            const o = off + 4 + k * 20;
+            this.view.setUint32(o, s.id, true);
+            this.view.setUint8(o + 4, s.gen);
+            this.view.setUint16(o + 6, s.ticks, true);
+            this.view.setFloat32(o + 8, s.x, true);
+            this.view.setFloat32(o + 12, s.y, true);
+            this.view.setFloat32(o + 16, s.z, true);
+        });
         Atomics.add(this.tail, 0, 1);
         return true;
     }

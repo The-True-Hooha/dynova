@@ -16,6 +16,7 @@ pub struct PhysicsSnapshot {
     contacts: Vec<Contact>,
     warm_cache: Vec<WarmEntry>,
     joints: Vec<Joint>,
+    kin: Vec<Kin>,
     gravity: [f32; 3],
 }
 
@@ -49,6 +50,7 @@ impl PhysicsWorld {
             contacts: self.contacts.clone(),
             warm_cache: self.warm_cache.clone(),
             joints: self.joints.clone(),
+            kin: self.kin.clone(),
             gravity: [self.gx, self.gy, self.gz],
         }
     }
@@ -85,6 +87,7 @@ impl PhysicsWorld {
         self.contacts.extend_from_slice(&s.contacts);
         self.warm_cache.clone_from(&s.warm_cache);
         self.joints.clone_from(&s.joints);
+        self.kin.clone_from(&s.kin);
         [self.gx, self.gy, self.gz] = s.gravity;
         true
     }
@@ -98,7 +101,7 @@ impl PhysicsSnapshot {
     pub fn hash(&self) -> u64 {
         let cols: Vec<&[f32]> = self.f32_cols.iter().map(|c| c.as_slice()).collect();
         hash_state(self.capacity, &cols, &self.hull_of, &self.island_of, &self.shape,
-            [&self.flags[0], &self.flags[1], &self.flags[2], &self.flags[3]], &self.contacts, &self.warm_cache, &self.joints, self.gravity)
+            [&self.flags[0], &self.flags[1], &self.flags[2], &self.flags[3]], &self.contacts, &self.warm_cache, &self.joints, &self.kin, self.gravity)
     }
 
     /// Heap bytes held, so a keyframe store can bound its memory.
@@ -107,6 +110,7 @@ impl PhysicsSnapshot {
             + self.contacts.len() * std::mem::size_of::<Contact>()
             + self.warm_cache.len() * std::mem::size_of::<WarmEntry>()
             + self.joints.len() * std::mem::size_of::<Joint>()
+            + self.kin.len() * std::mem::size_of::<Kin>()
     }
 }
 
@@ -115,7 +119,7 @@ impl PhysicsWorld {
     pub fn state_hash(&self) -> u64 {
         let cols: Vec<&[f32]> = self.f32_cols().iter().map(|c| c.as_slice()).collect();
         hash_state(self.capacity, &cols, &self.hull_of, &self.island_of, &self.shape,
-            [&self.active, &self.sleeping, &self.touching, &self.penetrating], &self.contacts, &self.warm_cache, &self.joints, [self.gx, self.gy, self.gz])
+            [&self.active, &self.sleeping, &self.touching, &self.penetrating], &self.contacts, &self.warm_cache, &self.joints, &self.kin, [self.gx, self.gy, self.gz])
     }
 }
 
@@ -153,6 +157,7 @@ fn hash_state(
     contacts: &[Contact],
     warm_cache: &[WarmEntry],
     joints: &[Joint],
+    kin: &[Kin],
     gravity: [f32; 3],
 ) -> u64 {
     let d = slot_defaults();
@@ -186,6 +191,14 @@ fn hash_state(
         }
         h.word(j.motor_vel.to_bits() as u64);
         h.word(j.motor_max.to_bits() as u64);
+        slots = slots.wrapping_add(h.finish());
+    }
+    // Same reason: a world with no kinematic target in flight hashes as before.
+    for k in kin {
+        let mut h = Fnv::new();
+        h.word(k.id as u64);
+        h.word(k.remaining as u64);
+        for v in k.step.iter().chain(&k.to) { h.word(v.to_bits() as u64); }
         slots = slots.wrapping_add(h.finish());
     }
     let mut h = Fnv::new();

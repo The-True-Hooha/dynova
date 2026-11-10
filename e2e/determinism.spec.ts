@@ -44,3 +44,14 @@ test('a 1230-tick joint scene (chain, limited door, motor wheel and slider, weld
     expect(r.error).toBeUndefined();
     expect(r.jointScene).toEqual(HOST_JOINT_SCENE);
 });
+
+// Pinned from core/src/determinism.rs `KIN_PINNED_END` and `KIN_PINNED_MIDDLE`.
+const HOST_KINEMATIC_SCENE = ['637658996748191174', '17987134958895714485', '17987134958895714485', '637658996748191174'];
+
+test('a 700-tick kinematic scene (platform, wall and joint anchor fed by samples, rejected samples) and its seek round trip match the native build in this browser', async ({ page }) => {
+    await page.goto('/determinism.html');
+    await page.waitForFunction(() => (window as any).__result !== undefined, null, { timeout: 30_000 });
+    const r = await page.evaluate(() => (window as any).__result);
+    expect(r.error).toBeUndefined();
+    expect(r.kinematicScene).toEqual(HOST_KINEMATIC_SCENE);
+});

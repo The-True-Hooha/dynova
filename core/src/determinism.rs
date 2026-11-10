@@ -2,7 +2,7 @@
 //! needs continuous collision, forces, teleports, destroy and respawn, gravity changes) plus a record/seek round trip, run from one
 //! seed so the native build and every browser can be compared hash for hash (Stage 5A, `docs/decisions/determinism.md`).
 
-use crate::command_ring::Command;
+use crate::command_ring::{Command, KinSample};
 use crate::physics::{BodyDesc, JointDesc, JOINT_BALL, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER};
 use crate::runtime::Runtime;
 
@@ -83,24 +83,28 @@ fn script(rt: &mut Runtime, t: u32) {
 
 /// Live hash at the end, live hash at the middle tick, the middle tick again after a seek, the end after seeking back.
 pub fn run_scene() -> [u64; 4] {
-    let mut rt = Runtime::new(CAPACITY, 1024);
+    run_recorded(CAPACITY, build, script, TICKS, MIDDLE)
+}
+
+fn run_recorded(capacity: u32, build: fn(&mut Runtime), script: fn(&mut Runtime, u32), ticks: u32, middle_tick: u32) -> [u64; 4] {
+    let mut rt = Runtime::new(capacity, 1024);
     rt.enable_physics();
     build(&mut rt);
     rt.ring.push(&Command::Record { on: true });
     rt.step();
     let first = rt.tick();
     let mut middle = 0;
-    for t in 0..TICKS {
+    for t in 0..ticks {
         script(&mut rt, t);
         rt.step();
-        if rt.tick() == first + MIDDLE {
+        if rt.tick() == first + middle_tick {
             middle = rt.state_hash().unwrap_or(0);
         }
     }
     let end_tick = rt.tick();
     let live_end = rt.state_hash().unwrap_or(0);
     rt.ring.push(&Command::Pause { on: true });
-    rt.ring.push(&Command::Seek { tick: first + MIDDLE });
+    rt.ring.push(&Command::Seek { tick: first + middle_tick });
     rt.step();
     let replay_middle = rt.state_hash().unwrap_or(0);
     rt.ring.push(&Command::Seek { tick: end_tick });
@@ -168,29 +172,56 @@ fn joint_script(rt: &mut Runtime, t: u32) {
 
 /// Same four values as `run_scene`, for the joint world.
 pub fn run_joint_scene() -> [u64; 4] {
-    let mut rt = Runtime::new(128, 1024);
-    rt.enable_physics();
-    build_joints(&mut rt);
-    rt.ring.push(&Command::Record { on: true });
-    rt.step();
-    let first = rt.tick();
-    let mut middle = 0;
-    for t in 0..JOINT_TICKS {
-        joint_script(&mut rt, t);
-        rt.step();
-        if rt.tick() == first + JOINT_MIDDLE {
-            middle = rt.state_hash().unwrap_or(0);
-        }
+    run_recorded(128, build_joints, joint_script, JOINT_TICKS, JOINT_MIDDLE)
+}
+
+pub const KIN_TICKS: u32 = 700;
+pub const KIN_MIDDLE: u32 = 400;
+const PLATFORM: u32 = 0;
+const WALL_K: u32 = 1;
+const ANCHOR_K: u32 = 2;
+const BOB: u32 = 3;
+const CARRIED: u32 = 4;
+const BALLS: u32 = 10;
+
+/// A platform carrying boxes, a wall shoving balls, a pendulum hung from a moving anchor (it is not held to a tight tolerance: a light bob swung over its pivot stretches the joint, see docs/joints.md), and a floor for what falls.
+fn build_kinematic(rt: &mut Runtime) {
+    rt.ring.push(&spawn(PLATFORM, 0, BodyDesc::box_at([0.0, 1.0, 0.0], [3.0, 0.25, 3.0], 0.0, 0.1)));
+    rt.ring.push(&spawn(WALL_K, 0, BodyDesc::box_at([-12.0, 1.0, 12.0], [0.25, 2.0, 4.0], 0.0, 0.1)));
+    rt.ring.push(&spawn(ANCHOR_K, 0, BodyDesc::box_at([12.0, 8.0, -8.0], [0.25; 3], 0.0, 0.0)));
+    rt.ring.push(&spawn(BOB, 0, BodyDesc::sphere_at([12.0, 7.1, -8.0], 0.3, 1.0, 0.0)));
+    rt.ring.push(&joint(0, JOINT_BALL, ANCHOR_K, BOB, [12.0, 8.0, -8.0], [0.0; 3]));
+    for i in 0..6 {
+        rt.ring.push(&spawn(CARRIED + i, 0, BodyDesc::box_at([(i as f32 - 2.5) * 0.9, 1.6, (i % 2) as f32 * 0.8 - 0.4], [0.3; 3], 1.0, 0.1)));
+        rt.ring.push(&spawn(BALLS + i, 0, BodyDesc::sphere_at([-9.0 + i as f32 * 1.0, 0.5, 12.0 + (i % 3) as f32 * 0.9 - 0.9], 0.4, 1.0, 0.2)));
     }
-    let end_tick = rt.tick();
-    let live_end = rt.state_hash().unwrap_or(0);
-    rt.ring.push(&Command::Pause { on: true });
-    rt.ring.push(&Command::Seek { tick: first + JOINT_MIDDLE });
-    rt.step();
-    let replay_middle = rt.state_hash().unwrap_or(0);
-    rt.ring.push(&Command::Seek { tick: end_tick });
-    rt.step();
-    [live_end, middle, replay_middle, rt.state_hash().unwrap_or(0)]
+    rt.ring.push(&spawn(40, 0, BodyDesc::box_at([0.0, -0.5, 0.0], [40.0, 0.5, 40.0], 0.0, 0.1)));
+}
+
+fn kin(rt: &mut Runtime, samples: &[KinSample]) {
+    let mut all = [KinSample { id: 0, generation: 0, ticks: 1, to: [0.0; 3] }; 3];
+    all[..samples.len()].copy_from_slice(samples);
+    rt.ring.push(&Command::KinematicBatch { count: samples.len() as u8, samples: all });
+}
+
+/// Keyframes fall every 60 ticks: the samples at 370 and 385 lie between the keyframe at tick 360 and the middle seek, and the one at 690
+/// between the keyframe at tick 660 and the end, so both seeks must replay kinematic samples (385 holds two rejected ones).
+fn kinematic_script(rt: &mut Runtime, t: u32) {
+    let s = |id, ticks, to| KinSample { id, generation: 0, ticks, to };
+    match t {
+        30 => kin(rt, &[s(PLATFORM, 120, [6.0, 1.0, 0.0]), s(WALL_K, 200, [-2.0, 1.0, 12.0]), s(ANCHOR_K, 100, [4.0, 8.0, -8.0])]),
+        170 => kin(rt, &[s(PLATFORM, 60, [6.0, 3.0, 4.0]), s(ANCHOR_K, 120, [4.0, 8.0, -4.0])]),
+        370 => kin(rt, &[s(PLATFORM, 30, [-4.0, 1.0, 4.0]), s(ANCHOR_K, 180, [10.0, 8.0, -4.0])]),
+        385 => kin(rt, &[s(PLATFORM, 10, [-6.0, 1.0, 4.0]), s(BOB, 4, [0.0; 3]), s(7, 5, [0.0; 3])]),
+        500 => { rt.ring.push(&Command::Teleport { id: BALLS + 5, generation: 0, x: 0.0, y: 6.0, z: -3.0 }); }
+        690 => kin(rt, &[s(PLATFORM, 20, [0.0, 1.0, 0.0])]),
+        _ => {}
+    }
+}
+
+/// The same four values for the kinematic world.
+pub fn run_kinematic_scene() -> [u64; 4] {
+    run_recorded(64, build_kinematic, kinematic_script, KIN_TICKS, KIN_MIDDLE)
 }
 
 #[cfg(test)]
@@ -313,6 +344,47 @@ mod tests {
         assert_eq!(rt.joint_count(), 8, "joint 3 destroyed by command, the weld removed with its body");
         assert_eq!(rt.stale_dropped() + rt.malformed_dropped(), 0);
     }
+
+    #[test]
+    fn a_seek_reproduces_the_live_hash_of_the_kinematic_scene_and_the_run_is_deterministic_and_pinned() {
+        let first = run_kinematic_scene();
+        let [live_end, live_mid, replay_mid, replay_end] = first;
+        assert_ne!(live_mid, 0);
+        assert_eq!(replay_mid, live_mid, "the middle tick after a seek");
+        assert_eq!(replay_end, live_end, "the end after seeking back");
+        assert_ne!(live_mid, live_end);
+        assert_eq!(first, run_kinematic_scene());
+        assert_eq!(live_end, KIN_PINNED_END, "update the pin and docs/decisions/determinism.md together if the solver changed on purpose");
+        assert_eq!(live_mid, KIN_PINNED_MIDDLE);
+    }
+
+    #[test]
+    fn the_kinematic_scene_carries_pushes_and_drags_and_counts_its_two_rejected_samples() {
+        let mut rt = Runtime::new(64, 1024);
+        rt.enable_physics();
+        build_kinematic(&mut rt);
+        rt.step();
+        let rest = |rt: &Runtime, id: u32| rt.physics_position(id as usize).unwrap();
+        let (box_start, ball_start) = (rest(&rt, CARRIED + 2), rest(&rt, BALLS + 2));
+        let bob_start = rest(&rt, BOB);
+        for t in 0..KIN_TICKS {
+            kinematic_script(&mut rt, t);
+            rt.step();
+            if t == 150 {
+                let moved = rest(&rt, CARRIED + 2)[0] - box_start[0];
+                assert!(moved > 4.0, "a box on the platform rode it six metres right: {moved}");
+                assert!(rest(&rt, PLATFORM)[0] > 5.9);
+            }
+        }
+        assert!(rest(&rt, BALLS + 2)[0] - ball_start[0] > 4.0, "the wall shoved the balls along: {:?}", rest(&rt, BALLS + 2));
+        let bob = rest(&rt, BOB);
+        assert!(bob.iter().all(|c| c.is_finite()) && (bob[0] - bob_start[0]).abs() + (bob[2] - bob_start[2]).abs() > 1.0, "the bob hanging from the gliding anchor was dragged along: {bob:?}");
+        assert_eq!(rt.malformed_dropped(), 2, "a sample aimed at a dynamic body, twice");
+        assert_eq!(rt.stale_dropped(), 0);
+    }
+
+    const KIN_PINNED_END: u64 = 637658996748191174;
+    const KIN_PINNED_MIDDLE: u64 = 17987134958895714485;
 
     const JOINT_PINNED_END: u64 = 15756670485398854027;
     const JOINT_PINNED_MIDDLE: u64 = 13638603286812908320;

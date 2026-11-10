@@ -63,6 +63,12 @@ pub fn determinism_joint_scene() -> Vec<u64> {
     determinism::run_joint_scene().to_vec()
 }
 
+/// The same four values for the kinematic world (moving platform, wall and joint anchor fed by telemetry samples).
+#[wasm_bindgen]
+pub fn determinism_kinematic_scene() -> Vec<u64> {
+    determinism::run_kinematic_scene().to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

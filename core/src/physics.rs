@@ -2,8 +2,10 @@ use crate::collision::{self as geo, Manifold};
 use crate::hull::{self, HullData, MAX_HULLS};
 
 mod joints;
+mod kinematic;
 mod snapshot;
 pub(crate) use snapshot::Fnv;
+pub use kinematic::{Kin, MAX_KIN_TICKS};
 pub use joints::{Joint, JointDesc, MAX_JOINTS, JOINT_BALL, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER, MAX_JOINT_ID};
 pub use snapshot::PhysicsSnapshot;
 
@@ -85,6 +87,7 @@ pub struct PhysicsWorld {
     pub contacts: Vec<Contact>,
     warm_cache: Vec<WarmEntry>,
     pub joints: Vec<Joint>,
+    pub kin: Vec<Kin>,
     joint_prep: Vec<joints::Prepared>,
     jointed: Vec<u8>,
     pub bucket_counts: Vec<u32>,
@@ -207,6 +210,7 @@ impl PhysicsWorld {
             contacts: Vec::with_capacity(MIN_MAX_CONTACTS),
             warm_cache: Vec::new(),
             joints: Vec::new(),
+            kin: Vec::new(),
             joint_prep: Vec::new(),
             jointed: Vec::new(),
             bucket_counts: vec![0u32; bucket_count_for(capacity)],
@@ -296,6 +300,7 @@ impl PhysicsWorld {
         self.penetrating[id] = false;
         self.forget_pairs(id as u32);
         self.drop_joints_of(id as u32);
+        self.drop_kin(id);
     }
 
     pub fn deactivate(&mut self, id: usize) {
@@ -304,6 +309,7 @@ impl PhysicsWorld {
         self.wake_touching(id);
         self.forget_pairs(id as u32);
         self.drop_joints_of(id as u32);
+        self.drop_kin(id);
     }
 
     /// Moves a body and clears its motion. Sleepers resting on its old position lose their support, so they wake.
@@ -317,6 +323,7 @@ impl PhysicsWorld {
         self.touching[id] = false;
         self.penetrating[id] = false;
         self.forget_pairs(id as u32);
+        self.drop_kin(id);
         // A static body generates no pairs, so a sleeper under its new position would stay embedded unless woken here.
         self.wake_touching(id);
     }
@@ -365,6 +372,7 @@ impl PhysicsWorld {
                 }
             }
         }
+        self.begin_kinematic();
         for i in 0..cap {
             if !self.active[i] || self.inv_mass[i] == 0.0 || self.sleeping[i] { continue; }
             let vsq = self.vel_x[i]*self.vel_x[i] + self.vel_y[i]*self.vel_y[i] + self.vel_z[i]*self.vel_z[i];
@@ -518,6 +526,16 @@ impl PhysicsWorld {
             [self.qx[i], self.qy[i], self.qz[i], self.qw[i]] = q;
         }
 
+        let moved = self.advance_kinematic();
+        // The check before the solver used the old position, and a body that arrives this tick is not checked again, so a sleeper it
+        // landed on would stay embedded.
+        if !moved.is_empty() {
+            let mut islands = Vec::new();
+            self.sleepers_near_kinematics(&moved, false, &mut islands);
+            for i in 0..self.capacity {
+                if self.sleeping[i] && islands.contains(&self.island_of[i]) { self.wake(i); }
+            }
+        }
         self.touching.fill(false);
         self.penetrating.fill(false);
         // A joint holds a body like a contact does, so a hanging body counts as supported and may sleep.
@@ -765,6 +783,10 @@ impl PhysicsWorld {
 
     fn wake_disturbed_sleepers(&mut self) -> bool {
         let mut islands: Vec<u32> = Vec::new();
+        if !self.kin.is_empty() {
+            let ids: Vec<u32> = self.kin.iter().map(|k| k.id).collect();
+            self.sleepers_near_kinematics(&ids, true, &mut islands);
+        }
         for ci in 0..self.contacts.len() {
             let (a, b) = (self.contacts[ci].a as usize, self.contacts[ci].b as usize);
             // `a` is always the awake body that generated the pair; only `b` can be a sleeper.
@@ -780,6 +802,45 @@ impl PhysicsWorld {
             if self.sleeping[i] && islands.contains(&self.island_of[i]) { self.wake(i); }
         }
         true
+    }
+
+    /// A moving kinematic body generates no contacts of its own (only awake dynamic bodies do), so a sleeper it runs into must be found here.
+    /// `by_joint` also wakes bodies held to a moving body by a joint, which would otherwise sleep through the move.
+    fn sleepers_near_kinematics(&self, ids: &[u32], by_joint: bool, islands: &mut Vec<u32>) {
+        if by_joint {
+            for j in &self.joints {
+                for (moving, other) in [(j.a, j.b), (j.b, j.a)] {
+                    if self.sleeping[other as usize] && ids.binary_search(&moving).is_ok() && !islands.contains(&self.island_of[other as usize]) {
+                        islands.push(self.island_of[other as usize]);
+                    }
+                }
+            }
+        }
+        for &id in ids {
+            let i = id as usize;
+            let mut touch = |j: usize| {
+                if j == i || !self.sleeping[j] { return; }
+                let (dx, dy, dz) = (self.pos_x[i] - self.pos_x[j], self.pos_y[i] - self.pos_y[j], self.pos_z[i] - self.pos_z[j]);
+                let reach = self.reach[i] + self.reach[j] + BROAD_EPS;
+                if dx * dx + dy * dy + dz * dz <= reach * reach && !islands.contains(&self.island_of[j]) {
+                    islands.push(self.island_of[j]);
+                }
+            };
+            if 2.0 * self.reach[i] > self.cell_size {
+                (0..self.capacity).for_each(&mut touch);
+                continue;
+            }
+            // Bodies wider than a cell are kept out of the grid, so the cells never list them.
+            self.big_dynamics.iter().for_each(|&j| touch(j as usize));
+            let (cells, ncells) = self.neighbor_cells(self.pos_x[i], self.pos_y[i], self.pos_z[i]);
+            for &cell in &cells[..ncells] {
+                let mut j = self.cell_heads[cell];
+                while j >= 0 {
+                    touch(j as usize);
+                    j = self.cell_next[j as usize];
+                }
+            }
+        }
     }
 
     fn wake(&mut self, id: usize) {
