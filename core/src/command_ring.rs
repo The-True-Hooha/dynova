@@ -625,6 +625,25 @@ mod tests {
     }
 
     #[test]
+    fn wire_tags_are_pinned_to_the_values_the_typescript_ring_writes() {
+        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let mut ring = CommandRing::new(8);
+        raw_slot(&mut ring, |b| { b[0] = 8; b[OFF_ID] = 3; b[OFF_GEN] = 2; b[OFF_POS..OFF_POS + 4].copy_from_slice(&1.5f32.to_le_bytes()); });
+        raw_slot(&mut ring, |b| { b[0] = 9; b[OFF_POS] = 1; });
+        raw_slot(&mut ring, |b| { b[0] = 10; b[OFF_ID] = 7; });
+        raw_slot(&mut ring, |b| { b[0] = 11; });
+        let mut out = Vec::new();
+        ring.drain_commands(8, &mut out);
+        assert_eq!(out, vec![
+            Command::Teleport { id: 3, generation: 2, x: 1.5, y: 0.0, z: 0.0 },
+            Command::Record { on: true },
+            Command::Seek { tick: 7 },
+        ]);
+        assert_eq!(ring.malformed_dropped(), 1, "tag 11 is not assigned");
+    }
+
+    #[test]
     fn gravity_round_trips_and_rejects_hostile_values() {
         let mut ring = CommandRing::new(8);
         let g = Command::Gravity { x: 0.0, y: -9.81, z: 0.0 };

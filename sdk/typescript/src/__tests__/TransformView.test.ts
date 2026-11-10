@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import * as tv from '../TransformView.js';
 import { TransformView, H_EPOCH, H_STATE, H_TICKS, H_STALE, H_MALFORMED, H_BUCKETS, H_BUCKET_LEN, FLOATS_PER_TRANSFORM } from '../TransformView.js';
 import { FakeRuntime } from './helpers.js';
 
@@ -217,3 +218,16 @@ describe('TransformView (triple buffer reader)', () => {
     });
 });
 
+
+describe('shared header layout', () => {
+    // The same literal table is asserted in core/src/runtime.rs (header_word_indices_and_size_are_pinned).
+    it('matches the word indices and size the Rust runtime publishes', () => {
+        expect([
+            tv.H_EPOCH, tv.H_STATE, tv.H_TICKS, tv.H_STALE, tv.H_MALFORMED, tv.H_BUCKETS, tv.H_BUCKET_LEN,
+            tv.H_INSPECT_SEQ, tv.H_INSPECT_BODIES, tv.H_INSPECT_CONTACTS, tv.H_INSPECT_CONTACT_N,
+            tv.H_STEP_LAST_US, tv.H_STEP_TOTAL_US, tv.H_INSPECT_TICK, tv.H_INSPECT_ON,
+            tv.H_REC_ON, tv.H_REC_START, tv.H_REC_END, tv.H_HASH_LO, tv.H_HASH_HI, tv.H_KEYFRAMES,
+        ]).toEqual([0, 5, 7, 8, 9, 10, 11, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]);
+        expect(tv.HEADER_WORDS).toBe(30);
+    });
+});

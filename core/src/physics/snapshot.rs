@@ -115,7 +115,29 @@ impl PhysicsWorld {
     }
 }
 
-/// FNV-1a over the raw bit patterns, so two states hash alike exactly when every stored value is bit-identical.
+struct SlotDefaults {
+    f32_bits: [u32; F32_COLUMNS],
+    hull_of: u32,
+    island_of: u32,
+    shape: u8,
+}
+
+fn slot_defaults() -> &'static SlotDefaults {
+    static DEFAULTS: std::sync::OnceLock<SlotDefaults> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        let w = PhysicsWorld::new(1);
+        SlotDefaults {
+            f32_bits: std::array::from_fn(|k| w.f32_cols()[k][0].to_bits()),
+            hull_of: w.hull_of[0],
+            island_of: w.island_of[0],
+            shape: w.shape[0],
+        }
+    })
+}
+
+/// FNV-1a over the raw bit patterns: states that differ in a hashed field hash differently (up to a 64-bit
+/// collision). Slots still in their never-spawned state are skipped and the slot hashes are summed, so the value
+/// does not depend on the capacity, which only ever grows; the hull table, `dt` and diagnostic counters are not hashed.
 #[allow(clippy::too_many_arguments)]
 fn hash_state(
     capacity: usize,
@@ -128,16 +150,26 @@ fn hash_state(
     warm_cache: &[WarmEntry],
     gravity: [f32; 3],
 ) -> u64 {
+    let d = slot_defaults();
+    let mut slots = 0u64;
+    for i in 0..capacity {
+        let untouched = f32_cols.iter().zip(&d.f32_bits).all(|(c, b)| c[i].to_bits() == *b)
+            && hull_of[i] == d.hull_of
+            && island_of[i] == d.island_of
+            && shape[i] == d.shape
+            && flags.iter().all(|f| !f[i]);
+        if untouched { continue; }
+        let mut h = Fnv::new();
+        h.word(i as u64);
+        for col in f32_cols { h.word(col[i].to_bits() as u64); }
+        h.word(hull_of[i] as u64);
+        h.word(island_of[i] as u64);
+        h.word(shape[i] as u64);
+        for f in flags { h.word(f[i] as u64); }
+        slots = slots.wrapping_add(h.finish());
+    }
     let mut h = Fnv::new();
-    h.word(capacity as u64);
-    for col in f32_cols {
-        for v in *col { h.word(v.to_bits() as u64); }
-    }
-    for v in hull_of.iter().chain(island_of) { h.word(*v as u64); }
-    for v in shape { h.word(*v as u64); }
-    for flag in flags {
-        for v in flag { h.word(*v as u64); }
-    }
+    h.word(slots);
     h.word(contacts.len() as u64);
     for c in contacts {
         h.word(c.a as u64);
@@ -281,5 +313,64 @@ mod tests {
         assert_eq!(grown.capacity, 8);
         assert_eq!(grown.pos_x.len(), 8);
         assert_eq!(grown.qw[7], 1.0);
+    }
+
+    #[test]
+    fn every_contact_warm_and_gravity_field_reaches_the_hash() {
+        type Mutation = Box<dyn Fn(&mut PhysicsWorld)>;
+        macro_rules! contact { ($f:ident, $v:expr) => { Box::new(|w: &mut PhysicsWorld| w.contacts[0].$f = $v) as Mutation } }
+        macro_rules! warm { ($f:ident, $v:expr) => { Box::new(|w: &mut PhysicsWorld| { w.warm_cache.push(WarmEntry { a: 0, b: 1, k: 0, lambda: 0.0, lt1: 0.0, lt2: 0.0 }); w.warm_cache[0].$f = $v }) as Mutation } }
+        let mutations: Vec<(&str, Mutation)> = vec![
+            ("a", contact!(a, 5)), ("b", contact!(b, 5)), ("key", contact!(key, 9)),
+            ("nx", contact!(nx, 9.0)), ("ny", contact!(ny, 9.0)), ("nz", contact!(nz, 9.0)),
+            ("depth", contact!(depth, 9.0)), ("rax", contact!(rax, 9.0)), ("ray", contact!(ray, 9.0)), ("raz", contact!(raz, 9.0)),
+            ("rbx", contact!(rbx, 9.0)), ("rby", contact!(rby, 9.0)), ("rbz", contact!(rbz, 9.0)),
+            ("lambda", contact!(lambda, 9.0)), ("lt1", contact!(lt1, 9.0)), ("mu", contact!(mu, 9.0)),
+            ("warm a", warm!(a, 5)), ("warm b", warm!(b, 5)), ("warm k", warm!(k, 5)),
+            ("warm lambda", warm!(lambda, 9.0)), ("warm lt1", warm!(lt1, 9.0)), ("warm lt2", warm!(lt2, 9.0)),
+            ("gx", Box::new(|w| w.gx = 3.0)), ("gy", Box::new(|w| w.gy = 3.0)), ("gz", Box::new(|w| w.gz = 3.0)),
+        ];
+        let want = world().capture().hash();
+        for (name, mutate) in mutations {
+            let mut w = world();
+            mutate(&mut w);
+            assert_ne!(w.capture().hash(), want, "{name} does not reach the hash");
+        }
+    }
+
+    #[test]
+    fn the_hash_does_not_depend_on_capacity_only_on_what_was_touched() {
+        let small = world();
+        let mut grown = world();
+        grown.resize(64);
+        assert_eq!(small.capture().hash(), grown.capture().hash());
+        let mut direct = PhysicsWorld::new(64);
+        direct.spawn(0, &BodyDesc::box_at([0.0, -0.5, 0.0], [10.0, 0.5, 10.0], 0.0, 0.0));
+        direct.spawn(1, &BodyDesc::box_at([0.0, 0.48, 0.0], [0.5; 3], 1.0, 0.0));
+        for _ in 0..3 { direct.step(); }
+        assert_eq!(small.capture().hash(), direct.capture().hash());
+        assert_eq!(PhysicsWorld::new(8).capture().hash(), PhysicsWorld::new(4096).capture().hash());
+        direct.pos_x[40] = 1.0;
+        assert_ne!(small.capture().hash(), direct.capture().hash(), "a touched slot beyond the small capacity still counts");
+    }
+
+    #[test]
+    fn a_snapshot_one_slot_bigger_than_the_world_is_rejected_and_an_equal_one_fits() {
+        let mut w = PhysicsWorld::new(4);
+        assert!(!w.restore(&PhysicsWorld::new(5).capture()));
+        assert!(w.restore(&PhysicsWorld::new(4).capture()));
+    }
+
+    #[test]
+    fn approx_bytes_counts_every_slot_contact_and_warm_entry() {
+        let per_slot = F32_COLUMNS * 4 + 4 + 4 + 1 + 4;
+        assert_eq!(PhysicsWorld::new(8).capture().approx_bytes(), 8 * per_slot);
+        let mut w = world();
+        let base = w.capture().approx_bytes();
+        let contacts = w.contacts.len();
+        assert!(contacts > 0);
+        assert_eq!(base, 8 * per_slot + contacts * std::mem::size_of::<Contact>() + w.warm_cache.len() * std::mem::size_of::<WarmEntry>());
+        w.warm_cache.push(WarmEntry { a: 0, b: 1, k: 0, lambda: 1.0, lt1: 0.0, lt2: 0.0 });
+        assert_eq!(w.capture().approx_bytes(), base + std::mem::size_of::<WarmEntry>());
     }
 }

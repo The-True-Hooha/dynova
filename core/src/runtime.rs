@@ -2,8 +2,8 @@ use crate::collision::V3;
 use crate::command_ring::{Command, CommandRing, MAX_CAPACITY};
 use crate::hull::{HullData, MAX_HULL_VERTS};
 use crate::inspector::Inspector;
-use crate::recorder::Recorder;
 use crate::physics::{BodyDesc, Fnv, PhysicsSnapshot, PhysicsWorld, SHAPE_HULL};
+use crate::recorder::Recorder;
 use crate::transform_buffers::{Transform, TransformBuffers, INITIAL_STATE};
 use std::sync::atomic::{AtomicU32, Ordering};
 use wasm_bindgen::prelude::*;
@@ -187,7 +187,7 @@ impl Runtime {
             }
             let keep = self.recorder.is_some() && Recorder::loggable(&cmd);
             let copy = keep.then(|| cmd.clone());
-            if let (true, Some(c)) = (self.apply_command(cmd, false), copy) {
+            if let (true, Some(c)) = (self.apply_command(cmd), copy) {
                 to_log.push((self.head, c));
             }
         }
@@ -227,7 +227,8 @@ impl Runtime {
     }
 }
 
-/// Complete simulation state at a tick boundary: restoring it and stepping must match a run that never stopped.
+/// Everything a step reads from earlier steps except the hull table (immutable, never removed), the ring and the id
+/// counter: restoring it and stepping must match a run that never stopped.
 pub struct RuntimeSnapshot {
     physics: PhysicsSnapshot,
     generations: Vec<u8>,
@@ -244,11 +245,20 @@ impl RuntimeSnapshot {
     }
 }
 
+/// Slots never touched (generation 0, not live) are skipped so the value does not depend on the capacity.
 fn runtime_hash(physics: u64, generations: &[u8], live: &[bool]) -> u64 {
+    let mut slots = 0u64;
+    for (i, (g, l)) in generations.iter().zip(live).enumerate() {
+        if *g == 0 && !*l { continue; }
+        let mut h = Fnv::new();
+        h.word(i as u64);
+        h.word(*g as u64);
+        h.word(*l as u64);
+        slots = slots.wrapping_add(h.finish());
+    }
     let mut h = Fnv::new();
     h.word(physics);
-    for g in generations { h.word(*g as u64); }
-    for l in live { h.word(*l as u64); }
+    h.word(slots);
     h.finish()
 }
 
@@ -350,12 +360,12 @@ impl Runtime {
     }
 
     /// True when the command passed validation, so it is part of the history a replay must reproduce; a rejected
-    /// command is not, because what rejected it (hull table, capacity) is not part of a snapshot.
-    fn apply_command(&mut self, cmd: Command, replay: bool) -> bool {
-        // Replayed commands re-run through the same checks, but the ring's diagnostic counters already counted them once.
+    /// command is not, because what rejected it (hull table, capacity) is not part of a snapshot. Replay only feeds
+    /// back accepted commands, so a replayed command never touches the ring's diagnostic counters.
+    fn apply_command(&mut self, cmd: Command) -> bool {
         match cmd {
             Command::Grow { capacity } => {
-                if !self.grow_to(capacity) && !replay {
+                if !self.grow_to(capacity) {
                     self.ring.note_malformed();
                 }
                 return false;
@@ -383,17 +393,13 @@ impl Runtime {
         }
         let Some((id, generation)) = cmd.target() else { return false };
         if (id as usize) >= self.generations.len() || self.generations[id as usize] != generation {
-            if !replay {
-                self.ring.note_stale();
-            }
+            self.ring.note_stale();
             return false;
         }
         match cmd {
             Command::Spawn { body, .. } => {
                 if self.live[id as usize] || (body.shape == SHAPE_HULL && self.physics.hull(body.hull).is_none()) {
-                    if !replay {
-                        self.ring.note_malformed();
-                    }
+                    self.ring.note_malformed();
                     return false;
                 }
                 self.live[id as usize] = true;
@@ -466,14 +472,14 @@ impl Runtime {
     /// Restores the nearest keyframe and replays the log up to `target`. False, with the world untouched, when
     /// nothing is recorded or `target` is outside the recorded range.
     fn seek(&mut self, target: u32) -> bool {
-        let Some(rec) = self.recorder.take() else { return false };
+        let Some(mut rec) = self.recorder.take() else { return false };
         let done = match rec.plan(target) {
             Some((kf, cmds)) if self.restore(&kf.snapshot) => {
                 self.head = target;
                 let mut next = cmds.iter().peekable();
                 for t in kf.tick..target {
                     while let Some((_, cmd)) = next.next_if(|(key, _)| *key == t) {
-                        self.apply_command(cmd.clone(), true);
+                        self.apply_command(cmd.clone());
                     }
                     self.advance_physics();
                 }
@@ -481,6 +487,10 @@ impl Runtime {
             }
             _ => false,
         };
+        if done && target == rec.end() {
+            // Commands logged after an earlier seek to this tick were applied to the world just discarded.
+            rec.truncate_to(target);
+        }
         self.recorder = Some(rec);
         done
     }
@@ -2108,5 +2118,148 @@ mod tests {
         rt.step();
         assert_eq!((header(&rt, H_TICKS), header(&rt, H_KEYFRAMES), rt.malformed_dropped()), (t + 1, 1, 1));
         assert_eq!((header(&rt, H_REC_START), header(&rt, H_REC_END)), (t + 1, t + 1));
+    }
+
+    #[test]
+    fn header_word_indices_and_size_are_pinned() {
+        assert_eq!(
+            [H_EPOCH, H_CAPACITY, H_BUF0, H_STATE, H_GENERATIONS, H_TICKS, H_STALE, H_MALFORMED, H_BUCKETS, H_BUCKET_LEN, H_RING_PENDING,
+             H_DROPPED_CONTACTS, H_OVERRUNS, H_CONTACTS, H_INSPECT_SEQ, H_INSPECT_BODIES, H_INSPECT_CONTACTS, H_INSPECT_CONTACT_N,
+             H_STEP_LAST_US, H_STEP_TOTAL_US, H_INSPECT_TICK, H_INSPECT_ON, H_REC_ON, H_REC_START, H_REC_END, H_HASH_LO, H_HASH_HI, H_KEYFRAMES],
+            [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29],
+        );
+        assert_eq!(HEADER_WORDS, 30);
+    }
+
+    #[test]
+    fn recording_twice_keeps_the_original_range() {
+        let (mut rt, _) = recorded_run();
+        let keyframes = header(&rt, H_KEYFRAMES);
+        rt.ring.push(&Command::Record { on: true });
+        rt.step();
+        assert_eq!((header(&rt, H_REC_START), header(&rt, H_REC_END), header(&rt, H_KEYFRAMES)), (1, RUN + 1, keyframes));
+    }
+
+    #[test]
+    fn a_second_seek_to_the_tick_of_an_earlier_post_seek_command_does_not_replay_that_command() {
+        let (mut rt, _) = recorded_run();
+        rt.ring.push(&Command::Seek { tick: 105 });
+        rt.ring.push(&Command::Force { id: 2, generation: 0, x: 0.0, y: 150.0, z: 0.0 });
+        rt.step();
+        seek_to(&mut rt, 105);
+        rt.step();
+        let live = take(&rt);
+        assert_eq!(header(&rt, H_TICKS), 106);
+        seek_to(&mut rt, 1);
+        seek_to(&mut rt, 106);
+        assert_eq!((hash_header(&rt), frame_bits(&rt)), (live.hash, live.frame), "the force applied to the discarded world must not be replayed");
+    }
+
+    #[test]
+    fn a_rejected_seek_after_a_command_then_a_valid_seek_to_the_head_keeps_the_log_consistent() {
+        let (mut rt, _) = recorded_run();
+        seek_to(&mut rt, 105);
+        rt.ring.push(&Command::Force { id: 2, generation: 0, x: 0.0, y: 150.0, z: 0.0 });
+        rt.ring.push(&Command::Seek { tick: u32::MAX });
+        rt.step();
+        seek_to(&mut rt, 105);
+        rt.step();
+        let live = take(&rt);
+        seek_to(&mut rt, 1);
+        seek_to(&mut rt, 106);
+        assert_eq!((hash_header(&rt), frame_bits(&rt)), (live.hash, live.frame));
+    }
+
+    #[test]
+    fn the_state_hash_is_the_same_before_a_grow_and_in_a_replay_on_the_grown_world() {
+        let mut rt = snapshot_scene();
+        rt.ring.push(&Command::Record { on: true });
+        rt.step();
+        let mut hashes = vec![hash_header(&rt)];
+        for t in 1..=40u32 {
+            if t == 15 { rt.ring.push(&Command::Grow { capacity: 64 }); }
+            rt.step();
+            hashes.push(hash_header(&rt));
+        }
+        let base = header(&rt, H_REC_START);
+        for t in [5u32, 40, 14, 15, 16, 0] {
+            seek_to(&mut rt, base + t);
+            assert_eq!(hash_header(&rt), hashes[t as usize], "hash at recorded offset {t}");
+        }
+    }
+
+    #[test]
+    fn a_burst_of_commands_forces_a_keyframe_off_the_interval() {
+        let mut rt = Runtime::new(16, 8192);
+        rt.enable_physics();
+        rt.ring.push(&Command::Record { on: true });
+        rt.ring.push(&floor());
+        rt.step();
+        assert_eq!(header(&rt, H_KEYFRAMES), 1);
+        for _ in 0..4096 { rt.ring.push(&Command::Force { id: 0, generation: 0, x: 0.0, y: 1.0, z: 0.0 }); }
+        rt.step();
+        assert_ne!(header(&rt, H_TICKS) % 60, 0);
+        assert_eq!(header(&rt, H_KEYFRAMES), 2);
+        rt.step();
+        assert_eq!(header(&rt, H_KEYFRAMES), 2);
+    }
+
+    #[test]
+    fn a_small_byte_budget_evicts_old_keyframes_and_moves_the_start_through_the_runtime() {
+        let mut rt = snapshot_scene();
+        let one = rt.capture().unwrap().approx_bytes();
+        rt.recorder = Some(Recorder::with_budget(one * 2 + 4096));
+        rt.ring.push(&Command::Record { on: true });
+        let first = header(&rt, H_TICKS) + 1;
+        for _ in 0..400 { rt.step(); }
+        let (start, end) = (header(&rt, H_REC_START), header(&rt, H_REC_END));
+        assert!(start > first, "the first keyframes were evicted: start {start}");
+        assert!(header(&rt, H_KEYFRAMES) < 1 + 400 / 60, "unbounded would hold 7: {}", header(&rt, H_KEYFRAMES));
+        let live = take(&rt);
+        seek_to(&mut rt, start);
+        assert_eq!(header(&rt, H_TICKS), start);
+        seek_to(&mut rt, start - 1);
+        assert_eq!(header(&rt, H_TICKS), start, "before the retained range is rejected");
+        seek_to(&mut rt, end);
+        assert_eq!((hash_header(&rt), frame_bits(&rt)), (live.hash, live.frame));
+    }
+
+    #[test]
+    fn recording_off_while_rewound_keeps_stepping_live_and_clears_the_words() {
+        let (mut rt, _) = recorded_run();
+        seek_to(&mut rt, 100);
+        rt.ring.push(&Command::Record { on: false });
+        rt.step();
+        assert_eq!(header(&rt, H_TICKS), 101);
+        for w in [H_REC_ON, H_REC_START, H_REC_END, H_HASH_LO, H_HASH_HI, H_KEYFRAMES] {
+            assert_eq!(header(&rt, w), 0);
+        }
+    }
+
+    #[test]
+    fn a_fork_shrinks_the_published_range_and_keyframe_count() {
+        let (mut rt, _) = recorded_run();
+        assert_eq!(header(&rt, H_KEYFRAMES), 5);
+        seek_to(&mut rt, 70);
+        assert_eq!((header(&rt, H_REC_END), header(&rt, H_KEYFRAMES)), (RUN, 5), "seeking alone keeps the future");
+        rt.step();
+        assert_eq!((header(&rt, H_REC_START), header(&rt, H_REC_END), header(&rt, H_KEYFRAMES)), (1, 71, 2));
+    }
+
+    #[test]
+    fn a_teleport_with_extreme_id_or_generation_is_stale_not_a_panic() {
+        let mut rt = snapshot_scene();
+        rt.ring.push(&Command::Teleport { id: u32::MAX, generation: 255, x: 0.0, y: 0.0, z: 0.0 });
+        rt.ring.push(&Command::Teleport { id: 0, generation: 255, x: 0.0, y: 0.0, z: 0.0 });
+        rt.step();
+        assert_eq!(rt.stale_dropped(), 2);
+    }
+
+    #[test]
+    fn a_runtime_snapshot_counts_two_bytes_per_slot_on_top_of_the_physics_snapshot() {
+        let mut rt = Runtime::new(8, 8);
+        rt.enable_physics();
+        let s = rt.capture().unwrap();
+        assert_eq!(s.approx_bytes(), s.physics.approx_bytes() + 8 * 2);
     }
 }

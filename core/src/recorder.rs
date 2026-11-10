@@ -255,4 +255,26 @@ mod tests {
         tiny.push_keyframe(1, snap());
         assert_eq!(tiny.keyframe_count(), 1, "the newest keyframe is always kept");
     }
+
+    #[test]
+    fn a_total_exactly_at_the_budget_is_kept() {
+        let one = snap().approx_bytes();
+        let mut r = Recorder::with_budget(one * 2);
+        r.push_keyframe(0, snap());
+        r.push_keyframe(1, snap());
+        assert_eq!(r.keyframe_count(), 2);
+        r.push_keyframe(2, snap());
+        assert_eq!((r.start(), r.keyframe_count()), (1, 2));
+    }
+
+    #[test]
+    fn truncating_gives_back_the_dropped_keyframes_bytes() {
+        let one = snap().approx_bytes();
+        let mut r = Recorder::with_budget(one * 2);
+        r.push_keyframe(0, snap());
+        r.push_keyframe(1, snap());
+        r.truncate_to(0);
+        r.push_keyframe(1, snap());
+        assert_eq!(r.keyframe_count(), 2, "the forked-away keyframe no longer counts against the budget");
+    }
 }
