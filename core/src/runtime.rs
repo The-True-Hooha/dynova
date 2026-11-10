@@ -2,7 +2,7 @@ use crate::collision::V3;
 use crate::command_ring::{Command, CommandRing, MAX_CAPACITY};
 use crate::hull::{HullData, MAX_HULL_VERTS};
 use crate::inspector::Inspector;
-use crate::physics::{BodyDesc, Fnv, PhysicsSnapshot, PhysicsWorld, SHAPE_HULL};
+use crate::physics::{BodyDesc, Fnv, JointDesc, PhysicsSnapshot, PhysicsWorld, SHAPE_HULL};
 use crate::recorder::Recorder;
 use crate::transform_buffers::{Transform, TransformBuffers, INITIAL_STATE};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -446,6 +446,15 @@ impl Runtime {
                 return true;
             }
             Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. } => return false,
+            Command::JointCreate { id, gen_a, gen_b, desc } => return self.apply_joint_create(id, gen_a, gen_b, &desc),
+            Command::JointDestroy { id } => {
+                let found = self.physics_enabled && self.physics.destroy_joint(id);
+                if !found {
+                    self.ring.note_stale();
+                }
+                return found;
+            }
+            Command::JointMotor { id, vel, max } => return self.apply_joint_motor(id, vel, max),
             _ => {}
         }
         let Some((id, generation)) = cmd.target() else { return false };
@@ -478,6 +487,34 @@ impl Runtime {
             _ => {}
         }
         true
+    }
+
+    fn body_is_live(&self, id: u32, generation: u8) -> bool {
+        (id as usize) < self.generations.len() && self.generations[id as usize] == generation && self.live[id as usize]
+    }
+
+    fn apply_joint_create(&mut self, id: u32, gen_a: u8, gen_b: u8, desc: &JointDesc) -> bool {
+        if !self.body_is_live(desc.a, gen_a) || !self.body_is_live(desc.b, gen_b) {
+            self.ring.note_stale();
+            return false;
+        }
+        let ok = self.physics_enabled && self.physics.create_joint(id, desc);
+        if !ok {
+            self.ring.note_malformed();
+        }
+        ok
+    }
+
+    fn apply_joint_motor(&mut self, id: u32, vel: f32, max: f32) -> bool {
+        if !self.physics_enabled || self.physics.joint(id).is_none() {
+            self.ring.note_stale();
+            return false;
+        }
+        let ok = self.physics.set_joint_motor(id, vel, max);
+        if !ok {
+            self.ring.note_malformed();
+        }
+        ok
     }
 
     fn advance_physics(&mut self) {
@@ -2516,5 +2553,143 @@ mod tests {
         rt.ring.push(&Command::Force { id: 2, generation: 0, x: 0.0, y: 1.0, z: 0.0 });
         rt.step();
         assert_eq!((header(&rt, H_SEEKS), header(&rt, H_TICKS)), (1, 50));
+    }
+
+    fn joint_ball(a: u32, b: u32, at: V3) -> JointDesc {
+        JointDesc { kind: crate::physics::JOINT_BALL, a, b, anchor: at, axis: [0.0; 3], limits: None, motor_vel: 0.0, motor_max: 0.0 }
+    }
+
+    fn joint_hinge(a: u32, b: u32, at: V3, vel: f32, max: f32) -> JointDesc {
+        JointDesc { kind: crate::physics::JOINT_HINGE, axis: [0.0, 0.0, 1.0], motor_vel: vel, motor_max: max, ..joint_ball(a, b, at) }
+    }
+
+    fn joint_world() -> Runtime {
+        let mut rt = Runtime::new(8, 64);
+        rt.enable_physics();
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, 5.0, -3.0], [0.25; 3], 0.0, 0.0)));
+        rt.ring.push(&spawn_cmd(1, 0, BodyDesc::box_at([1.0, 5.0, 0.0], [0.5, 0.1, 0.1], 1.0, 0.0)));
+        rt.ring.push(&spawn_cmd(2, 0, BodyDesc::box_at([4.0, 9.0, 0.0], [0.25; 3], 1.0, 0.0)));
+        rt.ring.push(&spawn_cmd(3, 0, BodyDesc::box_at([8.0, 9.0, 0.0], [0.25; 3], 0.0, 0.0)));
+        rt.step();
+        rt
+    }
+
+    #[test]
+    fn a_joint_created_through_the_ring_holds_the_bodies_together() {
+        let mut rt = joint_world();
+        rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_ball(0, 1, [0.0, 5.0, 0.0]) });
+        for _ in 0..120 { rt.step(); }
+        assert_eq!(rt.physics.joints.len(), 1);
+        let p = &rt.physics;
+        let r = ((p.pos_x[1]).powi(2) + (p.pos_y[1] - 5.0).powi(2)).sqrt();
+        assert!((r - 1.0).abs() < 0.1, "arm length {r}");
+        assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (0, 0));
+    }
+
+    #[test]
+    fn joints_to_dead_or_wrong_generation_bodies_are_stale_and_invalid_ones_malformed() {
+        let mut rt = joint_world();
+        let at = [0.0, 5.0, 0.0];
+        rt.ring.push(&Command::JointCreate { id: 0, gen_a: 1, gen_b: 0, desc: joint_ball(0, 1, at) });
+        rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 7, desc: joint_ball(0, 1, at) });
+        rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_ball(0, 6, at) });
+        rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_ball(0, 99, at) });
+        rt.step();
+        assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (4, 0));
+        rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_ball(0, 3, at) });
+        rt.ring.push(&Command::JointCreate { id: 1, gen_a: 0, gen_b: 0, desc: joint_ball(0, 1, at) });
+        rt.ring.push(&Command::JointCreate { id: 1, gen_a: 0, gen_b: 0, desc: joint_ball(0, 2, at) });
+        rt.step();
+        assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (4, 2), "two static bodies and a duplicate joint id");
+        assert_eq!(rt.physics.joints.len(), 1);
+    }
+
+    #[test]
+    fn destroying_a_body_removes_its_joints_and_a_late_joint_destroy_is_counted_stale() {
+        let mut rt = joint_world();
+        rt.ring.push(&Command::JointCreate { id: 4, gen_a: 0, gen_b: 0, desc: joint_ball(0, 1, [0.0, 5.0, 0.0]) });
+        rt.step();
+        rt.ring.push(&Command::Destroy { id: 1, generation: 0 });
+        rt.step();
+        assert!(rt.physics.joints.is_empty());
+        rt.ring.push(&Command::JointDestroy { id: 4 });
+        rt.ring.push(&Command::JointMotor { id: 4, vel: 1.0, max: 1.0 });
+        rt.step();
+        assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (2, 0));
+        rt.ring.push(&spawn_cmd(1, 1, unit_box(1.0, 5.0, 0.0)));
+        rt.step();
+        assert!(rt.physics.joints.is_empty(), "the reused slot does not inherit the old joint");
+    }
+
+    #[test]
+    fn a_motor_command_drives_a_hinge_and_a_ball_joint_refuses_it() {
+        let mut rt = joint_world();
+        rt.physics.gy = 0.0;
+        rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_hinge(0, 1, [0.0, 5.0, 0.0], 0.0, 0.0) });
+        rt.ring.push(&Command::JointCreate { id: 1, gen_a: 0, gen_b: 0, desc: joint_ball(2, 3, [6.0, 9.0, 0.0]) });
+        rt.step();
+        rt.ring.push(&Command::JointMotor { id: 0, vel: 2.0, max: 1.0e4 });
+        rt.ring.push(&Command::JointMotor { id: 1, vel: 2.0, max: 1.0 });
+        for _ in 0..90 { rt.step(); }
+        assert_eq!(rt.malformed_dropped(), 1, "only the ball joint refused the motor");
+        assert!((rt.physics.ang_z[1] - 2.0).abs() < 0.2, "arm turns at {}", rt.physics.ang_z[1]);
+    }
+
+    #[test]
+    fn a_recorded_joint_run_replays_to_the_same_hash_and_frame_at_every_tick() {
+        let mut rt = Runtime::new(8, 128);
+        rt.enable_physics();
+        let mut takes = vec![Take { hash: 0, frame: Vec::new() }];
+        let total = 260u32;
+        for t in 0..total {
+            match t {
+                0 => {
+                    rt.ring.push(&Command::Record { on: true });
+                    rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, 5.0, -3.0], [0.25; 3], 0.0, 0.0)));
+                    rt.ring.push(&spawn_cmd(1, 0, BodyDesc::box_at([1.0, 5.0, 0.0], [0.5, 0.1, 0.1], 1.0, 0.0)));
+                    rt.ring.push(&spawn_cmd(2, 0, BodyDesc::box_at([2.5, 5.0, 0.0], [0.5, 0.1, 0.1], 1.0, 0.0)));
+                    rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_ball(0, 0, [0.0; 3]) });
+                }
+                1 => {
+                    rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_hinge(0, 1, [0.0, 5.0, 0.0], 0.0, 0.0) });
+                    rt.ring.push(&Command::JointCreate { id: 1, gen_a: 0, gen_b: 0, desc: joint_hinge(1, 2, [1.75, 5.0, 0.0], 0.0, 0.0) });
+                    rt.ring.push(&Command::JointCreate { id: 2, gen_a: 0, gen_b: 0, desc: joint_ball(0, 2, [0.0; 3]) });
+                }
+                40 => { rt.ring.push(&Command::JointMotor { id: 1, vel: 1.5, max: 20.0 }); }
+                90 => { rt.ring.push(&Command::JointMotor { id: 9, vel: 1.5, max: 20.0 }); }
+                120 => { rt.ring.push(&Command::JointDestroy { id: 0 }); }
+                121 => { rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_hinge(0, 1, [0.0, 5.0, 0.0], 0.0, 0.0) }); }
+                200 => { rt.ring.push(&Command::Destroy { id: 1, generation: 0 }); }
+                _ => {}
+            }
+            rt.step();
+            takes.push(take(&rt));
+        }
+        let (stale, malformed) = (rt.stale_dropped(), rt.malformed_dropped());
+        assert_eq!(malformed, 1, "the all-static joint create");
+        assert!(stale >= 1, "motor on a joint that never existed, and a joint whose body was destroyed");
+        for t in [1, 2, 41, 90, 119, 120, 121, 122, 199, 200, 201, total, 60, 61, 130, 2, total] {
+            seek_to(&mut rt, t);
+            assert_eq!(hash_header(&rt), takes[t as usize].hash, "hash at {t}");
+            assert_eq!(frame_bits(&rt), takes[t as usize].frame, "frame at {t}");
+            assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (stale, malformed), "replay re-counted at {t}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_joint_is_not_resurrected_by_a_replay() {
+        let mut rt = Runtime::new(8, 64);
+        rt.enable_physics();
+        rt.ring.push(&Command::Record { on: true });
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0; 3], [0.25; 3], 0.0, 0.0)));
+        rt.ring.push(&spawn_cmd(1, 0, BodyDesc::box_at([2.0; 3], [0.25; 3], 0.0, 0.0)));
+        rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_ball(0, 1, [1.0; 3]) });
+        for _ in 0..3 { rt.step(); }
+        assert!(rt.physics.joints.is_empty());
+        let want = rt.state_hash();
+        seek_to(&mut rt, 1);
+        seek_to(&mut rt, 3);
+        assert!(rt.physics.joints.is_empty());
+        assert_eq!(rt.state_hash(), want);
     }
 }

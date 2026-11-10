@@ -1,6 +1,6 @@
 import { HEADER_WORDS, TransformView } from './TransformView.js';
 import type { RecordingState } from './TransformView.js';
-import { CommandRing, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc } from './CommandRing.js';
+import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import type { MemoryMode } from './memory.js';
 
@@ -55,6 +55,25 @@ export interface SpawnOptions {
     hull?: number;
 }
 
+export interface JointOptions {
+    /** One of `JOINT_BALL`, `JOINT_HINGE`, `JOINT_FIXED`, `JOINT_SLIDER`. */
+    kind: number;
+    a: EntityHandle;
+    b: EntityHandle;
+    /** World-space point both bodies are pinned to at creation. */
+    anchor: readonly [number, number, number];
+    /** World-space hinge or slider axis; required for those kinds. */
+    axis?: readonly [number, number, number];
+    /** Hinge angle in radians (within +-3.1) or slider distance; only for hinge and slider. */
+    limits?: readonly [number, number];
+    /** Motor target in rad/s or m/s and the largest torque or force it may apply; only for hinge and slider. */
+    motor?: { velocity: number; maxForce: number };
+}
+
+export interface JointHandle {
+    readonly id: number;
+}
+
 export interface StepDriver {
     step(): void;
 }
@@ -75,6 +94,9 @@ type Queued =
     | { k: 'record'; on: boolean }
     | { k: 'pause'; on: boolean }
     | { k: 'seek'; tick: number }
+    | { k: 'jointCreate'; d: JointCreateDesc }
+    | { k: 'jointDestroy'; id: number }
+    | { k: 'jointMotor'; id: number; velocity: number; maxForce: number }
     | { k: 'hullVerts'; hull: number; coords: number[] }
     | { k: 'hullCommit'; hull: number; count: number };
 
@@ -104,6 +126,8 @@ export class World {
     private growths = 0;
     private pendingGrow = 0;
     private nextHull = 0;
+    /** Joint ids only grow: a seek can drop joints the SDK believes are live, and a reused id could then hit a different joint. */
+    private nextJoint = 0;
     private knownSeeks = 0;
 
     private constructor(
@@ -230,6 +254,9 @@ export class World {
             case 'record': return this.ring.record(c.on);
             case 'pause': return this.ring.pause(c.on);
             case 'seek': return this.ring.seek(c.tick);
+            case 'jointCreate': return this.ring.jointCreate(c.d);
+            case 'jointDestroy': return this.ring.jointDestroy(c.id);
+            case 'jointMotor': return this.ring.jointMotor(c.id, c.velocity, c.maxForce);
             case 'hullVerts': return this.ring.hullVerts(c.hull, c.coords);
             case 'hullCommit': return this.ring.hullCommit(c.hull, c.count);
         }
@@ -309,6 +336,53 @@ export class World {
         if (![x, y, z].every((v) => Number.isFinite(v) && Math.abs(v) <= MAX_TELEPORT_COORD)) throw new RangeError(`teleport position must be finite and within +-${MAX_TELEPORT_COORD}`);
         if (!this.ids.isLive(handle)) throw new Error(`stale handle {id: ${handle.id}, gen: ${handle.gen}}`);
         if (!this.enqueue({ k: 'teleport', d: { id: handle.id, gen: handle.gen, x, y, z } })) throw new Error('CommandRing full');
+    }
+
+    /**
+     * Pin two bodies together with a joint, using their poses at the time the command runs. At least one body must be
+     * dynamic. A joint disappears when either body is destroyed; a seek restores the joints of the target tick.
+     */
+    createJoint(o: JointOptions): JointHandle {
+        this.assertAlive();
+        const finite3 = (v: readonly number[]) => v.length === 3 && v.every(Number.isFinite);
+        if (!Number.isInteger(o.kind) || o.kind < JOINT_BALL || o.kind > JOINT_SLIDER) throw new RangeError(`unknown joint kind ${o.kind}`);
+        for (const h of [o.a, o.b]) if (!this.ids.isLive(h)) throw new Error(`stale handle {id: ${h.id}, gen: ${h.gen}}`);
+        if (o.a.id === o.b.id) throw new RangeError('a joint needs two different bodies');
+        if (!finite3(o.anchor) || o.anchor.some((v) => Math.abs(v) > MAX_TELEPORT_COORD)) throw new RangeError(`joint anchor must be finite and within +-${MAX_TELEPORT_COORD}`);
+        const axial = o.kind === JOINT_HINGE || o.kind === JOINT_SLIDER;
+        const axis = o.axis ?? [0, 0, 0];
+        if (!finite3(axis)) throw new RangeError('joint axis must be finite');
+        if (axial && !(Math.hypot(...axis) > 1e-6 && Number.isFinite(axis.reduce((sum, v) => Math.fround(sum + Math.fround(Math.fround(v) ** 2)), 0)))) throw new RangeError('hinge and slider joints need a finite, non-zero axis');
+        if (!axial && (o.limits || o.motor)) throw new RangeError('only hinge and slider joints take limits or a motor');
+        if (o.limits) {
+            const bound = o.kind === JOINT_HINGE ? MAX_ANGLE_LIMIT : MAX_LINEAR_LIMIT;
+            const [lo, hi] = o.limits;
+            if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo > 0 || hi < 0 || Math.abs(lo) > bound || Math.abs(hi) > bound) throw new RangeError(`joint limits must satisfy lo <= 0 <= hi within +-${bound}; the angle or slide is measured from the pose at creation`);
+        }
+        if (o.motor) this.assertMotor(o.motor.velocity, o.motor.maxForce);
+        if (this.nextJoint >= MAX_JOINT_ID) throw new RangeError(`joint limit reached (${MAX_JOINT_ID})`);
+        const id = this.nextJoint;
+        const desc = { id, kind: o.kind, a: o.a.id, genA: o.a.gen, b: o.b.id, genB: o.b.gen, anchor: o.anchor, axis, limits: o.limits, motorVelocity: o.motor?.velocity, motorMax: o.motor?.maxForce };
+        if (!this.enqueue({ k: 'jointCreate', d: desc })) throw new Error('CommandRing full');
+        this.nextJoint++;
+        return { id };
+    }
+
+    private assertMotor(velocity: number, maxForce: number): void {
+        if (!Number.isFinite(velocity) || Math.abs(velocity) > MAX_MOTOR_SPEED) throw new RangeError(`motor velocity must be finite and within +-${MAX_MOTOR_SPEED}`);
+        if (!Number.isFinite(maxForce) || maxForce < 0 || maxForce > MAX_MOTOR_FORCE) throw new RangeError(`motor maxForce must be within 0..${MAX_MOTOR_FORCE}`);
+    }
+
+    /** Change a hinge or slider motor target; `maxForce` 0 switches it off. A handle whose joint is gone is dropped by the runtime and counted as stale. */
+    setJointMotor(joint: JointHandle, velocity: number, maxForce: number): void {
+        this.assertAlive();
+        this.assertMotor(velocity, maxForce);
+        if (!this.enqueue({ k: 'jointMotor', id: joint.id, velocity, maxForce })) throw new Error('CommandRing full');
+    }
+
+    destroyJoint(joint: JointHandle): void {
+        this.assertAlive();
+        if (!this.enqueue({ k: 'jointDestroy', id: joint.id })) throw new Error('CommandRing full');
     }
 
     /**

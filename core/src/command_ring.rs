@@ -1,6 +1,6 @@
 use crate::collision::V3;
 use crate::hull::MAX_HULL_COORD;
-use crate::physics::{BodyDesc, MAX_COORD};
+use crate::physics::{BodyDesc, JointDesc, MAX_COORD};
 use std::sync::atomic::{AtomicU32, Ordering};
 use wasm_bindgen::prelude::*;
 
@@ -17,6 +17,9 @@ pub const TAG_TELEPORT: u8 = 8;
 pub const TAG_RECORD: u8 = 9;
 pub const TAG_SEEK: u8 = 10;
 pub const TAG_PAUSE: u8 = 11;
+pub const TAG_JOINT_CREATE: u8 = 12;
+pub const TAG_JOINT_DESTROY: u8 = 13;
+pub const TAG_JOINT_MOTOR: u8 = 14;
 pub const HULL_VERTS_PER_SLOT: usize = 4;
 /// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
 pub const MAX_CAPACITY: u32 = 1 << 18;
@@ -35,6 +38,17 @@ const OFF_RESTITUTION: usize = 52;
 const OFF_FRICTION: usize = 56;
 const OFF_HULL: usize = 60;
 
+const OFF_JOINT_KIND: usize = 5;
+const OFF_JOINT_GEN_A: usize = 6;
+const OFF_JOINT_GEN_B: usize = 7;
+const OFF_JOINT_A: usize = 8;
+const OFF_JOINT_B: usize = 12;
+const OFF_JOINT_ANCHOR: usize = 16;
+const OFF_JOINT_AXIS: usize = 28;
+const OFF_JOINT_LIMITS: usize = 40;
+const OFF_JOINT_MOTOR: usize = 48;
+const OFF_JOINT_FLAGS: usize = 56;
+
 #[repr(C, align(4))]
 struct Slot([u8; SLOT_BYTES]);
 
@@ -52,6 +66,9 @@ pub enum Command {
     Record { on: bool },
     Seek { tick: u32 },
     Pause { on: bool },
+    JointCreate { id: u32, gen_a: u8, gen_b: u8, desc: JointDesc },
+    JointDestroy { id: u32 },
+    JointMotor { id: u32, vel: f32, max: f32 },
 }
 
 impl Command {
@@ -61,7 +78,8 @@ impl Command {
             | Command::Destroy { id, generation }
             | Command::Force   { id, generation, .. }
             | Command::Teleport { id, generation, .. } => Some((*id, *generation)),
-            Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } | Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. } => None,
+            Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } | Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. }
+            | Command::JointCreate { .. } | Command::JointDestroy { .. } | Command::JointMotor { .. } => None,
         }
     }
 }
@@ -235,6 +253,31 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             b[0] = TAG_TELEPORT;
             wr_f32x(b, OFF_POS, &[*x, *y, *z]);
         }
+        Command::JointCreate { id, gen_a, gen_b, desc } => {
+            b[0] = TAG_JOINT_CREATE;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&id.to_le_bytes());
+            b[OFF_JOINT_KIND] = desc.kind;
+            b[OFF_JOINT_GEN_A] = *gen_a;
+            b[OFF_JOINT_GEN_B] = *gen_b;
+            b[OFF_JOINT_A..OFF_JOINT_A + 4].copy_from_slice(&desc.a.to_le_bytes());
+            b[OFF_JOINT_B..OFF_JOINT_B + 4].copy_from_slice(&desc.b.to_le_bytes());
+            wr_f32x(b, OFF_JOINT_ANCHOR, &desc.anchor);
+            wr_f32x(b, OFF_JOINT_AXIS, &desc.axis);
+            if let Some((lo, hi)) = desc.limits {
+                wr_f32x(b, OFF_JOINT_LIMITS, &[lo, hi]);
+                b[OFF_JOINT_FLAGS] = 1;
+            }
+            wr_f32x(b, OFF_JOINT_MOTOR, &[desc.motor_vel, desc.motor_max]);
+        }
+        Command::JointDestroy { id } => {
+            b[0] = TAG_JOINT_DESTROY;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&id.to_le_bytes());
+        }
+        Command::JointMotor { id, vel, max } => {
+            b[0] = TAG_JOINT_MOTOR;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&id.to_le_bytes());
+            wr_f32x(b, OFF_POS, &[*vel, *max]);
+        }
     }
 }
 
@@ -309,6 +352,34 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
             let v: [f32; 3] = rd_f32x(b, OFF_POS);
             if !all_finite(&v) || v.iter().any(|f| f.abs() > MAX_COORD) { return None; }
             Some(Command::Teleport { id, generation, x: v[0], y: v[1], z: v[2] })
+        }
+        TAG_JOINT_CREATE => {
+            let limits = match b[OFF_JOINT_FLAGS] {
+                0 => None,
+                1 => {
+                    let [lo, hi]: [f32; 2] = rd_f32x(b, OFF_JOINT_LIMITS);
+                    Some((lo, hi))
+                }
+                _ => return None,
+            };
+            let rd_u32 = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            let [motor_vel, motor_max]: [f32; 2] = rd_f32x(b, OFF_JOINT_MOTOR);
+            let desc = JointDesc {
+                kind: b[OFF_JOINT_KIND],
+                a: rd_u32(OFF_JOINT_A),
+                b: rd_u32(OFF_JOINT_B),
+                anchor: rd_f32x(b, OFF_JOINT_ANCHOR),
+                axis: rd_f32x(b, OFF_JOINT_AXIS),
+                limits,
+                motor_vel,
+                motor_max,
+            };
+            desc.is_valid().then_some(Command::JointCreate { id, gen_a: b[OFF_JOINT_GEN_A], gen_b: b[OFF_JOINT_GEN_B], desc })
+        }
+        TAG_JOINT_DESTROY => Some(Command::JointDestroy { id }),
+        TAG_JOINT_MOTOR => {
+            let [vel, max]: [f32; 2] = rd_f32x(b, OFF_POS);
+            (vel.is_finite() && max.is_finite()).then_some(Command::JointMotor { id, vel, max })
         }
         _ => None,
     }
@@ -637,15 +708,15 @@ mod tests {
 
     #[test]
     fn wire_tags_are_pinned_to_the_values_the_typescript_ring_writes() {
-        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
         let mut ring = CommandRing::new(8);
         raw_slot(&mut ring, |b| { b[0] = 8; b[OFF_ID] = 3; b[OFF_GEN] = 2; b[OFF_POS..OFF_POS + 4].copy_from_slice(&1.5f32.to_le_bytes()); });
         raw_slot(&mut ring, |b| { b[0] = 9; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 10; b[OFF_ID] = 7; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 2; });
-        raw_slot(&mut ring, |b| { b[0] = 12; });
+        raw_slot(&mut ring, |b| { b[0] = 15; });
         let mut out = Vec::new();
         ring.drain_commands(8, &mut out);
         assert_eq!(out, vec![
@@ -654,7 +725,7 @@ mod tests {
             Command::Seek { tick: 7 },
             Command::Pause { on: true },
         ]);
-        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 12 (unassigned) are malformed");
+        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 15 (unassigned) are malformed");
     }
 
     #[test]
@@ -723,5 +794,82 @@ mod tests {
         encode_slot(&cmd, &mut raw);
         assert_eq!(&raw[60..64], &513u32.to_le_bytes());
         assert_eq!(drain(&mut ring, &[0]), vec![cmd]);
+    }
+
+    fn joint_desc() -> JointDesc {
+        JointDesc {
+            kind: crate::physics::JOINT_HINGE,
+            a: 3,
+            b: 9,
+            anchor: [1.0, 2.0, 3.0],
+            axis: [0.0, 0.0, 1.0],
+            limits: Some((-0.5, 0.75)),
+            motor_vel: 2.0,
+            motor_max: 10.0,
+        }
+    }
+
+    #[test]
+    fn joint_commands_round_trip_with_and_without_limits() {
+        let mut ring = CommandRing::new(8);
+        let with = Command::JointCreate { id: 70_000, gen_a: 4, gen_b: 250, desc: joint_desc() };
+        let without = Command::JointCreate { id: 1, gen_a: 0, gen_b: 0, desc: JointDesc { limits: None, motor_max: 0.0, motor_vel: 0.0, ..joint_desc() } };
+        let destroy = Command::JointDestroy { id: crate::physics::MAX_JOINT_ID - 1 };
+        let motor = Command::JointMotor { id: 2, vel: -3.5, max: 0.0 };
+        for c in [&with, &without, &destroy, &motor] { assert!(ring.push(c)); }
+        assert_eq!(drain(&mut ring, &[]), vec![with, without, destroy, motor]);
+    }
+
+    #[test]
+    fn joint_create_bytes_match_cross_language_fixture() {
+        let mut b = [0u8; SLOT_BYTES];
+        encode_slot(&Command::JointCreate { id: 7, gen_a: 1, gen_b: 2, desc: joint_desc() }, &mut b);
+        let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        assert_eq!(hex, JOINT_FIXTURE_HEX);
+    }
+
+    pub const JOINT_FIXTURE_HEX: &str = concat!(
+        "0c", "07000000", "01", "01", "02",
+        "03000000", "09000000",
+        "0000803f", "00000040", "00004040",
+        "00000000", "00000000", "0000803f",
+        "000000bf", "0000403f",
+        "00000040", "00002041",
+        "01", "00000000000000",
+    );
+
+    #[test]
+    fn hostile_joint_slots_are_malformed_not_applied() {
+        let mut ring = CommandRing::new(32);
+        let good = |f: fn(&mut [u8; SLOT_BYTES])| {
+            let mut b = [0u8; SLOT_BYTES];
+            encode_slot(&Command::JointCreate { id: 1, gen_a: 0, gen_b: 0, desc: joint_desc() }, &mut b);
+            f(&mut b);
+            b
+        };
+        let slots = [
+            good(|b| b[OFF_JOINT_KIND] = 9),
+            good(|b| b[OFF_JOINT_FLAGS] = 2),
+            good(|b| b[OFF_JOINT_B..OFF_JOINT_B + 4].copy_from_slice(&3u32.to_le_bytes())),
+            good(|b| wr_f32(b, OFF_JOINT_ANCHOR, f32::NAN)),
+            good(|b| wr_f32x(b, OFF_JOINT_AXIS, &[0.0; 3])),
+            good(|b| wr_f32(b, OFF_JOINT_LIMITS, 5.0)),
+            good(|b| wr_f32(b, OFF_JOINT_MOTOR, f32::INFINITY)),
+            good(|b| wr_f32(b, OFF_JOINT_MOTOR + 4, -1.0)),
+        ];
+        for slot in slots {
+            raw_slot(&mut ring, |b| *b = slot);
+        }
+        raw_slot(&mut ring, |b| { b[0] = TAG_JOINT_MOTOR; wr_f32(b, OFF_POS, f32::NAN); });
+        raw_slot(&mut ring, |b| { b[0] = TAG_JOINT_MOTOR; wr_f32(b, OFF_POS + 4, f32::INFINITY); });
+        assert!(drain(&mut ring, &[]).is_empty());
+        assert_eq!(ring.malformed_dropped(), 10);
+    }
+
+    #[test]
+    fn a_joint_command_never_names_a_body_for_the_generic_stale_check() {
+        assert_eq!(Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_desc() }.target(), None);
+        assert_eq!(Command::JointDestroy { id: 0 }.target(), None);
+        assert_eq!(Command::JointMotor { id: 0, vel: 0.0, max: 0.0 }.target(), None);
     }
 }

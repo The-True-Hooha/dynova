@@ -1,8 +1,10 @@
 use crate::collision::{self as geo, Manifold};
 use crate::hull::{self, HullData, MAX_HULLS};
 
+mod joints;
 mod snapshot;
 pub(crate) use snapshot::Fnv;
+pub use joints::{Joint, JointDesc, JOINT_BALL, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER, MAX_JOINT_ID};
 pub use snapshot::PhysicsSnapshot;
 
 const MIN_BUCKETS: usize = 4096;
@@ -82,6 +84,9 @@ pub struct PhysicsWorld {
     island_of: Vec<u32>,
     pub contacts: Vec<Contact>,
     warm_cache: Vec<WarmEntry>,
+    pub joints: Vec<Joint>,
+    joint_prep: Vec<joints::Prepared>,
+    jointed: Vec<u8>,
     pub bucket_counts: Vec<u32>,
     pub capacity:  usize,
     pub gx: f32, pub gy: f32, pub gz: f32,
@@ -201,6 +206,9 @@ impl PhysicsWorld {
             island_of: vec![0; capacity],
             contacts: Vec::with_capacity(MIN_MAX_CONTACTS),
             warm_cache: Vec::new(),
+            joints: Vec::new(),
+            joint_prep: Vec::new(),
+            jointed: Vec::new(),
             bucket_counts: vec![0u32; bucket_count_for(capacity)],
             capacity,
             gx: 0.0, gy: -9.81, gz: 0.0,
@@ -287,6 +295,7 @@ impl PhysicsWorld {
         self.touching[id] = false;
         self.penetrating[id] = false;
         self.forget_pairs(id as u32);
+        self.drop_joints_of(id as u32);
     }
 
     pub fn deactivate(&mut self, id: usize) {
@@ -294,6 +303,7 @@ impl PhysicsWorld {
         self.active[id] = false;
         self.wake_touching(id);
         self.forget_pairs(id as u32);
+        self.drop_joints_of(id as u32);
     }
 
     /// Moves a body and clears its motion. Sleepers resting on its old position lose their support, so they wake.
@@ -345,10 +355,24 @@ impl PhysicsWorld {
         let dt   = self.dt;
         let cap  = self.capacity;
 
+        self.jointed.clear();
+        if !self.joints.is_empty() {
+            self.jointed.resize(cap, 0);
+            for j in &self.joints {
+                let k = if j.motor_max > 0.0 { joints::DRIVEN } else { joints::JOINTED };
+                for b in [j.a as usize, j.b as usize] {
+                    self.jointed[b] = self.jointed[b].max(k);
+                }
+            }
+        }
         for i in 0..cap {
             if !self.active[i] || self.inv_mass[i] == 0.0 || self.sleeping[i] { continue; }
             let vsq = self.vel_x[i]*self.vel_x[i] + self.vel_y[i]*self.vel_y[i] + self.vel_z[i]*self.vel_z[i];
-            if vsq < SLEEP_VEL_SQ && self.touching[i] && !self.penetrating[i] {
+            let wsq = self.ang_x[i]*self.ang_x[i] + self.ang_y[i]*self.ang_y[i] + self.ang_z[i]*self.ang_z[i];
+            // Only a jointed body can turn in place while staying supported (a wheel on its axle), so only it is judged on spin.
+            // A motor can move a body slower than the sleep speed, and sleeping would stop it.
+            let spinning = self.jointed.get(i).is_some_and(|&k| k == joints::DRIVEN || (k == joints::JOINTED && wsq >= SLEEP_VEL_SQ));
+            if vsq < SLEEP_VEL_SQ && !spinning && self.touching[i] && !self.penetrating[i] {
                 self.sleep_timer[i] += dt;
             } else {
                 self.sleep_timer[i] = 0.0;
@@ -408,6 +432,14 @@ impl PhysicsWorld {
             };
             apply_impulse_pair(&self.contacts[ci], &eff_mass, &mut m, &eff_inertia);
         }
+        self.prepare_joints();
+        {
+            let mut m = Motion {
+                vx: &mut self.vel_x, vy: &mut self.vel_y, vz: &mut self.vel_z,
+                ax: &mut self.ang_x, ay: &mut self.ang_y, az: &mut self.ang_z,
+            };
+            joints::warm_start_joints(&self.joints, &self.joint_prep, &eff_mass, &eff_inertia, &mut m);
+        }
 
         // Alternate sweep direction so the sequential solve does not bias one side of a manifold.
         self.solver_iters_used = 0;
@@ -415,7 +447,13 @@ impl PhysicsWorld {
             self.solver_iters_used += 1;
             let count = self.contacts.len();
             let stride = { let mut st = 1 + (iter * 2 + 1) * 7 % count.max(2); while gcd(st, count.max(1)) != 1 { st += 1; } st };
-            let mut largest = 0.0f32;
+            let mut largest = {
+                let mut m = Motion {
+                    vx: &mut self.vel_x, vy: &mut self.vel_y, vz: &mut self.vel_z,
+                    ax: &mut self.ang_x, ay: &mut self.ang_y, az: &mut self.ang_z,
+                };
+                joints::solve_joints(&mut self.joints, &self.joint_prep, &eff_mass, &eff_inertia, &mut m)
+            };
             for k in 0..count {
                 let ci = (k * stride + iter) % count;
                 let mut m = Motion {
@@ -482,6 +520,11 @@ impl PhysicsWorld {
 
         self.touching.fill(false);
         self.penetrating.fill(false);
+        // A joint holds a body like a contact does, so a hanging body counts as supported and may sleep.
+        for j in &self.joints {
+            self.touching[j.a as usize] = true;
+            self.touching[j.b as usize] = true;
+        }
         for c in &self.contacts {
             let deep = c.depth > 2.0 * SLOP;
             for id in [c.a as usize, c.b as usize] {
@@ -681,6 +724,12 @@ impl PhysicsWorld {
         for k in 0..self.contacts.len() {
             let (a, b) = (self.contacts[k].a as usize, self.contacts[k].b as usize);
             if a >= cap || b >= cap || !self.active[a] || !self.active[b] { continue; }
+            if self.inv_mass[a] == 0.0 || self.inv_mass[b] == 0.0 { continue; }
+            let (ra, rb) = (Self::find(&mut self.uf_parent, a as u32), Self::find(&mut self.uf_parent, b as u32));
+            if ra != rb { self.uf_parent[ra as usize] = rb; }
+        }
+        for k in 0..self.joints.len() {
+            let (a, b) = (self.joints[k].a as usize, self.joints[k].b as usize);
             if self.inv_mass[a] == 0.0 || self.inv_mass[b] == 0.0 { continue; }
             let (ra, rb) = (Self::find(&mut self.uf_parent, a as u32), Self::find(&mut self.uf_parent, b as u32));
             if ra != rb { self.uf_parent[ra as usize] = rb; }

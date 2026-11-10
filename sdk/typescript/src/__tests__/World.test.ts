@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { World } from '../World.js';
 import { makeWorld, makeSyncWorld } from './helpers.js';
 import { H_GENERATIONS, H_LIVE, H_SEEKS, H_PAUSED, H_TICKS } from '../TransformView.js';
-import { SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE } from '../CommandRing.js';
+import { SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, JOINT_BALL, JOINT_HINGE, JOINT_FIXED, JOINT_SLIDER } from '../CommandRing.js';
 
 const config = { capacity: 128, ringCapacity: 64 };
 const tight = { capacity: 8, ringCapacity: 2, maxDeferredCommands: 0 };
@@ -514,3 +514,69 @@ describe('World.handleOf', () => {
         expect(() => world.handleOf(h.id)).toThrow(/world unavailable/);
     });
 });
+
+describe('World joints', () => {
+    function pair() {
+        const made = makeWorld(config);
+        const a = made.world.spawn({ invMass: 0 });
+        const b = made.world.spawn();
+        return { ...made, a, b };
+    }
+    const raw = (rt: { dv: DataView; layout: { ringSlotsByteOffset: number } }, n: number) => {
+        const off = rt.layout.ringSlotsByteOffset + n * SLOT_BYTES;
+        return { tag: rt.dv.getUint8(off), id: rt.dv.getUint32(off + 1, true), genA: rt.dv.getUint8(off + 6), a: rt.dv.getUint32(off + 8, true), b: rt.dv.getUint32(off + 12, true) };
+    };
+
+    it('createJoint, setJointMotor and destroyJoint reach the ring with the handles of both bodies', () => {
+        const { world, rt, a, b } = pair();
+        const j = world.createJoint({ kind: JOINT_HINGE, a, b, anchor: [0, 1, 0], axis: [0, 0, 1], limits: [-1, 1], motor: { velocity: 2, maxForce: 5 } });
+        world.setJointMotor(j, -1, 0);
+        world.destroyJoint(j);
+        expect(j).toEqual({ id: 0 });
+        expect([2, 3, 4].map((n) => raw(rt, n).tag)).toEqual([TAG_JOINT_CREATE, TAG_JOINT_MOTOR, TAG_JOINT_DESTROY]);
+        expect([raw(rt, 2).a, raw(rt, 2).b, raw(rt, 2).genA]).toEqual([a.id, b.id, a.gen]);
+    });
+
+    it('joint ids only grow, even after a destroy', () => {
+        const { world, a, b } = pair();
+        const first = world.createJoint({ kind: JOINT_BALL, a, b, anchor: [0, 0, 0] });
+        world.destroyJoint(first);
+        expect(world.createJoint({ kind: JOINT_BALL, a, b, anchor: [0, 0, 0] }).id).toBe(1);
+    });
+
+    it('rejects bad arguments before anything is queued', () => {
+        const { world, a, b } = pair();
+        const base = { kind: JOINT_HINGE, a, b, anchor: [0, 0, 0] as [number, number, number], axis: [0, 0, 1] as [number, number, number] };
+        const bad: Array<[object, RegExp | typeof RangeError]> = [
+            [{ kind: 9 }, RangeError], [{ kind: 1.5 }, RangeError], [{ b: a }, RangeError], [{ b: { id: 99, gen: 0 } }, /stale handle/],
+            [{ anchor: [NaN, 0, 0] }, RangeError], [{ anchor: [2e6, 0, 0] }, RangeError], [{ axis: [0, 0, 0] }, RangeError],
+            [{ axis: undefined }, RangeError], [{ axis: [0, Infinity, 1] }, RangeError],
+            [{ limits: [1, -1] }, RangeError], [{ limits: [0.5, 1] }, RangeError], [{ limits: [-1, -0.5] }, RangeError], [{ axis: [1e30, 0, 0] }, RangeError], [{ kind: JOINT_BALL, axis: [NaN, 0, 0] }, RangeError], [{ limits: [-4, 1] }, RangeError], [{ limits: [NaN, 1] }, RangeError],
+            [{ motor: { velocity: NaN, maxForce: 1 } }, RangeError], [{ motor: { velocity: 2000, maxForce: 1 } }, RangeError],
+            [{ motor: { velocity: 1, maxForce: -1 } }, RangeError], [{ motor: { velocity: 1, maxForce: 1e7 } }, RangeError],
+            [{ kind: JOINT_BALL, limits: [0, 1] }, RangeError], [{ kind: JOINT_FIXED, motor: { velocity: 1, maxForce: 1 } }, RangeError],
+        ];
+        for (const [patch, expected] of bad) expect(() => world.createJoint({ ...base, ...patch } as never), JSON.stringify(patch)).toThrow(expected);
+        expect(world.pendingCommands).toBe(2);
+        expect(() => world.createJoint({ ...base, kind: JOINT_SLIDER, limits: [-5000, 5000] })).not.toThrow();
+        expect(() => world.createJoint({ ...base, limits: [-5000, 5000] })).toThrow(RangeError);
+        expect(() => world.setJointMotor({ id: 0 }, NaN, 0)).toThrow(RangeError);
+        expect(() => world.setJointMotor({ id: 0 }, 0, -1)).toThrow(RangeError);
+    });
+
+    it('a destroyed body cannot be jointed', () => {
+        const { world, a, b } = pair();
+        world.destroy(b);
+        expect(() => world.createJoint({ kind: JOINT_BALL, a, b, anchor: [0, 0, 0] })).toThrow(/stale handle/);
+    });
+
+    it('a full ring with no deferral throws and does not consume a joint id', () => {
+        const { world } = makeWorld(tight);
+        const a = world.spawn({ invMass: 0 });
+        const b = world.spawn();
+        expect(() => world.createJoint({ kind: JOINT_BALL, a, b, anchor: [0, 0, 0] })).toThrow(/CommandRing full/);
+        expect(() => world.destroyJoint({ id: 0 })).toThrow(/CommandRing full/);
+        expect(() => world.setJointMotor({ id: 0 }, 1, 1)).toThrow(/CommandRing full/);
+    });
+});
+

@@ -12,11 +12,24 @@ export const TAG_TELEPORT = 8;
 export const TAG_RECORD = 9;
 export const TAG_SEEK = 10;
 export const TAG_PAUSE = 11;
+export const TAG_JOINT_CREATE = 12;
+export const TAG_JOINT_DESTROY = 13;
+export const TAG_JOINT_MOTOR = 14;
 export const HULL_VERTS_PER_SLOT = 4;
 export const MAX_HULL_VERTS = 32;
 export const MAX_HULLS = 1024;
 export const MAX_HULL_COORD = 1e4;
 export const MAX_CAPACITY = 1 << 18;
+
+export const JOINT_BALL = 0;
+export const JOINT_HINGE = 1;
+export const JOINT_FIXED = 2;
+export const JOINT_SLIDER = 3;
+export const MAX_JOINT_ID = 1 << 24;
+export const MAX_ANGLE_LIMIT = 3.1;
+export const MAX_LINEAR_LIMIT = 1e4;
+export const MAX_MOTOR_SPEED = 1e3;
+export const MAX_MOTOR_FORCE = 1e6;
 
 export const SHAPE_BOX    = 0;
 export const SHAPE_SPHERE = 1;
@@ -45,6 +58,18 @@ export interface TeleportDesc {
     id: number;
     gen: number;
     x: number; y: number; z: number;
+}
+
+export interface JointCreateDesc {
+    id: number;
+    kind: number;
+    a: number; genA: number;
+    b: number; genB: number;
+    anchor: readonly [number, number, number];
+    axis: readonly [number, number, number];
+    limits?: readonly [number, number];
+    motorVelocity?: number;
+    motorMax?: number;
 }
 
 export interface ForceDesc {
@@ -198,6 +223,57 @@ export class CommandRing {
         this.view.setFloat32(off + 6, desc.x, true);
         this.view.setFloat32(off + 10, desc.y, true);
         this.view.setFloat32(off + 14, desc.z, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    jointCreate(d: JointCreateDesc): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_JOINT_CREATE);
+        this.view.setUint32(off + 1, d.id, true);
+        this.view.setUint8(off + 5, d.kind);
+        this.view.setUint8(off + 6, d.genA);
+        this.view.setUint8(off + 7, d.genB);
+        this.view.setUint32(off + 8, d.a, true);
+        this.view.setUint32(off + 12, d.b, true);
+        for (let i = 0; i < 3; i++) {
+            this.view.setFloat32(off + 16 + i * 4, d.anchor[i], true);
+            this.view.setFloat32(off + 28 + i * 4, d.axis[i], true);
+        }
+        if (d.limits) {
+            this.view.setFloat32(off + 40, d.limits[0], true);
+            this.view.setFloat32(off + 44, d.limits[1], true);
+            this.view.setUint8(off + 56, 1);
+        }
+        this.view.setFloat32(off + 48, d.motorVelocity ?? 0, true);
+        this.view.setFloat32(off + 52, d.motorMax ?? 0, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    jointDestroy(id: number): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_JOINT_DESTROY);
+        this.view.setUint32(off + 1, id, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    jointMotor(id: number, velocity: number, maxForce: number): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_JOINT_MOTOR);
+        this.view.setUint32(off + 1, id, true);
+        this.view.setFloat32(off + 6, velocity, true);
+        this.view.setFloat32(off + 10, maxForce, true);
         Atomics.add(this.tail, 0, 1);
         return true;
     }

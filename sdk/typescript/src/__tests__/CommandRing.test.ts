@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, SHAPE_HULL, SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE } from '../CommandRing.js';
+import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, SHAPE_HULL, SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, JOINT_HINGE } from '../CommandRing.js';
 
 function makeRing(capacity = 16) {
     const mem = new WebAssembly.Memory({ initial: 1 });
@@ -13,6 +13,37 @@ describe('CommandRing', () => {
     // The same wire values are asserted in core/src/command_ring.rs (wire_tags_are_pinned_to_the_values_the_typescript_ring_writes).
     it('pins the tag values of the recording commands', () => {
         expect([TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE]).toEqual([8, 9, 10, 11]);
+    });
+
+    it('pins the tag values of the joint commands', () => {
+        expect([TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR]).toEqual([12, 13, 14]);
+    });
+
+    // Same bytes as JOINT_FIXTURE_HEX in core/src/command_ring.rs.
+    it('joint create bytes match the Rust cross-language fixture', () => {
+        const { mem, ring } = makeRing();
+        new Uint8Array(mem.buffer, 0, SLOT_BYTES).fill(0xff);
+        expect(ring.jointCreate({ id: 7, kind: JOINT_HINGE, a: 3, genA: 1, b: 9, genB: 2, anchor: [1, 2, 3], axis: [0, 0, 1], limits: [-0.5, 0.75], motorVelocity: 2, motorMax: 10 })).toBe(true);
+        const hex = Array.from(new Uint8Array(mem.buffer, 0, SLOT_BYTES)).map((b) => b.toString(16).padStart(2, '0')).join('');
+        expect(hex).toBe('0c07000000' + '01' + '01' + '02' + '03000000' + '09000000' + '0000803f' + '00000040' + '00004040' + '00000000' + '00000000' + '0000803f' + '000000bf' + '0000403f' + '00000040' + '00002041' + '01' + '00000000000000');
+    });
+
+    it('joint create without limits leaves the flag and the limit words zero, and destroy and motor encode their payloads', () => {
+        const { mem, ring } = makeRing();
+        const view = new DataView(mem.buffer);
+        ring.jointCreate({ id: 1, kind: 0, a: 0, genA: 0, b: 1, genB: 0, anchor: [0, 0, 0], axis: [0, 0, 0] });
+        ring.jointDestroy(16_777_215);
+        ring.jointMotor(5, -3.5, 12);
+        expect([view.getUint8(56), view.getFloat32(40, true), view.getFloat32(44, true)]).toEqual([0, 0, 0]);
+        const at = (n: number) => n * SLOT_BYTES;
+        expect([view.getUint8(at(1)), view.getUint32(at(1) + 1, true)]).toEqual([TAG_JOINT_DESTROY, 16_777_215]);
+        expect([view.getUint8(at(2)), view.getUint32(at(2) + 1, true), view.getFloat32(at(2) + 6, true), view.getFloat32(at(2) + 10, true)]).toEqual([TAG_JOINT_MOTOR, 5, -3.5, 12]);
+    });
+
+    it('a full ring refuses every joint command', () => {
+        const { ring } = makeRing(1);
+        expect(ring.jointDestroy(0)).toBe(true);
+        expect([ring.jointCreate({ id: 0, kind: 0, a: 0, genA: 0, b: 1, genB: 0, anchor: [0, 0, 0], axis: [0, 0, 0] }), ring.jointDestroy(1), ring.jointMotor(0, 0, 0)]).toEqual([false, false, false]);
     });
 
     it('teleport encodes tag, id, gen and position and clears the rest of the slot', () => {

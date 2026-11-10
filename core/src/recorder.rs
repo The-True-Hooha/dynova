@@ -57,7 +57,11 @@ impl Recorder {
     /// snapshot, so the caller must log a command only once the runtime accepted it: a command rejected for a
     /// missing hull or a too-small capacity would be accepted by a replay that runs after the upload or the grow.
     pub fn loggable(cmd: &Command) -> bool {
-        matches!(cmd, Command::Spawn { .. } | Command::Destroy { .. } | Command::Force { .. } | Command::Teleport { .. } | Command::Gravity { .. })
+        matches!(
+            cmd,
+            Command::Spawn { .. } | Command::Destroy { .. } | Command::Force { .. } | Command::Teleport { .. } | Command::Gravity { .. }
+                | Command::JointCreate { .. } | Command::JointDestroy { .. } | Command::JointMotor { .. }
+        )
     }
 
     pub fn push_command(&mut self, tick: u32, cmd: &Command) {
@@ -167,6 +171,12 @@ mod tests {
         assert!(Recorder::loggable(&force(0)));
         assert!(Recorder::loggable(&Command::Teleport { id: 0, generation: 0, x: 0.0, y: 0.0, z: 0.0 }));
         assert!(Recorder::loggable(&Command::Gravity { x: 0.0, y: 0.0, z: 0.0 }));
+        let desc = crate::physics::JointDesc {
+            kind: crate::physics::JOINT_BALL, a: 0, b: 1, anchor: [0.0; 3], axis: [0.0; 3], limits: None, motor_vel: 0.0, motor_max: 0.0,
+        };
+        assert!(Recorder::loggable(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc }));
+        assert!(Recorder::loggable(&Command::JointDestroy { id: 0 }));
+        assert!(Recorder::loggable(&Command::JointMotor { id: 0, vel: 0.0, max: 0.0 }));
         for c in [
             Command::Grow { capacity: 8 }, Command::Inspect { on: true }, Command::Record { on: true }, Command::Seek { tick: 1 },
             Command::HullVerts { hull: 0, count: 1, verts: [[0.0; 3]; 4] }, Command::HullCommit { hull: 0, count: 4 },

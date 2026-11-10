@@ -15,6 +15,7 @@ pub struct PhysicsSnapshot {
     flags: [Vec<bool>; 4],
     contacts: Vec<Contact>,
     warm_cache: Vec<WarmEntry>,
+    joints: Vec<Joint>,
     gravity: [f32; 3],
 }
 
@@ -47,6 +48,7 @@ impl PhysicsWorld {
             flags: [self.active.clone(), self.sleeping.clone(), self.touching.clone(), self.penetrating.clone()],
             contacts: self.contacts.clone(),
             warm_cache: self.warm_cache.clone(),
+            joints: self.joints.clone(),
             gravity: [self.gx, self.gy, self.gz],
         }
     }
@@ -82,6 +84,7 @@ impl PhysicsWorld {
         self.contacts.clear();
         self.contacts.extend_from_slice(&s.contacts);
         self.warm_cache.clone_from(&s.warm_cache);
+        self.joints.clone_from(&s.joints);
         [self.gx, self.gy, self.gz] = s.gravity;
         true
     }
@@ -95,7 +98,7 @@ impl PhysicsSnapshot {
     pub fn hash(&self) -> u64 {
         let cols: Vec<&[f32]> = self.f32_cols.iter().map(|c| c.as_slice()).collect();
         hash_state(self.capacity, &cols, &self.hull_of, &self.island_of, &self.shape,
-            [&self.flags[0], &self.flags[1], &self.flags[2], &self.flags[3]], &self.contacts, &self.warm_cache, self.gravity)
+            [&self.flags[0], &self.flags[1], &self.flags[2], &self.flags[3]], &self.contacts, &self.warm_cache, &self.joints, self.gravity)
     }
 
     /// Heap bytes held, so a keyframe store can bound its memory.
@@ -103,6 +106,7 @@ impl PhysicsSnapshot {
         self.capacity * (F32_COLUMNS * 4 + 4 + 4 + 1 + 4)
             + self.contacts.len() * std::mem::size_of::<Contact>()
             + self.warm_cache.len() * std::mem::size_of::<WarmEntry>()
+            + self.joints.len() * std::mem::size_of::<Joint>()
     }
 }
 
@@ -111,7 +115,7 @@ impl PhysicsWorld {
     pub fn state_hash(&self) -> u64 {
         let cols: Vec<&[f32]> = self.f32_cols().iter().map(|c| c.as_slice()).collect();
         hash_state(self.capacity, &cols, &self.hull_of, &self.island_of, &self.shape,
-            [&self.active, &self.sleeping, &self.touching, &self.penetrating], &self.contacts, &self.warm_cache, [self.gx, self.gy, self.gz])
+            [&self.active, &self.sleeping, &self.touching, &self.penetrating], &self.contacts, &self.warm_cache, &self.joints, [self.gx, self.gy, self.gz])
     }
 }
 
@@ -148,6 +152,7 @@ fn hash_state(
     flags: [&[bool]; 4],
     contacts: &[Contact],
     warm_cache: &[WarmEntry],
+    joints: &[Joint],
     gravity: [f32; 3],
 ) -> u64 {
     let d = slot_defaults();
@@ -166,6 +171,21 @@ fn hash_state(
         h.word(island_of[i] as u64);
         h.word(shape[i] as u64);
         for f in flags { h.word(f[i] as u64); }
+        slots = slots.wrapping_add(h.finish());
+    }
+    // Summed like slots so a world without joints hashes exactly as it did before joints existed.
+    for j in joints {
+        let mut h = Fnv::new();
+        for w in [j.id, j.kind as u32, j.a, j.b] { h.word(w as u64); }
+        for v in j.la.iter().chain(&j.lb).chain(&j.axis_a).chain(&j.axis_b).chain(&j.ref_a).chain(&j.ref_b).chain(&j.rest).chain(&j.acc) {
+            h.word(v.to_bits() as u64);
+        }
+        match j.limits {
+            Some((lo, hi)) => { h.word(1); h.word(lo.to_bits() as u64); h.word(hi.to_bits() as u64); }
+            None => h.word(0),
+        }
+        h.word(j.motor_vel.to_bits() as u64);
+        h.word(j.motor_max.to_bits() as u64);
         slots = slots.wrapping_add(h.finish());
     }
     let mut h = Fnv::new();
