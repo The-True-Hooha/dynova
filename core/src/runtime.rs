@@ -175,11 +175,12 @@ impl Runtime {
         let mut commands = std::mem::take(&mut self.commands);
         self.ring.drain_commands(4096, &mut commands);
         let mut seeked: Option<u32> = None;
-        let mut seek_tried = false;
+        // Only the newest Seek in a batch replays: a scrubber can send several per step, and each replay costs up to a keyframe interval of physics.
+        let last_seek = commands.iter().rposition(|c| matches!(c, Command::Seek { .. }));
         let mut applied = false;
         // Logged only after the whole batch: a seek discards the world those commands were applied to.
         let mut to_log: Vec<(u32, Command)> = Vec::new();
-        for cmd in commands.drain(..) {
+        for (i, cmd) in commands.drain(..).enumerate() {
             match cmd {
                 Command::Record { on } => {
                     self.set_recording(on);
@@ -190,11 +191,10 @@ impl Runtime {
                     continue;
                 }
                 Command::Seek { tick } => {
-                    // One replay per step bounds the work a burst of Seek commands can demand.
-                    if seek_tried {
-                        self.ring.note_malformed();
-                    } else if self.seek(tick) {
-                        seek_tried = true;
+                    if Some(i) != last_seek {
+                        continue;
+                    }
+                    if self.seek(tick) {
                         seeked = Some(tick);
                         to_log.clear();
                         self.seeks = self.seeks.wrapping_add(1);
@@ -2160,12 +2160,22 @@ mod tests {
     }
 
     #[test]
-    fn only_the_first_seek_in_a_batch_replays_and_the_rest_are_counted_malformed() {
+    fn only_the_last_seek_in_a_batch_replays_and_the_earlier_ones_are_superseded_without_a_count() {
         let (mut rt, takes) = recorded_run();
         for t in [50, 60, 70] { rt.ring.push(&Command::Seek { tick: t }); }
         rt.step();
-        assert_eq!((header(&rt, H_TICKS), rt.malformed_dropped()), (50, 2));
-        assert_eq!(hash_header(&rt), takes[50].hash);
+        assert_eq!((header(&rt, H_TICKS), rt.malformed_dropped(), header(&rt, H_SEEKS)), (70, 0, 1));
+        assert_eq!(hash_header(&rt), takes[70].hash);
+    }
+
+    #[test]
+    fn a_rejected_last_seek_leaves_the_world_even_if_an_earlier_one_was_valid() {
+        let (mut rt, takes) = recorded_run();
+        rt.ring.push(&Command::Seek { tick: 50 });
+        rt.ring.push(&Command::Seek { tick: u32::MAX });
+        rt.step();
+        assert_eq!((header(&rt, H_TICKS), rt.malformed_dropped(), header(&rt, H_SEEKS)), (RUN, 1, 0));
+        assert_eq!(hash_header(&rt), takes[RUN as usize].hash);
     }
 
     #[test]
@@ -2352,7 +2362,7 @@ mod tests {
         seek_to(&mut rt, u32::MAX);
         for t in [60, 70] { rt.ring.push(&Command::Seek { tick: t }); }
         rt.step();
-        assert_eq!(header(&rt, H_SEEKS), 3, "a rejected seek and an extra seek in one batch do not count");
+        assert_eq!(header(&rt, H_SEEKS), 3, "a rejected seek does not count, and two seeks in one batch count once");
     }
 
     #[test]

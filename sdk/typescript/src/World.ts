@@ -281,6 +281,12 @@ export class World {
         return handle;
     }
 
+    /** The live handle for an entity id (what a tool that only knows ids, like the inspector, needs to issue commands), or null. */
+    handleOf(id: number): EntityHandle | null {
+        this.assertAlive();
+        return this.ids.handleOf(id);
+    }
+
     destroy(handle: EntityHandle): void {
         this.assertAlive();
         if (!this.ids.isLive(handle)) throw new Error(`stale handle {id: ${handle.id}, gen: ${handle.gen}}`);

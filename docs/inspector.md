@@ -1,6 +1,6 @@
-# Inspector (read-only)
+# Inspector
 
-The inspector shows what the runtime is doing without touching the simulation: a profiler, the list of entities, one selected entity (position, rotation, velocity, angular velocity, state) and its contact points. It reads the same shared memory the game reads and has no write path other than switching the snapshot on and off.
+The inspector shows what the runtime is doing without touching the simulation: a profiler, the list of entities, one selected entity (position, rotation, velocity, angular velocity, state) and its contact points. It reads the same shared memory the game reads and by default has no write path other than switching the snapshot on and off. Pass `controls` to add editing and a timeline (below).
 
 ```ts
 import { InspectorView } from '@dynova/sdk';
@@ -15,6 +15,23 @@ panel.dispose(); // switches the snapshot off and removes the panel
 ```
 
 Run `make dev` and open `/inspector.html` for a live pile with the panel beside it.
+
+## Editing and the timeline
+
+```ts
+mountInspector(el, {
+  view, setEnabled: (on) => world.setInspector(on),
+  controls: {
+    recording: () => world.recording,
+    record: (on) => world.record(on),
+    pause: (on) => world.pause(on),
+    seek: (tick) => world.seek(tick),
+    teleport: (id, x, y, z) => { const h = world.handleOf(id); if (!h) return false; world.teleport(h, x, y, z); return true; },
+  },
+});
+```
+
+With `controls` the panel gains a **Timeline** (record, pause or resume, a slider over the recorded range, one-tick step buttons, and the tick, range, keyframe count and state hash) and an editable **position** for the selected entity (type x, y, z and press Enter). Each control issues a command (`Record`, `Pause`, `Seek`, `Teleport`); the panel still writes nothing itself. Moving the slider pauses first, because a running world forks the timeline at its next step. A refused position (not a number, past ±1e6, or an entity that no longer exists) is outlined red and nothing is sent. The demo page also lets you drag bodies on the canvas. See [docs/replay.md](./replay.md) for what a seek reproduces.
 
 ## How it works
 
@@ -34,7 +51,7 @@ Tick, ticks per second, mean and last step time, command queue depth, contacts (
 
 ## Limits
 
-- Read-only. Moving entities, snapshots and replay are Stage 4B.
+- Without `controls` the panel is read-only.
 - One panel per `InspectorView` (a second `mountInspector` on the same view throws); no popup window or browser extension.
 - The entity list draws the first 200 matching entities; the note says how many matched.
 - A snapshot older than the latest tick is shown as it was; the panel warns instead of hiding it.

@@ -1,11 +1,12 @@
 import { InspectorView, World, layoutFromRuntime, SHAPE_SPHERE } from '@dynova/sdk';
 import { canvas2dAdapter } from '@dynova/canvas2d';
-import { mountInspector, type InspectorPanel } from '@dynova/inspector';
+import { mountInspector, type InspectorControls, type InspectorPanel } from '@dynova/inspector';
 
 const params = new URLSearchParams(location.search);
 const N = Number(params.get('n') ?? 300);
 const paused = params.has('paused');
 const withPanel = params.get('panel') !== '0';
+const withControls = params.get('controls') !== '0';
 
 const PPU = 16;
 const ARENA_HALF = 12;
@@ -45,20 +46,79 @@ async function run() {
 
     const canvas = document.getElementById('view') as HTMLCanvasElement;
     const ctx = canvas.getContext('2d')!;
+    const view = { pixelsPerUnit: PPU, originX: canvas.width / 2, originY: canvas.height - 24 };
     const adapter = canvas2dAdapter(world, ctx, {
         scales,
-        view: { pixelsPerUnit: PPU, originX: canvas.width / 2, originY: canvas.height - 24 },
+        view,
         style: (id) => ({ shape: sphere.has(id) ? 'circle' : 'rect', color: sphere.has(id) ? '#44aaff' : id < 4 ? '#555d6e' : '#ffaa44' }),
     });
 
     let panel: InspectorPanel | null = null;
     const inspectorView = new InspectorView(exports.memory, rt.header_ptr());
+    const controls: InspectorControls = {
+        recording: () => world.recording,
+        record: (on) => world.record(on),
+        pause: (on) => world.pause(on),
+        seek: (tick) => world.seek(tick),
+        teleport: (id, x, y, z) => {
+            const handle = world.handleOf(id);
+            if (!handle) return false;
+            try {
+                world.teleport(handle, x, y, z);
+                return true;
+            } catch {
+                // Out of range, a stale handle or a full command ring: the move is refused, the page keeps working.
+                return false;
+            }
+        },
+    };
     if (withPanel) {
         panel = mountInspector(document.getElementById('panel')!, {
             view: inspectorView,
+            controls: withControls ? controls : undefined,
             setEnabled: (on) => world.setInspector(on),
         });
     }
+
+    const STATIC_IDS = 4;
+    const canvasPoint = (e: PointerEvent): [number, number] => {
+        const r = canvas.getBoundingClientRect();
+        return [((e.clientX - r.left) * canvas.width) / r.width, ((e.clientY - r.top) * canvas.height) / r.height];
+    };
+    const toWorld = (cx: number, cy: number): [number, number] => [(cx - view.originX) / PPU, (view.originY - cy) / PPU];
+    const pick = (wx: number, wy: number): number | null => {
+        const t = world.readTransforms();
+        for (let id = config.capacity - 1; id >= 0; id--) {
+            const o = id * 7;
+            if (t[o + 3] === 0 && t[o + 4] === 0 && t[o + 5] === 0 && t[o + 6] === 0) continue;
+            const dx = wx - t[o];
+            const dy = wy - t[o + 1];
+            const hx = scales[id * 3] / 2;
+            const hy = scales[id * 3 + 1] / 2;
+            const hit = sphere.has(id) ? dx * dx + dy * dy <= hx * hx : Math.abs(dx) <= hx && Math.abs(dy) <= hy;
+            if (hit) return id;
+        }
+        return null;
+    };
+    let drag: { id: number; dx: number; dy: number; z: number } | null = null;
+    canvas.addEventListener('pointerdown', (e) => {
+        const [wx, wy] = toWorld(...canvasPoint(e));
+        const id = pick(wx, wy);
+        if (id === null) return;
+        panel?.select(id);
+        if (id < STATIC_IDS) return;
+        const t = world.readTransforms();
+        drag = { id, dx: wx - t[id * 7], dy: wy - t[id * 7 + 1], z: t[id * 7 + 2] };
+        canvas.setPointerCapture(e.pointerId);
+    });
+    canvas.addEventListener('pointermove', (e) => {
+        if (!drag || !withControls) return;
+        const [wx, wy] = toWorld(...canvasPoint(e));
+        controls.teleport(drag.id, wx - drag.dx, wy - drag.dy, drag.z);
+    });
+    const endDrag = () => { drag = null; };
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
 
     const draw = () => {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -81,6 +141,14 @@ async function run() {
         world,
         view: inspectorView,
         mountInspector,
+        screenOf: (id: number) => {
+            const t = world.readTransforms();
+            const r = canvas.getBoundingClientRect();
+            return {
+                x: r.left + ((view.originX + t[id * 7] * PPU) * r.width) / canvas.width,
+                y: r.top + ((view.originY - t[id * 7 + 1] * PPU) * r.height) / canvas.height,
+            };
+        },
         stats: () => ({ ticks: world.runtimeCounters.ticks, sleeping: rt.sleeping_count(), contacts: world.runtimeStats.contacts, ring: world.pendingCommands }),
     };
     (window as any).__ready = true;

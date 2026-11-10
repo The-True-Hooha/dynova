@@ -1,6 +1,6 @@
 import {
     BODY_STATE_AWAKE, BODY_STATE_INACTIVE, BODY_STATE_SLEEPING, BODY_STATE_STATIC,
-    type InspectedBody, type InspectorSnapshot, type ProfilerSample,
+    type InspectedBody, type InspectorSnapshot, type ProfilerSample, type RecordingState,
 } from '@dynova/sdk';
 
 export type Vec3 = [number, number, number];
@@ -125,4 +125,53 @@ export function fmtVec(v: readonly number[], digits = 3): string {
 
 export function fmtBytes(bytes: number): string {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+export interface TimelineView {
+    /** Whether the scrubber has a range to move over. */
+    scrubbable: boolean;
+    min: number;
+    max: number;
+    value: number;
+    label: string;
+}
+
+/** What the timeline strip shows for a recording state; `null` (no read) and an idle recorder both disable the scrubber. */
+export function timelineView(state: RecordingState | null): TimelineView {
+    if (!state) return { scrubbable: false, min: 0, max: 0, value: 0, label: 'recording state unavailable' };
+    if (!state.on) return { scrubbable: false, min: 0, max: 0, value: 0, label: 'not recording' };
+    const value = Math.min(Math.max(state.tick, state.start), state.end);
+    const hash = state.hash.toString(16).padStart(16, '0');
+    return {
+        scrubbable: state.end > state.start,
+        min: state.start,
+        max: state.end,
+        value,
+        label: `tick ${state.tick} of ${state.start}–${state.end}, ${state.keyframes} keyframes, hash ${hash}${state.paused ? ', paused' : ''}`,
+    };
+}
+
+/** Tick one step away from `tick` inside the recorded range, or null when that step would leave it. */
+export function stepTarget(state: RecordingState | null, direction: -1 | 1): number | null {
+    if (!state || !state.on) return null;
+    const target = state.tick + direction;
+    return target >= state.start && target <= state.end ? target : null;
+}
+
+/** Parses an edited coordinate; anything that is not a finite number is rejected instead of becoming 0 or NaN. */
+export function parseCoordinate(text: string): number | null {
+    const trimmed = text.trim();
+    if (trimmed === '') return null;
+    const v = Number(trimmed);
+    return Number.isFinite(v) ? v : null;
+}
+
+/** Runs a command-issuing callback; returns the failure message instead of letting an event handler throw, or null on success. */
+export function attempt(fn: () => void): string | null {
+    try {
+        fn();
+        return null;
+    } catch (e) {
+        return e instanceof Error ? e.message : String(e);
+    }
 }

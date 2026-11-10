@@ -1,8 +1,22 @@
-import { BODY_STATE_AWAKE, BODY_STATE_SLEEPING, BODY_STATE_STATIC, type InspectorView } from '@dynova/sdk';
-import { ProfilerWindow, contactsOf, fmt, fmtBytes, fmtVec, listEntities, speed, stateCounts, stateName } from './model.js';
+import { BODY_STATE_AWAKE, BODY_STATE_SLEEPING, BODY_STATE_STATIC, type InspectorView, type RecordingState } from '@dynova/sdk';
+import { ProfilerWindow, attempt, contactsOf, fmt, fmtBytes, fmtVec, listEntities, parseCoordinate, speed, stateCounts, stateName, stepTarget, timelineView } from './model.js';
+
+/**
+ * The write side of the panel. Every method must issue a command (`World.record`, `pause`, `seek`, `teleport`): the panel
+ * never touches simulation memory itself. Leave it out and the panel is read-only.
+ */
+export interface InspectorControls {
+    recording(): RecordingState | null;
+    record(on: boolean): void;
+    pause(on: boolean): void;
+    seek(tick: number): void;
+    /** Moves entity `id` to a position; false when the move was refused (no live entity with that id, or a position the world rejects). */
+    teleport(id: number, x: number, y: number, z: number): boolean;
+}
 
 export interface InspectorOptions {
     view: InspectorView;
+    controls?: InspectorControls;
     /** Turns the runtime's debug snapshot on or off (`world.setInspector`); the panel has no other way to change the simulation. */
     setEnabled(on: boolean): void;
     /** Refresh period in milliseconds. */
@@ -30,6 +44,10 @@ const STYLE = `
 .dyn-insp .muted{color:#7d8799}
 .dyn-insp select,.dyn-insp button{font:inherit;background:#252b36;color:inherit;border:1px solid #3a4456;border-radius:3px}
 .dyn-insp .list{max-height:180px;overflow:auto}
+.dyn-insp .bar{display:flex;gap:4px;margin:2px 0}
+.dyn-insp input[type=range]{width:100%}
+.dyn-insp input.coord{width:64px;font:inherit;background:#252b36;color:inherit;border:1px solid #3a4456;border-radius:3px}
+.dyn-insp input.bad{border-color:#ff6b6b}
 `;
 
 const FILTERS: [string, number | null][] = [['all', null], ['awake', BODY_STATE_AWAKE], ['sleeping', BODY_STATE_SLEEPING], ['static', BODY_STATE_STATIC]];
@@ -88,7 +106,24 @@ export function mountInspector(container: HTMLElement, options: InspectorOptions
     const contactBody = document.createElement('tbody');
     contactTable.appendChild(contactBody);
 
+    const { controls } = options;
+    const timelineBox = el('div', { testid: 'timeline' });
+    const recordBtn = el('button', { testid: 'record' });
+    const pauseBtn = el('button', { testid: 'pause' });
+    const backBtn = el('button', { text: '◀ tick', testid: 'step-back' });
+    const fwdBtn = el('button', { text: 'tick ▶', testid: 'step-forward' });
+    const scrub = el('input', { testid: 'scrub' });
+    scrub.type = 'range';
+    scrub.step = '1';
+    const timelineLabel = el('div', { cls: 'muted', testid: 'timeline-label' });
+    let scrubbing = false;
+    let refused: string | null = null;
+    const bar = el('div', { cls: 'bar' });
+    bar.append(recordBtn, pauseBtn, backBtn, fwdBtn);
+    timelineBox.append(bar, scrub, timelineLabel);
+
     root.append(
+        ...(controls ? [el('h4', { text: 'Timeline' }), timelineBox] : []),
         el('h4', { text: 'Profiler' }), profile, status,
         el('h4', { text: 'Entities' }), counts, filter, listBox, listNote,
         el('h4', { text: 'Selected' }), readout,
@@ -99,8 +134,49 @@ export function mountInspector(container: HTMLElement, options: InspectorOptions
     let selected: number | null = null;
     let disposed = false;
 
+    function renderTimeline(): void {
+        if (!controls) return;
+        const state = controls.recording();
+        const t = timelineView(state);
+        recordBtn.textContent = state?.on ? 'stop recording' : 'record';
+        pauseBtn.textContent = state?.paused ? 'resume' : 'pause';
+        pauseBtn.disabled = !state;
+        backBtn.disabled = stepTarget(state, -1) === null;
+        fwdBtn.disabled = stepTarget(state, 1) === null;
+        scrub.disabled = !t.scrubbable;
+        scrub.min = String(t.min);
+        scrub.max = String(t.max);
+        // Rewriting the value under the pointer would fight the drag that is producing it.
+        if (!scrubbing) scrub.value = String(t.value);
+        timelineLabel.textContent = refused ? `command refused: ${refused}` : t.label;
+        timelineLabel.className = refused ? 'warn' : 'muted';
+        refused = null;
+    }
+
+    /** A seek only makes sense on a stopped clock: a running world forks the timeline at its next step. */
+    function seekTo(tick: number): void {
+        if (!controls) return;
+        const failure = attempt(() => {
+            if (!controls.recording()?.paused) controls.pause(true);
+            controls.seek(tick);
+        });
+        if (failure) {
+            refused = failure;
+            renderTimeline();
+        }
+    }
+
+    function command(fn: () => void): void {
+        const failure = attempt(fn);
+        if (failure) {
+            refused = failure;
+            renderTimeline();
+        }
+    }
+
     function render(): void {
         if (disposed) return;
+        renderTimeline();
         const p = view.profile();
         profiler.push(p, performance.now());
         const rates = profiler.rates();
@@ -116,7 +192,9 @@ export function mountInspector(container: HTMLElement, options: InspectorOptions
 
         const snap = view.snapshot();
         listBody.replaceChildren();
-        readoutBody.replaceChildren();
+        // A half-typed coordinate must survive the refresh timer.
+        const editing = readoutBody.contains(document.activeElement);
+        if (!editing) readoutBody.replaceChildren();
         contactBody.replaceChildren();
         if (!snap) {
             status.textContent = view.missedReads > 0 ? `waiting for a consistent frame (${view.missedReads} missed)` : 'waiting for the first frame';
@@ -146,14 +224,20 @@ export function mountInspector(container: HTMLElement, options: InspectorOptions
         }
         const body = snap.body(selected);
         if (!body || body.state === 0) {
-            row(readoutBody, [`entity ${selected} does not exist`], 'readout-empty');
+            if (!editing) row(readoutBody, [`entity ${selected} does not exist`], 'readout-empty');
             return;
         }
-        row(readoutBody, ['id / state', `${body.id} / ${stateName(body.state)}`], 'r-state');
-        row(readoutBody, ['position', fmtVec(body.position)], 'r-position');
-        row(readoutBody, ['rotation', fmtVec(body.rotation)], 'r-rotation');
-        row(readoutBody, ['velocity', `${fmtVec(body.velocity)} (${fmt(speed(body))} m/s)`], 'r-velocity');
-        row(readoutBody, ['angular vel.', fmtVec(body.angularVelocity)], 'r-angular');
+        if (!editing) {
+            row(readoutBody, ['id / state', `${body.id} / ${stateName(body.state)}`], 'r-state');
+            if (controls) {
+                positionEditor(body.id, body.position);
+            } else {
+                row(readoutBody, ['position', fmtVec(body.position)], 'r-position');
+            }
+            row(readoutBody, ['rotation', fmtVec(body.rotation)], 'r-rotation');
+            row(readoutBody, ['velocity', `${fmtVec(body.velocity)} (${fmt(speed(body))} m/s)`], 'r-velocity');
+            row(readoutBody, ['angular vel.', fmtVec(body.angularVelocity)], 'r-angular');
+        }
         const touching = contactsOf(snap, selected);
         for (const t of touching.slice(0, 12)) {
             row(contactBody, [`↔ ${t.other}`, fmtVec(t.point, 2), `n ${fmtVec(t.normal, 2)}`, `d ${fmt(t.depth, 3)}`], 'contact');
@@ -161,6 +245,53 @@ export function mountInspector(container: HTMLElement, options: InspectorOptions
         if (touching.length > 12) row(contactBody, [`… and ${touching.length - 12} more`]);
         if (touching.length === 0) row(contactBody, ['no contacts'], 'no-contacts');
     }
+
+    function positionEditor(id: number, position: [number, number, number]): void {
+        const tr = document.createElement('tr');
+        tr.dataset.testid = 'r-position';
+        tr.appendChild(el('td', { text: 'position' }));
+        const cell = document.createElement('td');
+        const inputs = (['x', 'y', 'z'] as const).map((axis, k) => {
+            const input = el('input', { cls: 'coord', testid: `pos-${axis}` });
+            input.type = 'text';
+            input.value = fmt(position[k], 3);
+            input.addEventListener('input', () => input.classList.toggle('bad', parseCoordinate(input.value) === null));
+            input.addEventListener('keydown', (e) => {
+                if (e.key !== 'Enter') return;
+                const next = inputs.map((i) => parseCoordinate(i.value));
+                if (next.some((v) => v === null)) return;
+                const [x, y, z] = next as number[];
+                let moved = false;
+                const failure = attempt(() => { moved = controls?.teleport(id, x, y, z) ?? false; });
+                if (moved) input.blur();
+                else {
+                    input.classList.add('bad');
+                    if (failure) { refused = failure; renderTimeline(); }
+                }
+            });
+            return input;
+        });
+        cell.append(...inputs);
+        tr.appendChild(cell);
+        readoutBody.appendChild(tr);
+    }
+
+    recordBtn.addEventListener('click', () => controls && command(() => controls.record(!controls.recording()?.on)));
+    pauseBtn.addEventListener('click', () => controls && command(() => controls.pause(!controls.recording()?.paused)));
+    scrub.addEventListener('pointerdown', () => { scrubbing = true; });
+    const endScrub = () => { scrubbing = false; };
+    scrub.addEventListener('pointerup', endScrub);
+    scrub.addEventListener('pointercancel', endScrub);
+    scrub.addEventListener('change', endScrub);
+    scrub.addEventListener('input', () => seekTo(Number(scrub.value)));
+    backBtn.addEventListener('click', () => {
+        const t = stepTarget(controls?.recording() ?? null, -1);
+        if (t !== null) seekTo(t);
+    });
+    fwdBtn.addEventListener('click', () => {
+        const t = stepTarget(controls?.recording() ?? null, 1);
+        if (t !== null) seekTo(t);
+    });
 
     const onClick = (e: Event) => {
         const tr = (e.target as Element).closest('tr[data-id]') as HTMLElement | null;
@@ -172,6 +303,8 @@ export function mountInspector(container: HTMLElement, options: InspectorOptions
     const panel: InspectorPanel = {
         update: render,
         select(id) {
+            // Inputs for the previous entity must not outlive the selection: they would edit the wrong id.
+            if (readoutBody.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();
             selected = id;
             render();
         },

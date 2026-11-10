@@ -5,7 +5,7 @@ const ready = (page: Page) => page.waitForFunction(() => (window as any).__ready
 async function open(page: Page, query: string) {
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`/inspector.html?paused=1&${query}`);
+    await page.goto(`/inspector.html?paused=1&controls=0&${query}`);
     await ready(page);
     expect(await page.evaluate(() => (window as any).__error)).toBeUndefined();
     return errors;

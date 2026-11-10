@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { InspectedBody, InspectedContact, InspectorSnapshot, ProfilerSample } from '@dynova/sdk';
-import { ProfilerWindow, contactsOf, fmt, fmtBytes, fmtVec, listEntities, speed, stateCounts, stateName } from '../model.js';
+import type { InspectedBody, InspectedContact, InspectorSnapshot, ProfilerSample, RecordingState } from '@dynova/sdk';
+import { ProfilerWindow, attempt, parseCoordinate, stepTarget, timelineView, contactsOf, fmt, fmtBytes, fmtVec, listEntities, speed, stateCounts, stateName } from '../model.js';
 
 const sample = (ticks: number, totalMicros: number, extra: Partial<ProfilerSample> = {}): ProfilerSample => ({
     ticks, stepLastMicros: 0, stepTotalMicros: totalMicros, ringPending: 0, contacts: 0, droppedContacts: 0, workerOverruns: 0,
@@ -154,5 +154,79 @@ describe('formatting', () => {
     it('joins vectors and formats memory sizes', () => {
         expect(fmtVec([1, -0, 2.5], 1)).toBe('1.0, 0.0, 2.5');
         expect(fmtBytes(16 * 1024 * 1024)).toBe('16.0 MiB');
+    });
+});
+
+const rec = (extra: Partial<RecordingState> = {}): RecordingState => ({
+    on: true, paused: false, tick: 50, start: 10, end: 90, keyframes: 2, hash: 0xabcn, seeks: 0, ...extra,
+});
+
+describe('timelineView', () => {
+    it('shows a scrubber over the recorded range with the hash in hex', () => {
+        expect(timelineView(rec())).toEqual({
+            scrubbable: true, min: 10, max: 90, value: 50,
+            label: 'tick 50 of 10–90, 2 keyframes, hash 0000000000000abc',
+        });
+    });
+
+    it('says when the clock is paused', () => {
+        expect(timelineView(rec({ paused: true })).label).toMatch(/, paused$/);
+    });
+
+    it('pads a full 64-bit hash without losing bits', () => {
+        expect(timelineView(rec({ hash: 0xfedcba9876543210n })).label).toMatch(/hash fedcba9876543210/);
+    });
+
+    it('disables the scrubber when nothing is recorded, the read failed, or the range is a single tick', () => {
+        expect(timelineView(null)).toMatchObject({ scrubbable: false, label: 'recording state unavailable' });
+        expect(timelineView(rec({ on: false }))).toMatchObject({ scrubbable: false, label: 'not recording' });
+        expect(timelineView(rec({ start: 20, end: 20, tick: 20 })).scrubbable).toBe(false);
+    });
+
+    it('keeps the thumb inside the range even if the tick is momentarily outside it', () => {
+        expect(timelineView(rec({ tick: 5 })).value).toBe(10);
+        expect(timelineView(rec({ tick: 500 })).value).toBe(90);
+    });
+});
+
+describe('stepTarget', () => {
+    it('moves one tick inside the range and refuses to leave it', () => {
+        expect(stepTarget(rec(), -1)).toBe(49);
+        expect(stepTarget(rec(), 1)).toBe(51);
+        expect(stepTarget(rec({ tick: 10 }), -1)).toBeNull();
+        expect(stepTarget(rec({ tick: 90 }), 1)).toBeNull();
+        expect(stepTarget(rec({ tick: 10 }), 1)).toBe(11);
+    });
+
+    it('reaches the first and last recorded tick but not beyond', () => {
+        expect(stepTarget(rec({ tick: 11 }), -1)).toBe(10);
+        expect(stepTarget(rec({ tick: 89 }), 1)).toBe(90);
+    });
+
+    it('has no target without a recording', () => {
+        expect(stepTarget(null, 1)).toBeNull();
+        expect(stepTarget(rec({ on: false }), 1)).toBeNull();
+    });
+});
+
+describe('parseCoordinate', () => {
+    it('accepts plain, signed, decimal and exponent numbers with surrounding spaces', () => {
+        expect(parseCoordinate(' 3.5 ')).toBe(3.5);
+        expect(parseCoordinate('-2')).toBe(-2);
+        expect(parseCoordinate('1e3')).toBe(1000);
+        expect(parseCoordinate('0')).toBe(0);
+    });
+
+    it('rejects empty, non-numeric and non-finite text instead of turning it into 0 or NaN', () => {
+        for (const bad of ['', '   ', 'abc', '1,5', 'Infinity', '-Infinity', 'NaN', '1 2']) expect(parseCoordinate(bad)).toBeNull();
+    });
+});
+
+describe('attempt', () => {
+    it('returns null when the callback succeeds and the message when it throws', () => {
+        expect(attempt(() => undefined)).toBeNull();
+        expect(attempt(() => { throw new Error('CommandRing full'); })).toBe('CommandRing full');
+        expect(attempt(() => { throw new RangeError('bad tick'); })).toBe('bad tick');
+        expect(attempt(() => { throw 'plain'; })).toBe('plain');
     });
 });

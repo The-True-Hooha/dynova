@@ -172,3 +172,20 @@ describe('EntityIdAllocator.resync', () => {
         expect(a.isLive({ id: 0, gen: 1 })).toBe(true);
     });
 });
+
+describe('EntityIdAllocator.handleOf', () => {
+    it('returns the live handle for an id, and null for free, never-allocated and out-of-range ids', () => {
+        const memory = new WebAssembly.Memory({ initial: 1 });
+        const a = new EntityIdAllocator(memory, 0, 8);
+        const h0 = a.alloc();
+        const h1 = a.alloc();
+        a.free(h0);
+        const again = a.alloc();
+        expect(a.handleOf(1)).toEqual(h1);
+        expect(a.handleOf(0)).toEqual(again);
+        expect(again.gen).toBe(1);
+        a.free(again);
+        expect(a.handleOf(0)).toBeNull();
+        for (const bad of [5, -1, 8, 1.5, NaN]) expect(a.handleOf(bad)).toBeNull();
+    });
+});

@@ -36,6 +36,12 @@ export class EntityIdAllocator {
         return handle.id >= 0 && handle.id < this.capacity && this.liveGen[handle.id] === handle.gen;
     }
 
+    /** The live handle for `id`, or null when nothing live holds that id. */
+    handleOf(id: number): EntityHandle | null {
+        if (!Number.isInteger(id) || id < 0 || id >= this.capacity || this.liveGen[id] === NOT_LIVE) return null;
+        return { id, gen: this.liveGen[id] };
+    }
+
     free(handle: EntityHandle): boolean {
         if (!this.isLive(handle)) return false;
         this.liveGen[handle.id] = NOT_LIVE;

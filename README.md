@@ -58,8 +58,8 @@ dynova/
   renderer/canvas2d/ # Canvas2D adapter (second renderer, proves the adapter contract)
   examples/          # Runnable demos and e2e pages
   e2e/               # Playwright cross-browser tests
-  inspector/         # Read-only inspector panel (@dynova/inspector)
-  docs/              # Hosting notes, adapter contract, Three.js adapter, scene colliders, inspector, benchmark
+  inspector/         # Inspector panel with optional editing and timeline (@dynova/inspector)
+  docs/              # Hosting notes, adapter contract, Three.js adapter, scene colliders, inspector, replay, benchmark
 ```
 
 Planned, not yet built: `inspector/` (Phase 4).
@@ -121,6 +121,6 @@ Open `http://localhost:5173`.
 
 ## Status
 
-Phases 1, 2 and 3 are complete: shared-memory worker runtime with a sync fallback, lock-free triple-buffered transforms with growth, bounded command backpressure, and a physics core (spheres, boxes, capsules, convex hulls, friction, warm starting, island sleeping, swept CCD). Phase 3 Stage 3A is done (Three.js instanced adapter, scene-graph-to-collider fitting, model loading (glTF with Draco/Meshopt, multi-file `.gltf`, OBJ, STL, PLY), convex hulls); Stage 3B is done (shared decode contract in the SDK, Canvas2D adapter, runtime swap demo at `/swap.html`; see [docs/adapter-contract.md](./docs/adapter-contract.md)). Phase 4 Stage 4A (read-only inspector, `/inspector.html`; see [docs/inspector.md](./docs/inspector.md)) is done; Stage 4B (editing, snapshot, replay) is next. Run `make dev` and open `/gltf.html` (drop your own model files on it) or `/stage3a.html?live=1`. See [ROADMAP.md](./ROADMAP.md) and [PLAN.md](./PLAN.md).
+Phases 1, 2 and 3 are complete: shared-memory worker runtime with a sync fallback, lock-free triple-buffered transforms with growth, bounded command backpressure, and a physics core (spheres, boxes, capsules, convex hulls, friction, warm starting, island sleeping, swept CCD). Phase 3 Stage 3A is done (Three.js instanced adapter, scene-graph-to-collider fitting, model loading (glTF with Draco/Meshopt, multi-file `.gltf`, OBJ, STL, PLY), convex hulls); Stage 3B is done (shared decode contract in the SDK, Canvas2D adapter, runtime swap demo at `/swap.html`; see [docs/adapter-contract.md](./docs/adapter-contract.md)). Phase 4 is done: Stage 4A (read-only inspector, `/inspector.html`; see [docs/inspector.md](./docs/inspector.md)) and Stage 4B (drag to reposition, recording, seek and replay scrubbing; see [docs/replay.md](./docs/replay.md)). Run `make dev` and open `/gltf.html` (drop your own model files on it) or `/stage3a.html?live=1`. See [ROADMAP.md](./ROADMAP.md) and [PLAN.md](./PLAN.md).
 
 Known limits: a single column of unit boxes buckles above about 20 high; dynamic-vs-dynamic CCD is not implemented; Firefox is configured in Playwright but was not verified in the development sandbox. A solver golden hash (single-threaded build) matches the native build in Chromium and WebKit; a sin/cos/atan2/sqrt probe also matches; a run on the shared (threaded) build is not done. The 30-body stress scene has no joints (bodies are contained by static walls).

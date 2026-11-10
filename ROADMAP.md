@@ -114,7 +114,7 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 - Profiler: FPS, frame time, swap rate, command queue depth, memory usage
 - **Exit:** inspector runs as a separate panel reading the same SAB the game does, live, no perf hit on the sim (verify: sim FPS unchanged with inspector open vs closed).
 
-### Stage 4B — Inspector read-write + serialization
+### Stage 4B — Inspector read-write + serialization  ✅ done with deviations (`docs/replay.md`): snapshots are in-memory keyframes inside the runtime driven by `Record`/`Seek`/`Pause`/`Teleport` ring commands, with no binary file format (export/import is parked); bit-identical means same build, same browser
 - Click an entity in inspector, drag to reposition -> issues a command, doesn't mutate buffer directly (respect the command-queue-is-the-only-write-path rule even for tooling)
 - Snapshot/restore: serialize full buffer set + command log since last snapshot, binary format
 - Replay scrubbing UI (timeline, jump to tick N by replaying from nearest snapshot + command log)

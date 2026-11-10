@@ -503,3 +503,14 @@ describe('World recording commands', () => {
         expect(world.recording).toMatchObject({ paused: true, tick: 12, on: false });
     });
 });
+
+describe('World.handleOf', () => {
+    it('maps an id to its live handle and refuses after dispose', () => {
+        const { world } = makeWorld({ capacity: 4, ringCapacity: 8 });
+        const h = world.spawn();
+        expect(world.handleOf(h.id)).toEqual(h);
+        expect(world.handleOf(3)).toBeNull();
+        world.dispose();
+        expect(() => world.handleOf(h.id)).toThrow(/world unavailable/);
+    });
+});
