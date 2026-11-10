@@ -28,7 +28,8 @@ async function run() {
             h = ((h * 1099511628211n) & 0xffffffffffffffffn) ^ BigInt(bits[0]);
         }
     }
-    return { hash: h.toString(), probe: glue.determinism_probe().toString(), userAgent: navigator.userAgent };
+    const scene = Array.from(glue.determinism_scene() as BigUint64Array, (v) => v.toString());
+    return { hash: h.toString(), probe: glue.determinism_probe().toString(), scene, userAgent: navigator.userAgent };
 }
 
 run().then(

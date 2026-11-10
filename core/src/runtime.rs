@@ -337,6 +337,22 @@ impl Runtime {
         true
     }
 
+    /// Position of an active body, for tests and tools.
+    pub fn physics_position(&self, id: usize) -> Option<[f32; 3]> {
+        (self.physics_enabled && id < self.physics.capacity && self.physics.active[id])
+            .then(|| [self.physics.pos_x[id], self.physics.pos_y[id], self.physics.pos_z[id]])
+    }
+
+    /// Shape code of an active body, for tests and tools.
+    pub fn physics_shape(&self, id: usize) -> Option<u8> {
+        (self.physics_enabled && id < self.physics.capacity && self.physics.active[id]).then(|| self.physics.shape[id])
+    }
+
+    /// Tick the world is at (the published `ticks` word is only written at the end of a step).
+    pub fn tick(&self) -> u32 {
+        self.head
+    }
+
     pub fn state_hash(&self) -> Option<u64> {
         self.physics_enabled.then(|| runtime_hash(self.physics.state_hash(), &self.generations, &self.live))
     }

@@ -11,6 +11,7 @@ pub mod hull;
 pub mod physics;
 pub mod inspector;
 pub mod recorder;
+pub mod determinism;
 
 pub mod runtime;
 pub use runtime::Runtime;
@@ -47,6 +48,13 @@ pub fn determinism_probe() -> u64 {
         }
     }
     h
+}
+
+/// The Stage 5A determinism scene run entirely inside the module, so native and every browser execute the same code
+/// with no JS-side inputs: `[live end hash, live hash at the middle tick, the same middle tick after a seek, the end after seeking back]`.
+#[wasm_bindgen]
+pub fn determinism_scene() -> Vec<u64> {
+    determinism::run_scene().to_vec()
 }
 
 #[cfg(test)]
