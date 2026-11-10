@@ -124,12 +124,12 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 
 ## Phase 5 — Re-evaluate (gated on data, not calendar)
 
-### Stage 5A — Profiling-driven decisions
+### Stage 5A — Profiling-driven decisions  ✅ done (`docs/decisions/bvh.md`: no BVH, two grid fixes instead; `docs/decisions/determinism.md`: no fixed-point migration, f32 is bit-identical on every build tested)
 - Pull grid bucket histogram data from real usage (Phase 2B onward) — decide BVH switch only if it shows the clustering pathology, not preemptively
 - Decide fixed-point math commitment for lockstep based on the cross-browser f32 determinism results from the Stage 1B smoke test — extend that same harness to cover the actual solver now that it exists, don't write it fresh here
 - **Exit:** written decision doc, per item, backed by data — "BVH: no, grid histogram flat across 3 test scenes" or "BVH: yes, terrain+debris scene shows 40% of pairs in 2% of cells"
 
-### Stage 5B — Scope expansion based on 5A
+### Stage 5B — Scope expansion based on 5A  ⏸ waiting on a user choice: neither decision greenlit a migration or a BVH (the grid fixes shipped as Step 23a); what remains is the second vertical (robotics, CAD or digital twin), which depends on inbound interest the repository cannot show
 - If lockstep verified feasible: fixed-point math migration for solver
 - If BVH warranted: implement as a swappable broad-phase behind the same `query_pairs()` interface, not a rewrite of narrow phase
 - Second vertical target selection (robotics/CAD/digital-twin) — pick one, not all three, based on which non-goal from VISION.md is getting the most inbound interest
