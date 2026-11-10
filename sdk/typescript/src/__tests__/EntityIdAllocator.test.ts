@@ -127,3 +127,48 @@ describe('EntityIdAllocator', () => {
         }
     });
 });
+
+describe('EntityIdAllocator.resync', () => {
+    function allocated(n: number) {
+        const memory = new WebAssembly.Memory({ initial: 1 });
+        const a = new EntityIdAllocator(memory, 0, 16);
+        const handles = Array.from({ length: n }, () => a.alloc());
+        return { a, handles };
+    }
+
+    it('keeps handles that are live in the runtime and drops the rest', () => {
+        const { a, handles } = allocated(4);
+        a.resync(Uint8Array.from([0, 1, 0, 2]), Uint8Array.from([1, 0, 1, 1]));
+        expect(handles.map((h) => a.isLive(h))).toEqual([true, false, true, false]);
+        expect(a.isLive({ id: 3, gen: 2 })).toBe(true);
+    });
+
+    it('frees every dead id below the counter with the generation the runtime expects, lowest id first', () => {
+        const { a } = allocated(4);
+        a.resync(Uint8Array.from([0, 7, 0, 255]), Uint8Array.from([0, 0, 1, 0]));
+        expect([a.alloc(), a.alloc(), a.alloc()]).toEqual([{ id: 0, gen: 0 }, { id: 1, gen: 7 }, { id: 3, gen: 255 }]);
+        expect(a.alloc()).toEqual({ id: 4, gen: 0 });
+    });
+
+    it('does not free ids that were never allocated and ignores a table shorter than the counter', () => {
+        const { a } = allocated(4);
+        a.resync(Uint8Array.from([0, 0]), Uint8Array.from([1, 1]));
+        expect(a.alloc()).toEqual({ id: 4, gen: 0 });
+        expect(a.isLive({ id: 0, gen: 0 })).toBe(true);
+    });
+
+    it('never frees an id the table mentions but the allocator has not handed out', () => {
+        const { a } = allocated(3);
+        const gens = new Uint8Array(8);
+        gens[5] = 9;
+        a.resync(gens, new Uint8Array(8));
+        expect([0, 1, 2, 3, 4, 5].map(() => a.alloc())).toEqual([0, 1, 2, 3, 4, 5].map((id) => ({ id, gen: 0 })));
+    });
+
+    it('a handle issued before the resync for a slot the runtime reports as a newer generation is stale', () => {
+        const { a, handles } = allocated(1);
+        a.resync(Uint8Array.from([1]), Uint8Array.from([1]));
+        expect(a.isLive(handles[0])).toBe(false);
+        expect(a.isLive({ id: 0, gen: 1 })).toBe(true);
+    });
+});

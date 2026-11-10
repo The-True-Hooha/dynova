@@ -69,6 +69,19 @@ impl Recorder {
         self.is_armed() || tick.is_multiple_of(KEYFRAME_INTERVAL) || self.since_keyframe >= MAX_SEGMENT_COMMANDS
     }
 
+    /// Commands applied on a paused world pile up at the head tick without a step to put a keyframe after them.
+    pub fn wants_bake(&self) -> bool {
+        self.since_keyframe >= MAX_SEGMENT_COMMANDS
+    }
+
+    /// Keyframe taken on a paused world: its state already includes the commands logged at `tick`, so they leave the
+    /// log; replaying them on top of this keyframe would apply them twice.
+    pub fn bake_pending(&mut self, tick: u32, snapshot: RuntimeSnapshot) {
+        let cut = self.log.partition_point(|(t, _)| *t < tick);
+        self.log.truncate(cut);
+        self.push_keyframe(tick, snapshot);
+    }
+
     pub fn push_keyframe(&mut self, tick: u32, snapshot: RuntimeSnapshot) {
         self.bytes += snapshot.approx_bytes();
         self.keyframes.push(Keyframe { tick, snapshot });
@@ -254,6 +267,28 @@ mod tests {
         tiny.push_keyframe(0, snap());
         tiny.push_keyframe(1, snap());
         assert_eq!(tiny.keyframe_count(), 1, "the newest keyframe is always kept");
+    }
+
+    #[test]
+    fn baking_pending_commands_into_a_keyframe_removes_them_from_the_log() {
+        let mut r = recorder_with(&[1, 2]);
+        r.advance_end(3);
+        r.push_command(3, &force(3));
+        r.push_command(3, &force(3));
+        r.bake_pending(3, snap());
+        assert_eq!((r.keyframe_count(), r.log_len(), r.end()), (2, 2, 3));
+        let (k, cmds) = r.plan(3).unwrap();
+        assert_eq!((k.tick, cmds.len()), (3, 0), "seeking the baked tick lands on the keyframe, no replay");
+        assert!(!r.wants_bake());
+    }
+
+    #[test]
+    fn a_bake_is_wanted_only_after_a_full_segment() {
+        let mut r = recorder_with(&[]);
+        for _ in 0..MAX_SEGMENT_COMMANDS - 1 { r.push_command(0, &force(0)); }
+        assert!(!r.wants_bake());
+        r.push_command(0, &force(0));
+        assert!(r.wants_bake());
     }
 
     #[test]

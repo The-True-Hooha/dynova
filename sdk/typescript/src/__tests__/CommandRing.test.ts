@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, SHAPE_HULL, SLOT_BYTES } from '../CommandRing.js';
+import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, SHAPE_HULL, SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE } from '../CommandRing.js';
 
 function makeRing(capacity = 16) {
     const mem = new WebAssembly.Memory({ initial: 1 });
@@ -10,6 +10,50 @@ function makeRing(capacity = 16) {
 }
 
 describe('CommandRing', () => {
+    // The same wire values are asserted in core/src/command_ring.rs (wire_tags_are_pinned_to_the_values_the_typescript_ring_writes).
+    it('pins the tag values of the recording commands', () => {
+        expect([TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE]).toEqual([8, 9, 10, 11]);
+    });
+
+    it('teleport encodes tag, id, gen and position and clears the rest of the slot', () => {
+        const { mem, ring } = makeRing();
+        new Uint8Array(mem.buffer, 0, SLOT_BYTES).fill(0xff);
+        expect(ring.teleport({ id: 70000, gen: 255, x: 1.5, y: -2, z: 3 })).toBe(true);
+        const view = new DataView(mem.buffer);
+        expect([view.getUint8(0), view.getUint32(1, true), view.getUint8(5)]).toEqual([TAG_TELEPORT, 70000, 255]);
+        expect([view.getFloat32(6, true), view.getFloat32(10, true), view.getFloat32(14, true)]).toEqual([1.5, -2, 3]);
+        expect(view.getUint8(18)).toBe(0);
+        expect(view.getUint8(63)).toBe(0);
+    });
+
+    it('record and pause encode a 0/1 flag at the payload byte', () => {
+        const { mem, ring } = makeRing();
+        const view = new DataView(mem.buffer);
+        ring.record(true);
+        ring.record(false);
+        ring.pause(true);
+        ring.pause(false);
+        const at = (n: number) => [view.getUint8(n * SLOT_BYTES), view.getUint8(n * SLOT_BYTES + 6)];
+        expect([at(0), at(1), at(2), at(3)]).toEqual([[TAG_RECORD, 1], [TAG_RECORD, 0], [TAG_PAUSE, 1], [TAG_PAUSE, 0]]);
+    });
+
+    it('seek encodes the tick as an unsigned 32-bit id field, including the maximum', () => {
+        const { mem, ring } = makeRing();
+        ring.seek(0);
+        ring.seek(0xffffffff);
+        const view = new DataView(mem.buffer);
+        expect([view.getUint8(0), view.getUint32(1, true)]).toEqual([TAG_SEEK, 0]);
+        expect([view.getUint8(SLOT_BYTES), view.getUint32(SLOT_BYTES + 1, true)]).toEqual([TAG_SEEK, 0xffffffff]);
+    });
+
+    it('the new commands report a full ring instead of overwriting', () => {
+        const { ring } = makeRing();
+        let n = 0;
+        while (ring.seek(n)) n++;
+        expect(n).toBeGreaterThan(0);
+        expect([ring.teleport({ id: 0, gen: 0, x: 0, y: 0, z: 0 }), ring.record(true), ring.pause(true), ring.seek(1)]).toEqual([false, false, false, false]);
+    });
+
     it('spawn encodes tag, id, gen, and position', () => {
         const { mem, ring } = makeRing();
         expect(ring.spawn({ id: 7, gen: 3, x: 1, y: 2, z: 3, qx: 0, qy: 0, qz: 0, qw: 1 })).toBe(true);

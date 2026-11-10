@@ -1,14 +1,15 @@
 export { TransformView, FLOATS_PER_TRANSFORM } from './TransformView.js';
+export type { RecordingState } from './TransformView.js';
 export { InspectorView, BODY_STATE_INACTIVE, BODY_STATE_AWAKE, BODY_STATE_SLEEPING, BODY_STATE_STATIC } from './InspectorView.js';
 export type { InspectorSnapshot, InspectedBody, InspectedContact, ProfilerSample } from './InspectorView.js';
-export { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, SHAPE_HULL, SLOT_BYTES, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_VERTS, MAX_HULL_COORD } from './CommandRing.js';
+export { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, SHAPE_HULL, SLOT_BYTES, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, MAX_CAPACITY, MAX_HULLS, MAX_HULL_VERTS, MAX_HULL_COORD } from './CommandRing.js';
 export { EntityIdAllocator } from './EntityIdAllocator.js';
 export { World, layoutFromRuntime } from './World.js';
 export { launchWorld } from './launch.js';
 export { createMemory, detectMode } from './memory.js';
 export type { WorldConfig, WorldLayout, SpawnOptions, RuntimePointers, StepDriver, GrowthEvent } from './World.js';
 export type { LaunchOptions, FallbackRuntime, SimInit, SimMessage } from './launch.js';
-export type { SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
+export type { SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc } from './CommandRing.js';
 export type { EntityHandle } from './EntityIdAllocator.js';
 export type { MemoryMode, MemoryResult } from './memory.js';
 export { decodeTransforms, assertIdOffset } from './adapter.js';

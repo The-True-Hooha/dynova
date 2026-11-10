@@ -1,5 +1,6 @@
 import { HEADER_WORDS, TransformView } from './TransformView.js';
-import { CommandRing, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc } from './CommandRing.js';
+import type { RecordingState } from './TransformView.js';
+import { CommandRing, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import type { MemoryMode } from './memory.js';
 
@@ -70,10 +71,15 @@ type Queued =
     | { k: 'grow'; capacity: number }
     | { k: 'gravity'; v: [number, number, number] }
     | { k: 'inspect'; on: boolean }
+    | { k: 'teleport'; d: TeleportDesc }
+    | { k: 'record'; on: boolean }
+    | { k: 'pause'; on: boolean }
+    | { k: 'seek'; tick: number }
     | { k: 'hullVerts'; hull: number; coords: number[] }
     | { k: 'hullCommit'; hull: number; count: number };
 
 const DEFAULT_MAX_DEFERRED = 1 << 16;
+const MAX_TELEPORT_COORD = 1e6;
 
 export class World {
     readonly memory: WebAssembly.Memory;
@@ -98,6 +104,7 @@ export class World {
     private growths = 0;
     private pendingGrow = 0;
     private nextHull = 0;
+    private knownSeeks = 0;
 
     private constructor(
         config: WorldConfig,
@@ -171,6 +178,14 @@ export class World {
             this.ids.reacquire(this.memory, layout.idCounterByteOffset);
             changed = true;
         }
+        const seeks = this.transforms.seekCount();
+        // Only once nothing is in flight: a queued Spawn or Destroy is not in the runtime's tables yet, so resyncing now
+        // would free its id (and hand it out twice) or revive a handle that is about to be destroyed.
+        if (seeks !== this.knownSeeks && this.pendingCommands === 0) {
+            this.knownSeeks = seeks;
+            const { generations, live } = this.transforms.slotTables();
+            this.ids.resync(generations, live);
+        }
         const peek = this.transforms.peekEpoch();
         if ((peek & 1) === 0 && peek !== this.knownEpoch) {
             this.transforms.reacquire();
@@ -211,6 +226,10 @@ export class World {
             case 'grow': return this.ring.grow(c.capacity);
             case 'gravity': return this.ring.gravity(...c.v);
             case 'inspect': return this.ring.inspect(c.on);
+            case 'teleport': return this.ring.teleport(c.d);
+            case 'record': return this.ring.record(c.on);
+            case 'pause': return this.ring.pause(c.on);
+            case 'seek': return this.ring.seek(c.tick);
             case 'hullVerts': return this.ring.hullVerts(c.hull, c.coords);
             case 'hullCommit': return this.ring.hullCommit(c.hull, c.count);
         }
@@ -273,6 +292,54 @@ export class World {
         this.assertAlive();
         if (!this.ids.isLive(handle)) throw new Error(`stale handle {id: ${handle.id}, gen: ${handle.gen}}`);
         if (!this.enqueue({ k: 'force', d: { id: handle.id, gen: handle.gen, x, y, z } })) throw new Error('CommandRing full');
+    }
+
+    /**
+     * Move a body to a position through the command ring, clearing its motion. Needs the physics module; the body keeps
+     * its rotation.
+     */
+    teleport(handle: EntityHandle, x: number, y: number, z: number): void {
+        this.assertAlive();
+        if (![x, y, z].every((v) => Number.isFinite(v) && Math.abs(v) <= MAX_TELEPORT_COORD)) throw new RangeError(`teleport position must be finite and within +-${MAX_TELEPORT_COORD}`);
+        if (!this.ids.isLive(handle)) throw new Error(`stale handle {id: ${handle.id}, gen: ${handle.gen}}`);
+        if (!this.enqueue({ k: 'teleport', d: { id: handle.id, gen: handle.gen, x, y, z } })) throw new Error('CommandRing full');
+    }
+
+    /**
+     * Start or stop recording. While on, the runtime keeps keyframes and a command log so `seek` can jump to any tick in
+     * `recording.start..recording.end`. Needs the physics module.
+     */
+    record(on: boolean): void {
+        this.assertAlive();
+        if (!this.enqueue({ k: 'record', on })) throw new Error('CommandRing full');
+    }
+
+    /**
+     * Stop or resume the simulation clock. A paused runtime still applies commands (so `seek` and `teleport` work) but
+     * runs no physics step and publishes no new tick.
+     */
+    pause(on: boolean): void {
+        this.assertAlive();
+        if (!this.enqueue({ k: 'pause', on })) throw new Error('CommandRing full');
+    }
+
+    /**
+     * Jump to a recorded tick: the world becomes the recorded state at that tick, before any command applied there, so an
+     * edit made while paused at that tick is discarded (a live step commits it). Takes effect when the runtime processes
+     * the command. Entity handles are re-synced with the runtime on the first read or command after the runtime has
+     * drained every queued command: handles for entities that did not exist at that tick go stale and their ids come
+     * back. Pause first, because a running world forks the timeline at its next step. A tick outside
+     * `recording.start..recording.end` counts in `runtimeCounters.malformedDropped`.
+     */
+    seek(tick: number): void {
+        this.assertAlive();
+        if (!Number.isInteger(tick) || tick < 0 || tick > 0xffffffff) throw new RangeError(`tick must be an integer in [0, 2^32), got ${tick}`);
+        if (!this.enqueue({ k: 'seek', tick })) throw new Error('CommandRing full');
+    }
+
+    /** Recording range, paused flag, tick and state hash; `null` if the runtime kept rewriting them through every read attempt. */
+    get recording(): RecordingState | null {
+        return this.transforms.recording();
     }
 
     /**

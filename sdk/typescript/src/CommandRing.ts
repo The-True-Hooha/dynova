@@ -8,6 +8,10 @@ export const TAG_GRAVITY = 4;
 export const TAG_HULL_VERTS = 5;
 export const TAG_HULL_COMMIT = 6;
 export const TAG_INSPECT = 7;
+export const TAG_TELEPORT = 8;
+export const TAG_RECORD = 9;
+export const TAG_SEEK = 10;
+export const TAG_PAUSE = 11;
 export const HULL_VERTS_PER_SLOT = 4;
 export const MAX_HULL_VERTS = 32;
 export const MAX_HULLS = 1024;
@@ -35,6 +39,12 @@ export interface SpawnDesc {
 export interface DestroyDesc {
     id: number;
     gen: number;
+}
+
+export interface TeleportDesc {
+    id: number;
+    gen: number;
+    x: number; y: number; z: number;
 }
 
 export interface ForceDesc {
@@ -173,6 +183,51 @@ export class CommandRing {
         for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
         this.view.setUint8(off, TAG_INSPECT);
         this.view.setUint8(off + 6, on ? 1 : 0);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    teleport(desc: TeleportDesc): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_TELEPORT);
+        this.view.setUint32(off + 1, desc.id, true);
+        this.view.setUint8(off + 5, desc.gen);
+        this.view.setFloat32(off + 6, desc.x, true);
+        this.view.setFloat32(off + 10, desc.y, true);
+        this.view.setFloat32(off + 14, desc.z, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    private flag(tag: number, on: boolean): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, tag);
+        this.view.setUint8(off + 6, on ? 1 : 0);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    record(on: boolean): boolean {
+        return this.flag(TAG_RECORD, on);
+    }
+
+    pause(on: boolean): boolean {
+        return this.flag(TAG_PAUSE, on);
+    }
+
+    seek(tick: number): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_SEEK);
+        this.view.setUint32(off + 1, tick, true);
         Atomics.add(this.tail, 0, 1);
         return true;
     }

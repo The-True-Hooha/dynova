@@ -43,7 +43,21 @@ const H_REC_END: usize = 26;
 const H_HASH_LO: usize = 27;
 const H_HASH_HI: usize = 28;
 const H_KEYFRAMES: usize = 29;
-pub const HEADER_WORDS: usize = 30;
+// Paused flag, a counter of successful seeks (JS resyncs its entity handles when it changes) and the address of the live flags (one byte per entity).
+const H_PAUSED: usize = 30;
+const H_SEEKS: usize = 31;
+// Seqlock over the recording words (odd while the runtime rewrites them), so a reader never pairs half a hash with another step's range.
+const H_REC_SEQ: usize = 33;
+const H_LIVE: usize = 32;
+pub const HEADER_WORDS: usize = 34;
+
+/// What a step did to the tick counter.
+#[derive(Clone, Copy, PartialEq)]
+enum Tick {
+    Advanced,
+    Seeked,
+    Paused,
+}
 
 #[wasm_bindgen]
 pub struct Runtime {
@@ -63,6 +77,8 @@ pub struct Runtime {
     recorder: Option<Recorder>,
     /// Tick the world is at, ahead of the published `ticks` word while a step is still running (a seek moves it mid-step).
     head: u32,
+    paused: bool,
+    seeks: u32,
 }
 
 #[wasm_bindgen]
@@ -87,6 +103,8 @@ impl Runtime {
             inspecting: false,
             recorder: None,
             head: 0,
+            paused: false,
+            seeks: 0,
         };
         let mut rt = rt;
         rt.bucket_view = (0..rt.physics.bucket_counts.len()).map(|_| AtomicU32::new(0)).collect();
@@ -95,7 +113,7 @@ impl Runtime {
         rt
     }
 
-    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts, inspector seq, bodies ptr, contacts ptr, contact count, step last us and step total us (written by the JS step driver), inspector tick, inspector on, recording on, recorded start tick, recorded end tick, state hash low and high words, keyframe count].
+    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts, inspector seq, bodies ptr, contacts ptr, contact count, step last us and step total us (written by the JS step driver), inspector tick, inspector on, recording on, recorded start tick, recorded end tick, state hash low and high words, keyframe count, paused, seek count, live flags pointer, recording seqlock].
     pub fn header_ptr(&self) -> *const u32 {
         self.header.as_ptr() as *const u32
     }
@@ -158,12 +176,17 @@ impl Runtime {
         self.ring.drain_commands(4096, &mut commands);
         let mut seeked: Option<u32> = None;
         let mut seek_tried = false;
+        let mut applied = false;
         // Logged only after the whole batch: a seek discards the world those commands were applied to.
         let mut to_log: Vec<(u32, Command)> = Vec::new();
         for cmd in commands.drain(..) {
             match cmd {
                 Command::Record { on } => {
                     self.set_recording(on);
+                    continue;
+                }
+                Command::Pause { on } => {
+                    self.paused = on;
                     continue;
                 }
                 Command::Seek { tick } => {
@@ -174,6 +197,7 @@ impl Runtime {
                         seek_tried = true;
                         seeked = Some(tick);
                         to_log.clear();
+                        self.seeks = self.seeks.wrapping_add(1);
                     } else {
                         self.ring.note_malformed();
                         // A rejected seek must not turn into a live step that overwrites the recorded future.
@@ -187,7 +211,9 @@ impl Runtime {
             }
             let keep = self.recorder.is_some() && Recorder::loggable(&cmd);
             let copy = keep.then(|| cmd.clone());
-            if let (true, Some(c)) = (self.apply_command(cmd), copy) {
+            let accepted = self.apply_command(cmd);
+            applied |= accepted;
+            if let (true, Some(c)) = (accepted, copy) {
                 to_log.push((self.head, c));
             }
         }
@@ -196,8 +222,21 @@ impl Runtime {
         }
         self.commands = commands;
 
+        // A paused world still drains commands (a seek or a drag must work) but does not advance.
+        let mode = match (seeked, self.paused) {
+            (Some(_), _) => Tick::Seeked,
+            (None, true) => Tick::Paused,
+            (None, false) => Tick::Advanced,
+        };
+        let seeked = seeked.or(self.paused.then_some(self.head));
         let new_tick = match seeked {
-            Some(tick) => tick,
+            Some(tick) => {
+                // No physics step ran, so a command that moved a body (a drag) must still reach the frame.
+                if applied {
+                    self.write_transforms();
+                }
+                tick
+            }
             None => {
                 self.fork_if_rewound();
                 self.advance_physics();
@@ -210,7 +249,8 @@ impl Runtime {
             inspector.write(&self.header[H_INSPECT_SEQ], &self.header[H_INSPECT_CONTACT_N], &self.header[H_INSPECT_TICK], new_tick, &self.physics);
         }
 
-        self.record_tick(new_tick, seeked.is_some());
+        self.header[H_PAUSED].store(self.paused as u32, Ordering::Release);
+        self.record_tick(new_tick, mode);
 
         self.transforms.publish(&self.header[H_STATE]);
         self.header[H_STALE].store(self.ring.stale_dropped(), Ordering::Release);
@@ -223,6 +263,7 @@ impl Runtime {
         self.header[H_RING_PENDING].store(self.ring.len(), Ordering::Release);
         self.header[H_DROPPED_CONTACTS].store(self.physics.dropped_contacts, Ordering::Release);
         self.header[H_CONTACTS].store(self.physics.contacts.len() as u32, Ordering::Release);
+        self.header[H_SEEKS].store(self.seeks, Ordering::Release);
         self.header[H_TICKS].store(new_tick, Ordering::Release);
     }
 }
@@ -388,7 +429,7 @@ impl Runtime {
                 self.physics.gz = z;
                 return true;
             }
-            Command::Record { .. } | Command::Seek { .. } => return false,
+            Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. } => return false,
             _ => {}
         }
         let Some((id, generation)) = cmd.target() else { return false };
@@ -428,6 +469,13 @@ impl Runtime {
             return;
         }
         self.physics.step();
+        self.write_transforms();
+    }
+
+    fn write_transforms(&mut self) {
+        if !self.physics_enabled {
+            return;
+        }
         let p = &self.physics;
         for i in 0..p.capacity {
             if !p.active[i] {
@@ -495,28 +543,38 @@ impl Runtime {
         done
     }
 
-    fn record_tick(&mut self, tick: u32, seeked: bool) {
-        let Some(want) = self.recorder.as_ref().map(|r| !seeked && r.wants_keyframe(tick)) else {
-            for w in H_REC_ON..HEADER_WORDS {
+    fn record_tick(&mut self, tick: u32, mode: Tick) {
+        let Some(want) = self.recorder.as_ref().map(|r| match mode {
+            _ if r.is_armed() => true,
+            Tick::Advanced => r.wants_keyframe(tick),
+            Tick::Paused => r.wants_bake(),
+            Tick::Seeked => false,
+        }) else {
+            self.header[H_REC_SEQ].fetch_add(1, Ordering::AcqRel);
+            for w in H_REC_ON..=H_KEYFRAMES {
                 self.header[w].store(0, Ordering::Release);
             }
+            self.header[H_REC_SEQ].fetch_add(1, Ordering::AcqRel);
             return;
         };
         let snapshot = if want { self.capture() } else { None };
         let hash = self.state_hash().unwrap_or(0);
         let Some(rec) = self.recorder.as_mut() else { return };
-        match snapshot {
-            Some(s) => rec.push_keyframe(tick, s),
-            None if !seeked => rec.advance_end(tick),
-            None => {}
+        match (snapshot, mode) {
+            (Some(s), Tick::Paused) if !rec.is_armed() => rec.bake_pending(tick, s),
+            (Some(s), _) => rec.push_keyframe(tick, s),
+            (None, Tick::Advanced) => rec.advance_end(tick),
+            (None, _) => {}
         }
         let h = &self.header;
+        h[H_REC_SEQ].fetch_add(1, Ordering::AcqRel);
         h[H_HASH_LO].store(hash as u32, Ordering::Release);
         h[H_HASH_HI].store((hash >> 32) as u32, Ordering::Release);
         h[H_REC_START].store(rec.start(), Ordering::Release);
         h[H_REC_END].store(rec.end(), Ordering::Release);
         h[H_KEYFRAMES].store(rec.keyframe_count() as u32, Ordering::Release);
         h[H_REC_ON].store(1, Ordering::Release);
+        h[H_REC_SEQ].fetch_add(1, Ordering::AcqRel);
     }
 
     fn publish_layout(&self) {
@@ -526,6 +584,7 @@ impl Runtime {
             h[H_BUF0 + i].store(self.transforms.buf_ptr(i) as u32, Ordering::Release);
         }
         h[H_GENERATIONS].store(self.generations.as_ptr() as u32, Ordering::Release);
+        h[H_LIVE].store(self.live.as_ptr() as u32, Ordering::Release);
         h[H_BUCKETS].store(self.bucket_view.as_ptr() as u32, Ordering::Release);
         h[H_BUCKET_LEN].store(self.bucket_view.len() as u32, Ordering::Release);
         let (bodies, contacts) = self.inspector.as_ref().map_or((0, 0), |i| (i.bodies.as_ptr() as u32, i.contacts.as_ptr() as u32));
@@ -2125,10 +2184,11 @@ mod tests {
         assert_eq!(
             [H_EPOCH, H_CAPACITY, H_BUF0, H_STATE, H_GENERATIONS, H_TICKS, H_STALE, H_MALFORMED, H_BUCKETS, H_BUCKET_LEN, H_RING_PENDING,
              H_DROPPED_CONTACTS, H_OVERRUNS, H_CONTACTS, H_INSPECT_SEQ, H_INSPECT_BODIES, H_INSPECT_CONTACTS, H_INSPECT_CONTACT_N,
-             H_STEP_LAST_US, H_STEP_TOTAL_US, H_INSPECT_TICK, H_INSPECT_ON, H_REC_ON, H_REC_START, H_REC_END, H_HASH_LO, H_HASH_HI, H_KEYFRAMES],
-            [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29],
+             H_STEP_LAST_US, H_STEP_TOTAL_US, H_INSPECT_TICK, H_INSPECT_ON, H_REC_ON, H_REC_START, H_REC_END, H_HASH_LO, H_HASH_HI, H_KEYFRAMES,
+             H_PAUSED, H_SEEKS, H_LIVE, H_REC_SEQ],
+            [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33],
         );
-        assert_eq!(HEADER_WORDS, 30);
+        assert_eq!(HEADER_WORDS, 34);
     }
 
     #[test]
@@ -2261,5 +2321,174 @@ mod tests {
         rt.enable_physics();
         let s = rt.capture().unwrap();
         assert_eq!(s.approx_bytes(), s.physics.approx_bytes() + 8 * 2);
+    }
+
+    #[test]
+    fn a_paused_world_drains_commands_but_does_not_advance() {
+        let mut rt = snapshot_scene();
+        run(&mut rt, 10);
+        rt.ring.push(&Command::Pause { on: true });
+        rt.step();
+        let (ticks, hash) = (header(&rt, H_TICKS), rt.state_hash());
+        assert_eq!(header(&rt, H_PAUSED), 1);
+        run(&mut rt, 5);
+        assert_eq!((header(&rt, H_TICKS), rt.state_hash()), (ticks, hash), "no tick, no motion while paused");
+        rt.ring.push(&Command::Teleport { id: 1, generation: 0, x: 7.0, y: 7.0, z: 7.0 });
+        rt.step();
+        assert_eq!(entity(&rt, 1)[..3], [7.0, 7.0, 7.0], "a command still applies and its transform is published while paused");
+        assert_eq!(header(&rt, H_TICKS), ticks);
+        rt.ring.push(&Command::Pause { on: false });
+        rt.step();
+        assert_eq!((header(&rt, H_TICKS), header(&rt, H_PAUSED)), (ticks + 1, 0));
+    }
+
+    #[test]
+    fn the_seek_counter_counts_successful_seeks_only() {
+        let (mut rt, _) = recorded_run();
+        assert_eq!(header(&rt, H_SEEKS), 0);
+        seek_to(&mut rt, 50);
+        seek_to(&mut rt, 51);
+        assert_eq!(header(&rt, H_SEEKS), 2);
+        seek_to(&mut rt, u32::MAX);
+        for t in [60, 70] { rt.ring.push(&Command::Seek { tick: t }); }
+        rt.step();
+        assert_eq!(header(&rt, H_SEEKS), 3, "a rejected seek and an extra seek in one batch do not count");
+    }
+
+    #[test]
+    fn seeking_while_paused_works_and_resuming_forks_from_there() {
+        let (mut rt, takes) = recorded_run();
+        rt.ring.push(&Command::Pause { on: true });
+        rt.step();
+        for t in [30, 200, 120] {
+            seek_to(&mut rt, t);
+            assert_eq!((header(&rt, H_TICKS), hash_header(&rt)), (t, takes[t as usize].hash));
+        }
+        assert_eq!(header(&rt, H_REC_END), RUN, "pausing and seeking keeps the recorded future");
+        rt.ring.push(&Command::Pause { on: false });
+        rt.step();
+        assert_eq!((header(&rt, H_TICKS), header(&rt, H_REC_END)), (121, 121));
+    }
+
+    #[test]
+    fn a_command_while_paused_and_rewound_matches_the_same_command_in_the_seek_batch() {
+        let force = Command::Force { id: 2, generation: 0, x: 0.0, y: 150.0, z: 0.0 };
+        let (mut a, _) = recorded_run();
+        a.ring.push(&Command::Seek { tick: 105 });
+        a.ring.push(&force);
+        a.step();
+        a.step();
+        let (mut b, _) = recorded_run();
+        b.ring.push(&Command::Pause { on: true });
+        b.step();
+        seek_to(&mut b, 105);
+        b.ring.push(&force);
+        b.step();
+        b.ring.push(&Command::Pause { on: false });
+        b.step();
+        assert_eq!((header(&a, H_TICKS), hash_header(&a)), (106, hash_header(&b)));
+        assert_eq!(frame_bits(&a), frame_bits(&b));
+        seek_to(&mut b, 1);
+        seek_to(&mut b, 106);
+        assert_eq!(hash_header(&b), hash_header(&a), "the forked log replays to the same state");
+    }
+
+    #[test]
+    fn recording_started_while_paused_still_takes_its_first_keyframe() {
+        let mut rt = snapshot_scene();
+        rt.ring.push(&Command::Pause { on: true });
+        rt.ring.push(&Command::Record { on: true });
+        rt.step();
+        assert_eq!((header(&rt, H_REC_ON), header(&rt, H_KEYFRAMES)), (1, 1));
+        let t = header(&rt, H_TICKS);
+        assert_eq!((header(&rt, H_REC_START), header(&rt, H_REC_END)), (t, t));
+    }
+
+    #[test]
+    fn the_live_flag_pointer_tracks_the_live_vec_through_spawns_destroys_and_growth() {
+        let mut rt = Runtime::new(4, 32);
+        rt.enable_physics();
+        assert_eq!(header(&rt, H_LIVE), rt.live.as_ptr() as u32);
+        rt.ring.push(&spawn_cmd(1, 0, unit_box(0.0, 3.0, 0.0)));
+        rt.ring.push(&spawn_cmd(3, 0, unit_box(2.0, 3.0, 0.0)));
+        rt.step();
+        assert_eq!(rt.live, vec![false, true, false, true]);
+        rt.ring.push(&Command::Destroy { id: 1, generation: 0 });
+        rt.ring.push(&Command::Grow { capacity: 64 });
+        rt.step();
+        assert_eq!(header(&rt, H_LIVE), rt.live.as_ptr() as u32, "republished after the Vec moved");
+        assert_eq!((rt.live.len(), rt.live[1], rt.live[3]), (64, false, true));
+    }
+
+    #[test]
+    fn a_paused_edit_is_discarded_by_a_seek_to_the_same_tick_and_kept_by_resuming() {
+        let (mut rt, _) = recorded_run();
+        rt.ring.push(&Command::Pause { on: true });
+        rt.step();
+        let recorded = hash_header(&rt);
+        rt.ring.push(&Command::Teleport { id: 3, generation: 0, x: 9.0, y: 9.0, z: 0.0 });
+        rt.step();
+        let edited = hash_header(&rt);
+        assert_ne!(edited, recorded);
+        assert_eq!(header(&rt, H_TICKS), RUN);
+        seek_to(&mut rt, RUN);
+        assert_eq!(hash_header(&rt), recorded, "the recorded state at a tick excludes edits not yet committed by a step");
+
+        rt.ring.push(&Command::Teleport { id: 3, generation: 0, x: 9.0, y: 9.0, z: 0.0 });
+        rt.step();
+        rt.ring.push(&Command::Pause { on: false });
+        rt.step();
+        let live = take(&rt);
+        seek_to(&mut rt, 1);
+        seek_to(&mut rt, RUN + 1);
+        assert_eq!((hash_header(&rt), frame_bits(&rt)), (live.hash, live.frame), "an edit committed by a live step replays");
+    }
+
+    #[test]
+    fn a_long_paused_drag_is_baked_into_keyframes_instead_of_growing_the_log() {
+        let mut rt = Runtime::new(16, 8192);
+        rt.enable_physics();
+        rt.ring.push(&Command::Record { on: true });
+        rt.ring.push(&floor());
+        rt.ring.push(&spawn_cmd(1, 0, unit_box(0.0, 3.0, 0.0)));
+        rt.step();
+        rt.ring.push(&Command::Pause { on: true });
+        rt.step();
+        let tick = header(&rt, H_TICKS);
+        let keyframes = header(&rt, H_KEYFRAMES);
+        for i in 0..3 * 4096u32 {
+            rt.ring.push(&Command::Teleport { id: 1, generation: 0, x: (i % 50) as f32, y: 3.0, z: 0.0 });
+            if i % 4096 == 4095 { rt.step(); }
+        }
+        assert_eq!(header(&rt, H_TICKS), tick, "still paused");
+        assert_eq!(header(&rt, H_KEYFRAMES), keyframes + 3, "one bake per full segment");
+        assert!(rt.recorder.as_ref().unwrap().log_len() < 4096, "the pending commands left the log: {}", rt.recorder.as_ref().unwrap().log_len());
+        let edited = hash_header(&rt);
+        seek_to(&mut rt, tick);
+        assert_eq!(hash_header(&rt), edited, "a baked edit survives a seek to its own tick");
+        assert_eq!(entity(&rt, 1)[0], 37.0, "the last teleport of the drag (12287 % 50)");
+    }
+
+    #[test]
+    fn the_recording_seqlock_is_even_after_every_step_and_moves_by_two() {
+        let mut rt = snapshot_scene();
+        let seq = |rt: &Runtime| header(rt, H_REC_SEQ);
+        let s0 = seq(&rt);
+        assert_eq!(s0 % 2, 0);
+        rt.step();
+        assert_eq!(seq(&rt), s0 + 2, "also when not recording");
+        rt.ring.push(&Command::Record { on: true });
+        rt.step();
+        rt.step();
+        assert_eq!((seq(&rt) % 2, seq(&rt)), (0, s0 + 6));
+    }
+
+    #[test]
+    fn the_seek_counter_is_published_with_the_tick_at_the_end_of_the_step() {
+        let (mut rt, _) = recorded_run();
+        rt.ring.push(&Command::Seek { tick: 50 });
+        rt.ring.push(&Command::Force { id: 2, generation: 0, x: 0.0, y: 1.0, z: 0.0 });
+        rt.step();
+        assert_eq!((header(&rt, H_SEEKS), header(&rt, H_TICKS)), (1, 50));
     }
 }

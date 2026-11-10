@@ -16,6 +16,7 @@ pub const TAG_INSPECT: u8 = 7;
 pub const TAG_TELEPORT: u8 = 8;
 pub const TAG_RECORD: u8 = 9;
 pub const TAG_SEEK: u8 = 10;
+pub const TAG_PAUSE: u8 = 11;
 pub const HULL_VERTS_PER_SLOT: usize = 4;
 /// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
 pub const MAX_CAPACITY: u32 = 1 << 18;
@@ -50,6 +51,7 @@ pub enum Command {
     Teleport { id: u32, generation: u8, x: f32, y: f32, z: f32 },
     Record { on: bool },
     Seek { tick: u32 },
+    Pause { on: bool },
 }
 
 impl Command {
@@ -59,7 +61,7 @@ impl Command {
             | Command::Destroy { id, generation }
             | Command::Force   { id, generation, .. }
             | Command::Teleport { id, generation, .. } => Some((*id, *generation)),
-            Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } | Command::Record { .. } | Command::Seek { .. } => None,
+            Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } | Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. } => None,
         }
     }
 }
@@ -221,6 +223,10 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             b[0] = TAG_RECORD;
             b[OFF_POS] = *on as u8;
         }
+        Command::Pause { on } => {
+            b[0] = TAG_PAUSE;
+            b[OFF_POS] = *on as u8;
+        }
         Command::Seek { tick } => {
             b[0] = TAG_SEEK;
             b[OFF_ID..OFF_ID + 4].copy_from_slice(&tick.to_le_bytes());
@@ -291,6 +297,11 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
         TAG_RECORD => match b[OFF_POS] {
             0 => Some(Command::Record { on: false }),
             1 => Some(Command::Record { on: true }),
+            _ => None,
+        },
+        TAG_PAUSE => match b[OFF_POS] {
+            0 => Some(Command::Pause { on: false }),
+            1 => Some(Command::Pause { on: true }),
             _ => None,
         },
         TAG_SEEK => Some(Command::Seek { tick: id }),
@@ -626,21 +637,34 @@ mod tests {
 
     #[test]
     fn wire_tags_are_pinned_to_the_values_the_typescript_ring_writes() {
-        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         let mut ring = CommandRing::new(8);
         raw_slot(&mut ring, |b| { b[0] = 8; b[OFF_ID] = 3; b[OFF_GEN] = 2; b[OFF_POS..OFF_POS + 4].copy_from_slice(&1.5f32.to_le_bytes()); });
         raw_slot(&mut ring, |b| { b[0] = 9; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 10; b[OFF_ID] = 7; });
-        raw_slot(&mut ring, |b| { b[0] = 11; });
+        raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 1; });
+        raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 2; });
+        raw_slot(&mut ring, |b| { b[0] = 12; });
         let mut out = Vec::new();
         ring.drain_commands(8, &mut out);
         assert_eq!(out, vec![
             Command::Teleport { id: 3, generation: 2, x: 1.5, y: 0.0, z: 0.0 },
             Command::Record { on: true },
             Command::Seek { tick: 7 },
+            Command::Pause { on: true },
         ]);
-        assert_eq!(ring.malformed_dropped(), 1, "tag 11 is not assigned");
+        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 12 (unassigned) are malformed");
+    }
+
+    #[test]
+    fn pause_round_trips_both_ways() {
+        let mut ring = CommandRing::new(4);
+        ring.push(&Command::Pause { on: true });
+        ring.push(&Command::Pause { on: false });
+        let mut out = Vec::new();
+        ring.drain_commands(4, &mut out);
+        assert_eq!(out, vec![Command::Pause { on: true }, Command::Pause { on: false }]);
     }
 
     #[test]

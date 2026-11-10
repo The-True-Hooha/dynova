@@ -4,6 +4,7 @@ export const H_EPOCH = 0;
 export const H_CAPACITY = 1;
 export const H_BUF0 = 2;
 export const H_STATE = 5;
+export const H_GENERATIONS = 6;
 export const H_TICKS = 7;
 export const H_STALE = 8;
 export const H_MALFORMED = 9;
@@ -27,11 +28,33 @@ export const H_REC_END = 26;
 export const H_HASH_LO = 27;
 export const H_HASH_HI = 28;
 export const H_KEYFRAMES = 29;
-export const HEADER_WORDS = 30;
+export const H_PAUSED = 30;
+export const H_SEEKS = 31;
+export const H_LIVE = 32;
+export const H_REC_SEQ = 33;
+export const HEADER_WORDS = 34;
 
 const MAX_SPINS = 5_000_000;
 const NEW_FLAG = 0b100;
 const READER_SHIFT = 3;
+
+/** Recording and replay state the runtime publishes while a `Record` command is active. */
+export interface RecordingState {
+    on: boolean;
+    paused: boolean;
+    /** Tick the world is at. */
+    tick: number;
+    /** First and last tick a `Seek` can reach. */
+    start: number;
+    end: number;
+    keyframes: number;
+    /** State hash of the world now (see `TransformView.recording`); equal hashes mean bit-identical simulation state. */
+    hash: bigint;
+    /** Counts successful seeks. */
+    seeks: number;
+}
+
+const RECORDING_ATTEMPTS = 8;
 
 export class TransformView {
     private header: Int32Array;
@@ -85,6 +108,55 @@ export class TransformView {
             const copy = view.slice();
             if (Atomics.load(this.header, H_EPOCH) === e) return copy;
         }
+    }
+
+    /**
+     * Recording state read under the runtime's seqlock, or null when the runtime kept rewriting it through every
+     * attempt. `hash` describes the world as it is now: a command applied while paused changes it without changing `tick`,
+     * and it equals the hash after `Seek(tick)` only while no such command is pending.
+     */
+    recording(): RecordingState | null {
+        this.live();
+        for (let attempt = 0; attempt < RECORDING_ATTEMPTS; attempt++) {
+            const seq = Atomics.load(this.header, H_REC_SEQ);
+            if (seq & 1) continue;
+            const w = (i: number) => Atomics.load(this.header, i) >>> 0;
+            const state: RecordingState = {
+                on: w(H_REC_ON) === 1,
+                paused: w(H_PAUSED) === 1,
+                tick: w(H_TICKS),
+                start: w(H_REC_START),
+                end: w(H_REC_END),
+                keyframes: w(H_KEYFRAMES),
+                hash: BigInt(w(H_HASH_LO)) | (BigInt(w(H_HASH_HI)) << 32n),
+                seeks: w(H_SEEKS),
+            };
+            if (Atomics.load(this.header, H_REC_SEQ) === seq) return state;
+        }
+        return null;
+    }
+
+    /**
+     * Copies of the runtime's per-slot generation and liveness bytes, for rebuilding the id allocator after a seek.
+     * Retries across a buffer growth, which moves both arrays.
+     */
+    slotTables(): { generations: Uint8Array; live: Uint8Array } {
+        this.live();
+        for (let spins = 0; ; spins++) {
+            if (spins > MAX_SPINS) throw new Error('layout update stuck: the runtime never finished growing its buffers');
+            const e = Atomics.load(this.header, H_EPOCH);
+            if (e & 1) continue;
+            const capacity = Atomics.load(this.header, H_CAPACITY);
+            const generations = new Uint8Array(this.memory.buffer, Atomics.load(this.header, H_GENERATIONS), capacity).slice();
+            const live = new Uint8Array(this.memory.buffer, Atomics.load(this.header, H_LIVE), capacity).slice();
+            if (Atomics.load(this.header, H_EPOCH) === e) return { generations, live };
+        }
+    }
+
+    /** Number of successful seeks so far; a change means the runtime rewrote which entities exist. */
+    seekCount(): number {
+        this.live();
+        return Atomics.load(this.header, H_SEEKS) >>> 0;
     }
 
     counters(): { ticks: number; staleDropped: number; malformedDropped: number } {

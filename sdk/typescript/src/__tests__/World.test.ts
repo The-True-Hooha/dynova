@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { World } from '../World.js';
 import { makeWorld, makeSyncWorld } from './helpers.js';
+import { H_GENERATIONS, H_LIVE, H_SEEKS, H_PAUSED, H_TICKS } from '../TransformView.js';
+import { SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE } from '../CommandRing.js';
 
 const config = { capacity: 128, ringCapacity: 64 };
 const tight = { capacity: 8, ringCapacity: 2, maxDeferredCommands: 0 };
@@ -403,3 +405,101 @@ describe('World growth', () => {
 });
 
 function buf0(world: import('../World.js').World) { return world.readTransforms()[0]; }
+
+describe('World recording commands', () => {
+    const config = { capacity: 8, ringCapacity: 16 };
+
+    function slot(rt: { dv: DataView; layout: { ringSlotsByteOffset: number } }, n: number) {
+        const off = rt.layout.ringSlotsByteOffset + n * SLOT_BYTES;
+        return { tag: rt.dv.getUint8(off), id: rt.dv.getUint32(off + 1, true), gen: rt.dv.getUint8(off + 5), flag: rt.dv.getUint8(off + 6), x: rt.dv.getFloat32(off + 6, true) };
+    }
+
+    it('teleport, record, pause and seek reach the ring with the right payloads', () => {
+        const { world, rt } = makeWorld(config);
+        const h = world.spawn({ x: 0, y: 0, z: 0 });
+        world.teleport(h, 4, 5, 6);
+        world.record(true);
+        world.pause(true);
+        world.seek(120);
+        const tags = [1, 2, 3, 4].map((n) => slot(rt, n));
+        expect(tags.map((t) => t.tag)).toEqual([TAG_TELEPORT, TAG_RECORD, TAG_PAUSE, TAG_SEEK]);
+        expect([tags[0].id, tags[0].gen, tags[0].x]).toEqual([h.id, h.gen, 4]);
+        expect([tags[1].flag, tags[2].flag, tags[3].id]).toEqual([1, 1, 120]);
+    });
+
+    it('validates arguments before anything is queued', () => {
+        const { world } = makeWorld(config);
+        const h = world.spawn();
+        expect(() => world.teleport(h, NaN, 0, 0)).toThrow(RangeError);
+        expect(() => world.teleport(h, 0, 2e6, 0)).toThrow(RangeError);
+        expect(() => world.teleport({ id: 5, gen: 0 }, 0, 0, 0)).toThrow(/stale handle/);
+        for (const bad of [-1, 1.5, 2 ** 32, NaN, Infinity]) expect(() => world.seek(bad)).toThrow(RangeError);
+        expect(world.pendingCommands).toBe(1);
+    });
+
+    it('a seek the runtime reports resyncs handles on the next read: dead handles go stale and freed ids come back', () => {
+        const { world, rt } = makeWorld(config);
+        const a = world.spawn();
+        const b = world.spawn();
+        const c = world.spawn();
+        rt.drain();
+        const at = 16384;
+        new Uint8Array(rt.memory.buffer, at, 8).set([0, 0, 0, 0, 0, 0, 0, 0]);
+        new Uint8Array(rt.memory.buffer, at + 8, 8).set([1, 0, 1, 0, 0, 0, 0, 0]);
+        Atomics.store(rt.header, H_GENERATIONS, at);
+        Atomics.store(rt.header, H_LIVE, at + 8);
+        world.readTransforms();
+        expect(() => world.force(b, 0, 1, 0)).not.toThrow();
+        rt.drain();
+
+        Atomics.add(rt.header, H_SEEKS, 1);
+        world.readTransforms();
+        expect(() => world.force(b, 0, 1, 0)).toThrow(/stale handle/);
+        expect(() => world.force(a, 0, 1, 0)).not.toThrow();
+        expect(() => world.force(c, 0, 1, 0)).not.toThrow();
+        rt.drain();
+        expect(world.spawn()).toEqual({ id: 1, gen: 0 });
+    });
+
+    it('waits to resync until nothing is in flight, so a queued spawn keeps its id', () => {
+        const { world, rt } = makeWorld(config);
+        const a = world.spawn();
+        const at = 16384;
+        new Uint8Array(rt.memory.buffer, at, 16).fill(0);
+        Atomics.store(rt.header, H_GENERATIONS, at);
+        Atomics.store(rt.header, H_LIVE, at + 8);
+        Atomics.add(rt.header, H_SEEKS, 1);
+        world.readTransforms();
+        expect(world.pendingCommands).toBe(1);
+        expect(() => world.force(a, 0, 1, 0)).not.toThrow();
+        expect(world.spawn()).toEqual({ id: 1, gen: 0 });
+        rt.drain();
+        new Uint8Array(rt.memory.buffer, at + 8, 2).set([1, 1]);
+        world.readTransforms();
+        expect(() => world.force(a, 0, 1, 0)).not.toThrow();
+    });
+
+    it('does not resync again until the seek counter changes again', () => {
+        const { world, rt } = makeWorld(config);
+        const a = world.spawn();
+        rt.drain();
+        const at = 16384;
+        new Uint8Array(rt.memory.buffer, at, 16).fill(0);
+        Atomics.store(rt.header, H_GENERATIONS, at);
+        Atomics.store(rt.header, H_LIVE, at + 8);
+        Atomics.add(rt.header, H_SEEKS, 1);
+        world.readTransforms();
+        expect(() => world.force(a, 0, 1, 0)).toThrow(/stale handle/);
+        const b = world.spawn();
+        world.readTransforms();
+        world.readTransforms();
+        expect(() => world.force(b, 0, 1, 0)).not.toThrow();
+    });
+
+    it('exposes the recording state and the paused flag', () => {
+        const { world, rt } = makeWorld(config);
+        Atomics.store(rt.header, H_PAUSED, 1);
+        Atomics.store(rt.header, H_TICKS, 12);
+        expect(world.recording).toMatchObject({ paused: true, tick: 12, on: false });
+    });
+});

@@ -1,7 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import * as tv from '../TransformView.js';
 import { TransformView, H_EPOCH, H_STATE, H_TICKS, H_STALE, H_MALFORMED, H_BUCKETS, H_BUCKET_LEN, FLOATS_PER_TRANSFORM } from '../TransformView.js';
-import { FakeRuntime } from './helpers.js';
+import { FakeRuntime, makeWorld } from './helpers.js';
 
 function setup(capacity = 4, shared = true) {
     const memory = new WebAssembly.Memory({ initial: 8, maximum: 32, shared });
@@ -223,11 +223,96 @@ describe('shared header layout', () => {
     // The same literal table is asserted in core/src/runtime.rs (header_word_indices_and_size_are_pinned).
     it('matches the word indices and size the Rust runtime publishes', () => {
         expect([
-            tv.H_EPOCH, tv.H_STATE, tv.H_TICKS, tv.H_STALE, tv.H_MALFORMED, tv.H_BUCKETS, tv.H_BUCKET_LEN,
+            tv.H_EPOCH, tv.H_STATE, tv.H_GENERATIONS, tv.H_TICKS, tv.H_STALE, tv.H_MALFORMED, tv.H_BUCKETS, tv.H_BUCKET_LEN,
             tv.H_INSPECT_SEQ, tv.H_INSPECT_BODIES, tv.H_INSPECT_CONTACTS, tv.H_INSPECT_CONTACT_N,
             tv.H_STEP_LAST_US, tv.H_STEP_TOTAL_US, tv.H_INSPECT_TICK, tv.H_INSPECT_ON,
             tv.H_REC_ON, tv.H_REC_START, tv.H_REC_END, tv.H_HASH_LO, tv.H_HASH_HI, tv.H_KEYFRAMES,
-        ]).toEqual([0, 5, 7, 8, 9, 10, 11, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]);
-        expect(tv.HEADER_WORDS).toBe(30);
+            tv.H_PAUSED, tv.H_SEEKS, tv.H_LIVE, tv.H_REC_SEQ,
+        ]).toEqual([0, 5, 6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33]);
+        expect(tv.HEADER_WORDS).toBe(34);
+    });
+});
+
+describe('TransformView recording and slot tables', () => {
+    function setup(capacity = 4) {
+        const { rt, memory, layout } = makeWorld({ capacity, ringCapacity: 4 });
+        const view = new tv.TransformView(memory, layout.headerByteOffset);
+        return { rt, memory, view };
+    }
+
+    it('reports a stopped recording as zeros', () => {
+        const { view } = setup();
+        expect(view.recording()).toEqual({ on: false, paused: false, tick: 0, start: 0, end: 0, keyframes: 0, hash: 0n, seeks: 0 });
+    });
+
+    it('decodes the recording words, a 64-bit hash with both halves set and u32 values above 2^31', () => {
+        const { rt, view } = setup();
+        const set = (w: number, v: number) => Atomics.store(rt.header, w, v | 0);
+        set(tv.H_REC_ON, 1); set(tv.H_PAUSED, 1); set(tv.H_TICKS, 0xfffffff0); set(tv.H_REC_START, 5);
+        set(tv.H_REC_END, 0x80000001); set(tv.H_KEYFRAMES, 3); set(tv.H_SEEKS, 9);
+        set(tv.H_HASH_LO, 0x89abcdef); set(tv.H_HASH_HI, 0xfedcba98);
+        expect(view.recording()).toEqual({
+            on: true, paused: true, tick: 0xfffffff0, start: 5, end: 0x80000001, keyframes: 3, hash: 0xfedcba9889abcdefn, seeks: 9,
+        });
+        expect(view.seekCount()).toBe(9);
+    });
+
+    afterEach(() => vi.restoreAllMocks());
+
+    it('returns null while the runtime holds the seqlock odd through every attempt', () => {
+        const { rt, view } = setup();
+        Atomics.store(rt.header, tv.H_REC_SEQ, 3);
+        expect(view.recording()).toBeNull();
+    });
+
+    it('retries when the runtime rewrote the words between the two seqlock reads', () => {
+        const { rt, view } = setup();
+        Atomics.store(rt.header, tv.H_HASH_LO, 7);
+        const real = Atomics.load;
+        let seqReads = 0;
+        vi.spyOn(Atomics, 'load').mockImplementation(((a: Int32Array, i: number) => {
+            if (i === tv.H_REC_SEQ && a.buffer === rt.header.buffer && a.byteOffset === rt.header.byteOffset) {
+                seqReads++;
+                if (seqReads === 2) Atomics.store(rt.header, tv.H_REC_SEQ, 2);
+            }
+            return real(a, i);
+        }) as typeof Atomics.load);
+        expect(view.recording()?.hash).toBe(7n);
+        expect(seqReads).toBeGreaterThanOrEqual(4);
+    });
+
+    it('retries slotTables across a layout rewrite and returns tables from the settled epoch', () => {
+        const { rt, memory, view } = setup(2);
+        new Uint8Array(memory.buffer, 8192, 2).set([4, 5]);
+        new Uint8Array(memory.buffer, 8208, 2).set([1, 1]);
+        Atomics.store(rt.header, tv.H_GENERATIONS, 8192);
+        Atomics.store(rt.header, tv.H_LIVE, 8208);
+        const real = Atomics.load;
+        let epochReads = 0;
+        vi.spyOn(Atomics, 'load').mockImplementation(((a: Int32Array, i: number) => {
+            if (i === tv.H_EPOCH && a.buffer === rt.header.buffer && a.byteOffset === rt.header.byteOffset) {
+                epochReads++;
+                if (epochReads <= 2) return real(a, i) | 1;
+                if (epochReads === 3) new Uint8Array(memory.buffer, 8192, 2).set([6, 7]);
+            }
+            return real(a, i);
+        }) as typeof Atomics.load);
+        const { generations } = view.slotTables();
+        expect([...generations]).toEqual([6, 7]);
+        expect(epochReads).toBeGreaterThanOrEqual(4);
+    });
+
+    it('copies the generation and live tables the header points at', () => {
+        const { rt, memory, view } = setup(4);
+        const at = 8192;
+        new Uint8Array(memory.buffer, at, 4).set([0, 3, 255, 1]);
+        new Uint8Array(memory.buffer, at + 16, 4).set([1, 0, 1, 1]);
+        Atomics.store(rt.header, tv.H_GENERATIONS, at);
+        Atomics.store(rt.header, tv.H_LIVE, at + 16);
+        const { generations, live } = view.slotTables();
+        expect([...generations]).toEqual([0, 3, 255, 1]);
+        expect([...live]).toEqual([1, 0, 1, 1]);
+        new Uint8Array(memory.buffer, at, 4).fill(9);
+        expect([...generations]).toEqual([0, 3, 255, 1]);
     });
 });

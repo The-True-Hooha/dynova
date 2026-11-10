@@ -51,6 +51,21 @@ export class EntityIdAllocator {
         return true;
     }
 
+    /**
+     * Rebuild from the runtime's tables after a seek rewrote which entities exist. Every id below the allocation counter
+     * that is not live becomes free again with the generation the runtime expects next; handles issued before the seek
+     * for entities that no longer exist stop being live.
+     */
+    resync(generations: Uint8Array, live: Uint8Array): void {
+        this.liveGen.fill(NOT_LIVE);
+        this.freeList = [];
+        const allocated = Math.min(Atomics.load(this.counter, 0), generations.length, live.length);
+        for (let id = allocated - 1; id >= 0; id--) {
+            if (live[id]) this.liveGen[id] = generations[id];
+            else this.freeList.push({ id, gen: generations[id] });
+        }
+    }
+
     setCapacity(capacity: number): void {
         if (capacity <= this.capacity) return;
         const live = new Int16Array(capacity).fill(NOT_LIVE);
