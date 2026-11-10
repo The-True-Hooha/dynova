@@ -1,4 +1,5 @@
 import {
+    JOINT_BALL, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER,
     BODY_STATE_AWAKE, BODY_STATE_INACTIVE, BODY_STATE_SLEEPING, BODY_STATE_STATIC,
     type InspectedBody, type InspectorSnapshot, type ProfilerSample, type RecordingState,
 } from '@dynova/sdk';
@@ -105,6 +106,36 @@ export function contactsOf(snapshot: InspectorSnapshot, id: number): EntityConta
         const c = snapshot.contact(k);
         if (c.a === id) out.push({ other: c.b, point: c.point, normal: c.normal, depth: c.depth });
         else if (c.b === id) out.push({ other: c.a, point: c.point, normal: [-c.normal[0], -c.normal[1], -c.normal[2]], depth: c.depth });
+    }
+    return out;
+}
+
+export const JOINT_KIND_NAMES: Record<number, string> = { [JOINT_BALL]: 'ball', [JOINT_HINGE]: 'hinge', [JOINT_FIXED]: 'fixed', [JOINT_SLIDER]: 'slider' };
+
+export function jointKindName(kind: number): string {
+    return JOINT_KIND_NAMES[kind] ?? `kind ${kind}`;
+}
+
+/** A slider's anchors move apart along its axis by design, so its distance is travel, not error. */
+export function jointGapLabel(kind: number): string {
+    return kind === JOINT_SLIDER ? 'travel' : 'gap';
+}
+
+export interface EntityJoint {
+    id: number;
+    kind: number;
+    other: number;
+    /** Distance between the two anchors: the error for ball, hinge and fixed joints (near zero while they hold), the travel for a slider. */
+    gap: number;
+}
+
+/** Joints attached to `id`. */
+export function jointsOf(snapshot: InspectorSnapshot, id: number): EntityJoint[] {
+    const out: EntityJoint[] = [];
+    for (let k = 0; k < snapshot.jointCount; k++) {
+        const j = snapshot.joint(k);
+        if (j.a !== id && j.b !== id) continue;
+        out.push({ id: j.id, kind: j.kind, other: j.a === id ? j.b : j.a, gap: Math.hypot(j.anchorA[0] - j.anchorB[0], j.anchorA[1] - j.anchorB[1], j.anchorA[2] - j.anchorB[2]) });
     }
     return out;
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-    H_CAPACITY, H_CONTACTS, H_DROPPED_CONTACTS, H_EPOCH, H_INSPECT_BODIES, H_INSPECT_CONTACTS, H_INSPECT_CONTACT_N, H_INSPECT_SEQ,
+    H_CAPACITY, H_CONTACTS, H_DROPPED_CONTACTS, H_EPOCH, H_INSPECT_BODIES, H_INSPECT_CONTACTS, H_INSPECT_CONTACT_N, H_INSPECT_JOINT_N, H_INSPECT_JOINTS, H_INSPECT_SEQ,
     H_INSPECT_ON, H_INSPECT_TICK, H_OVERRUNS, H_RING_PENDING, H_STEP_LAST_US, H_STEP_TOTAL_US, H_TICKS, HEADER_WORDS, TransformView,
 } from '../TransformView.js';
 import { BODY_STATE_AWAKE, BODY_STATE_INACTIVE, BODY_STATE_SLEEPING, BODY_STATE_STATIC, InspectorView } from '../InspectorView.js';
@@ -10,6 +10,7 @@ import { FakeRuntime, makeSyncWorld, makeWorld } from './helpers.js';
 
 const BODY_WORDS = 14;
 const CONTACT_WORDS = 9;
+const JOINT_WORDS = 10;
 
 function setup(capacity = 4, shared = true) {
     const memory = new WebAssembly.Memory({ initial: 8, maximum: 32, shared });
@@ -42,6 +43,54 @@ function setup(capacity = 4, shared = true) {
     };
     return { memory, header, view: new InspectorView(memory, headerByteOffset), body, contact, publish };
 }
+
+describe('InspectorView joints', () => {
+    function withJoints(rows: number[][], count = rows.length) {
+        const s = setup();
+        const at = 4096;
+        const f = new Float32Array(s.memory.buffer, at, 16 * JOINT_WORDS);
+        const u = new Uint32Array(s.memory.buffer, at, 16 * JOINT_WORDS);
+        rows.forEach((r, k) => {
+            u.set(r.slice(0, 4), k * JOINT_WORDS);
+            f.set(r.slice(4), k * JOINT_WORDS + 4);
+        });
+        Atomics.store(s.header, H_INSPECT_JOINTS, at);
+        Atomics.store(s.header, H_INSPECT_JOINT_N, count);
+        s.publish(5, 0);
+        return s;
+    }
+
+    it('copies one row per joint with kind, bodies and both anchors', () => {
+        const { view } = withJoints([[7, 1, 2, 3, 0.5, 1, 1.5, 0.5, 1.25, 1.5], [9, 3, 0, 1, 0, 0, 0, 0, 0, 0.5]]);
+        const snap = view.snapshot()!;
+        expect(snap.jointCount).toBe(2);
+        expect(snap.joint(0)).toEqual({ id: 7, kind: 1, a: 2, b: 3, anchorA: [0.5, 1, 1.5], anchorB: [0.5, 1.25, 1.5] });
+        expect(snap.joint(1).id).toBe(9);
+        expect(snap.joint(1).anchorB).toEqual([0, 0, 0.5]);
+    });
+
+    it('rejects a joint index outside the frame', () => {
+        const snap = withJoints([[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]]).view.snapshot()!;
+        expect(() => snap.joint(1)).toThrow(RangeError);
+        expect(() => snap.joint(-1)).toThrow(RangeError);
+        expect(() => snap.joint(0.5)).toThrow(RangeError);
+    });
+
+    it('reports no joints when the table pointer is unset or the count is zero, even with a stale count word', () => {
+        const none = setup();
+        Atomics.store(none.header, H_INSPECT_JOINT_N, 3);
+        none.publish(1, 0);
+        expect(none.view.snapshot()!.jointCount).toBe(0);
+        expect(withJoints([], 0).view.snapshot()!.jointCount).toBe(0);
+    });
+
+    it('keeps a copied joint table valid after the shared rows change', () => {
+        const s = withJoints([[7, 0, 0, 1, 1, 1, 1, 1, 1, 1]]);
+        const snap = s.view.snapshot()!;
+        new Uint32Array(s.memory.buffer, 4096, 1)[0] = 99;
+        expect(snap.joint(0).id).toBe(7);
+    });
+});
 
 describe('InspectorView', () => {
     it('returns null before the inspector was ever enabled and reports no snapshot age', () => {

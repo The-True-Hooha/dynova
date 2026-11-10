@@ -22,6 +22,10 @@ world.destroyJoint(door);
 - Limit rows stay armed while not reached, allowing an approach speed of gap/dt, so a fast body stops on the bound instead of overshooting.
 - Up to 16384 live joints.
 
+## Inspecting and replaying
+
+Joints are part of the state hash, the snapshot and the recorded command log, so a seek over a joint scene is bit-identical. `core/src/determinism.rs` runs a 1230-tick joint scene (a six-link chain, a door with limits, a motor-driven wheel, a motor-driven slider whose target changes mid-run, a welded pair, a joint destroyed by command and a body destroyed under a joint) with a record and seek round trip; both seeks replay joint, motor and force commands. The pinned hashes match native aarch64, native x86_64 (Rosetta), Chromium and WebKit; see `docs/decisions/determinism.md`. A second test steps the same scene for 10000 ticks and checks, every tick, the worst anchor gap of each joint (under 0.2 m for the chain, 0.25 m for the door, under 0.01 m for the wheel and the weld), that the door and the slider reach both of their limits without passing them by more than 0.1, that the slider stays on its rail and that the destroyed joint and the destroyed body's joint are gone. The inspector shows each joint's anchor distance: the error for ball, hinge and fixed joints, the travel for a slider (`docs/inspector.md`).
+
 ## Limits of the solver
 
-Joints use the same 12-iteration sequential-impulse loop as contacts, with Baumgarte correction. Chains of equal masses hold: 10 links stay within 0.15 m of closed over 2000 ticks, 20 within about 0.1 m, 30 drift by about 0.5 m. A heavy end mass breaks long chains (an end mass 50x the link mass pulls a 10-link chain apart). Keep mass ratios under about 10 across a chain, or shorten it.
+Joints use the same 12-iteration sequential-impulse loop as contacts, with Baumgarte correction. Chains of equal masses hold: 10 links stay within 0.15 m of closed over 2000 ticks, 20 within about 0.1 m, 30 drift by about 0.5 m. A door 2 m long hinged at one end sags about 0.1 to 0.17 m at rest and when pushed into its limits (the lever is long and the body thin), which is within the 0.25 m the test allows. A heavy end mass breaks long chains (an end mass 50x the link mass pulls a 10-link chain apart). Keep mass ratios under about 10 across a chain, or shorten it.

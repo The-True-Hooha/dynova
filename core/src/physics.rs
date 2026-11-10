@@ -4,7 +4,7 @@ use crate::hull::{self, HullData, MAX_HULLS};
 mod joints;
 mod snapshot;
 pub(crate) use snapshot::Fnv;
-pub use joints::{Joint, JointDesc, JOINT_BALL, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER, MAX_JOINT_ID};
+pub use joints::{Joint, JointDesc, MAX_JOINTS, JOINT_BALL, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER, MAX_JOINT_ID};
 pub use snapshot::PhysicsSnapshot;
 
 const MIN_BUCKETS: usize = 4096;

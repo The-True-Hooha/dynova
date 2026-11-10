@@ -22,6 +22,10 @@ The four values are the live end state, the live state at tick 350, tick 350 aft
 | Chromium, wasm (`determinism_scene`) | same | same | = | = |
 | WebKit, wasm (`determinism_scene`) | same | same | = | = |
 
+### Joint scene
+
+`determinism::run_joint_scene` (wasm: `determinism_joint_scene`) adds a 1230-tick world with every joint kind: a six-link ball chain, a hinged door with limits pushed by forces, a motor-driven wheel and slider (the slider's motor target flips at ticks 100 and 610), a fixed-joint pair that falls onto a floor, a joint destroyed by command at tick 640 and a body destroyed under a joint at tick 800. It is recorded and sought like the first scene. Keyframes fall every 60 ticks, so the seek target (tick 650) replays the motor change, the force and the joint destroy at 610, 625 and 640 from the keyframe at 600, and the seek back to the end replays a motor change at 1210 from the keyframe at 1200; removing replay from `Runtime::seek` turns this test red. Live end `15756670485398854027`, live tick 650 `13638603286812908320`; a seek reproduces both. The same four rows hold: native aarch64 (opt-level 3 and debug), native x86_64 under Rosetta, Chromium and WebKit. The 700-tick pins above are unchanged because a joint-free world hashes as before.
+
 The older checks still hold in the same two browsers: the 30-body golden scene (`4599892428385582693`) and the sin/cos/atan2/sqrt probe (`7496710723231958662`) match the native build. Firefox could not be launched in the development sandbox, so it is untested; run `pnpm exec playwright test e2e/determinism.spec.ts --project=firefox` to add it.
 
 The native rows are debug builds (the test profile); the pinned test was also run at opt-level 3 on both architectures. The browser rows run the release wasm (opt-level 3, LTO). Reproduce: `cargo test --lib determinism` (native, pinned), `cargo test --lib --target x86_64-apple-darwin determinism` (needs the x86_64 std; the repo's nightly `build-std` setup provides it), and `pnpm exec playwright test e2e/determinism.spec.ts --project=chromium --project=webkit` (needs `make build-st`).

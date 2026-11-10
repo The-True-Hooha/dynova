@@ -1,5 +1,5 @@
 import { BODY_STATE_AWAKE, BODY_STATE_SLEEPING, BODY_STATE_STATIC, type InspectorView, type RecordingState } from '@dynova/sdk';
-import { ProfilerWindow, attempt, contactsOf, fmt, fmtBytes, fmtVec, listEntities, parseCoordinate, speed, stateCounts, stateName, stepTarget, timelineView } from './model.js';
+import { ProfilerWindow, attempt, contactsOf, jointGapLabel, jointKindName, jointsOf, fmt, fmtBytes, fmtVec, listEntities, parseCoordinate, speed, stateCounts, stateName, stepTarget, timelineView } from './model.js';
 
 /**
  * The write side of the panel. Every method must issue a command (`World.record`, `pause`, `seek`, `teleport`): the panel
@@ -105,6 +105,9 @@ export function mountInspector(container: HTMLElement, options: InspectorOptions
     const contactTable = el('table', { testid: 'contacts' });
     const contactBody = document.createElement('tbody');
     contactTable.appendChild(contactBody);
+    const jointTable = el('table', { testid: 'joints' });
+    const jointBody = document.createElement('tbody');
+    jointTable.appendChild(jointBody);
 
     const { controls } = options;
     const timelineBox = el('div', { testid: 'timeline' });
@@ -128,6 +131,7 @@ export function mountInspector(container: HTMLElement, options: InspectorOptions
         el('h4', { text: 'Entities' }), counts, filter, listBox, listNote,
         el('h4', { text: 'Selected' }), readout,
         el('h4', { text: 'Contacts' }), contactTable,
+        el('h4', { text: 'Joints' }), jointTable,
     );
     container.append(style, root);
 
@@ -196,6 +200,7 @@ export function mountInspector(container: HTMLElement, options: InspectorOptions
         const editing = readoutBody.contains(document.activeElement);
         if (!editing) readoutBody.replaceChildren();
         contactBody.replaceChildren();
+        jointBody.replaceChildren();
         if (!snap) {
             status.textContent = view.missedReads > 0 ? `waiting for a consistent frame (${view.missedReads} missed)` : 'waiting for the first frame';
             status.className = 'muted';
@@ -244,6 +249,12 @@ export function mountInspector(container: HTMLElement, options: InspectorOptions
         }
         if (touching.length > 12) row(contactBody, [`… and ${touching.length - 12} more`]);
         if (touching.length === 0) row(contactBody, ['no contacts'], 'no-contacts');
+        const attached = jointsOf(snap, selected);
+        for (const j of attached.slice(0, 12)) {
+            row(jointBody, [`⛓ ${j.id} ${jointKindName(j.kind)}`, `↔ ${j.other}`, `${jointGapLabel(j.kind)} ${fmt(j.gap, 4)}`], 'joint');
+        }
+        if (attached.length > 12) row(jointBody, [`… and ${attached.length - 12} more`]);
+        if (attached.length === 0) row(jointBody, ['no joints'], 'no-joints');
     }
 
     function positionEditor(id: number, position: [number, number, number]): void {

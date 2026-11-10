@@ -159,3 +159,21 @@ test('opening the inspector does not slow the simulation (5000 bodies, step time
     expect(bestOpen).toBeLessThan(bestClosed * 1.15);
     expect(last.snapshotMs).toBeLessThan(25);
 });
+
+test('the panel lists the joints on a selected entity with their kind, partner and anchor gap, and says so when there are none', async ({ page }) => {
+    const errors = await open(page, 'n=20&joints=1');
+    await step(page, 120);
+    await page.evaluate(() => (window as any).__inspector.panel.update());
+
+    await page.locator('[data-testid="entity-5"]').click();
+    const rows = await page.locator('[data-testid="joint"]').allTextContents();
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatch(/^⛓ 0 ball↔ 4gap 0\.\d+$/);
+    expect(rows[1]).toMatch(/^⛓ 1 hinge↔ 6gap 0\.\d+$/);
+    for (const r of rows) expect(Number(r.match(/gap ([\d.]+)/)![1])).toBeLessThan(0.1);
+
+    await page.locator('[data-testid="entity-10"]').click();
+    expect(await page.locator('[data-testid="joint"]').count()).toBe(0);
+    expect(await text(page, 'no-joints')).toBe('no joints');
+    expect(errors).toEqual([]);
+});

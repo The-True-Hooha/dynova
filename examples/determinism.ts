@@ -29,7 +29,8 @@ async function run() {
         }
     }
     const scene = Array.from(glue.determinism_scene() as BigUint64Array, (v) => v.toString());
-    return { hash: h.toString(), probe: glue.determinism_probe().toString(), scene, userAgent: navigator.userAgent };
+    const jointScene = Array.from(glue.determinism_joint_scene() as BigUint64Array, (v) => v.toString());
+    return { hash: h.toString(), probe: glue.determinism_probe().toString(), scene, jointScene, userAgent: navigator.userAgent };
 }
 
 run().then(

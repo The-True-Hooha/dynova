@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import type { InspectedBody, InspectedContact, InspectorSnapshot, ProfilerSample, RecordingState } from '@dynova/sdk';
-import { ProfilerWindow, attempt, parseCoordinate, stepTarget, timelineView, contactsOf, fmt, fmtBytes, fmtVec, listEntities, speed, stateCounts, stateName } from '../model.js';
+import type { InspectedBody, InspectedContact, InspectedJoint, InspectorSnapshot, ProfilerSample, RecordingState } from '@dynova/sdk';
+import { ProfilerWindow, attempt, parseCoordinate, stepTarget, timelineView, contactsOf, jointGapLabel, jointKindName, jointsOf, fmt, fmtBytes, fmtVec, listEntities, speed, stateCounts, stateName } from '../model.js';
 
 const sample = (ticks: number, totalMicros: number, extra: Partial<ProfilerSample> = {}): ProfilerSample => ({
     ticks, stepLastMicros: 0, stepTotalMicros: totalMicros, ringPending: 0, contacts: 0, droppedContacts: 0, workerOverruns: 0,
     memoryBytes: 0, growths: 0, snapshotAgeTicks: 0, ...extra,
 });
 
-function snapshot(states: number[], contacts: InspectedContact[] = []): InspectorSnapshot {
+function snapshot(states: number[], contacts: InspectedContact[] = [], joints: InspectedJoint[] = []): InspectorSnapshot {
     const bodies: InspectedBody[] = states.map((state, id) => ({
         id, state, position: [id, 0, 0], rotation: [0, 0, 0, 1], velocity: [3, 4, 0], angularVelocity: [0, 0, 0],
     }));
@@ -17,6 +17,8 @@ function snapshot(states: number[], contacts: InspectedContact[] = []): Inspecto
         contactCount: contacts.length,
         body: (id) => bodies[id] ?? null,
         contact: (k) => contacts[k],
+        jointCount: joints.length,
+        joint: (k) => joints[k],
         idsInState: (s) => bodies.filter((b) => b.state === s).map((b) => b.id),
     };
 }
@@ -136,6 +138,38 @@ describe('contactsOf', () => {
     it('returns nothing for an entity without contacts or an unknown id', () => {
         expect(contactsOf(snap, 1)).toEqual([]);
         expect(contactsOf(snap, 99)).toEqual([]);
+    });
+});
+
+describe('jointsOf', () => {
+    const joints: InspectedJoint[] = [
+        { id: 1, kind: 1, a: 4, b: 0, anchorA: [0, 0, 0], anchorB: [0, 0, 0] },
+        { id: 2, kind: 3, a: 2, b: 4, anchorA: [1, 2, 2], anchorB: [0, 0, 0] },
+        { id: 3, kind: 0, a: 7, b: 8, anchorA: [0, 0, 0], anchorB: [0, 0, 0] },
+    ];
+    const snap = snapshot([3, 1, 1, 0, 1, 0, 0, 1, 1], [], joints);
+
+    it('finds joints on either side, names the other body and measures the anchor gap', () => {
+        expect(jointsOf(snap, 4)).toEqual([
+            { id: 1, kind: 1, other: 0, gap: 0 },
+            { id: 2, kind: 3, other: 2, gap: 3 },
+        ]);
+        expect(jointsOf(snap, 0)).toEqual([{ id: 1, kind: 1, other: 4, gap: 0 }]);
+    });
+
+    it('returns nothing for an entity without joints, an unknown id or a snapshot with none', () => {
+        expect(jointsOf(snap, 1)).toEqual([]);
+        expect(jointsOf(snap, 99)).toEqual([]);
+        expect(jointsOf(snapshot([1, 1]), 0)).toEqual([]);
+    });
+
+    it('calls a slider\'s anchor distance travel and every other joint\'s gap', () => {
+        expect([0, 1, 2, 3].map(jointGapLabel)).toEqual(['gap', 'gap', 'gap', 'travel']);
+    });
+
+    it('names the four kinds and falls back for an unknown one', () => {
+        expect([0, 1, 2, 3].map(jointKindName)).toEqual(['ball', 'hinge', 'fixed', 'slider']);
+        expect(jointKindName(9)).toBe('kind 9');
     });
 });
 

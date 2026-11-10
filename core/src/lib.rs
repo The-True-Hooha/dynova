@@ -57,6 +57,12 @@ pub fn determinism_scene() -> Vec<u64> {
     determinism::run_scene().to_vec()
 }
 
+/// The same four values for the joint world (chain, door with limits, motor wheel, motor slider, welded pair).
+#[wasm_bindgen]
+pub fn determinism_joint_scene() -> Vec<u64> {
+    determinism::run_joint_scene().to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

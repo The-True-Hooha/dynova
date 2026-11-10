@@ -32,7 +32,9 @@ export const H_PAUSED = 30;
 export const H_SEEKS = 31;
 export const H_LIVE = 32;
 export const H_REC_SEQ = 33;
-export const HEADER_WORDS = 34;
+export const H_INSPECT_JOINTS = 34;
+export const H_INSPECT_JOINT_N = 35;
+export const HEADER_WORDS = 36;
 
 const MAX_SPINS = 5_000_000;
 const NEW_FLAG = 0b100;

@@ -48,8 +48,10 @@ const H_PAUSED: usize = 30;
 const H_SEEKS: usize = 31;
 // Seqlock over the recording words (odd while the runtime rewrites them), so a reader never pairs half a hash with another step's range.
 const H_REC_SEQ: usize = 33;
+const H_INSPECT_JOINTS: usize = 34;
+const H_INSPECT_JOINT_N: usize = 35;
 const H_LIVE: usize = 32;
-pub const HEADER_WORDS: usize = 34;
+pub const HEADER_WORDS: usize = 36;
 
 /// What a step did to the tick counter.
 #[derive(Clone, Copy, PartialEq)]
@@ -113,7 +115,7 @@ impl Runtime {
         rt
     }
 
-    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts, inspector seq, bodies ptr, contacts ptr, contact count, step last us and step total us (written by the JS step driver), inspector tick, inspector on, recording on, recorded start tick, recorded end tick, state hash low and high words, keyframe count, paused, seek count, live flags pointer, recording seqlock].
+    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts, inspector seq, bodies ptr, contacts ptr, contact count, step last us and step total us (written by the JS step driver), inspector tick, inspector on, recording on, recorded start tick, recorded end tick, state hash low and high words, keyframe count, paused, seek count, live flags pointer, recording seqlock, inspector joints pointer, inspector joint count].
     pub fn header_ptr(&self) -> *const u32 {
         self.header.as_ptr() as *const u32
     }
@@ -246,7 +248,7 @@ impl Runtime {
         self.head = new_tick;
 
         if let (true, true, Some(inspector)) = (self.inspecting, self.physics_enabled, self.inspector.as_mut()) {
-            inspector.write(&self.header[H_INSPECT_SEQ], &self.header[H_INSPECT_CONTACT_N], &self.header[H_INSPECT_TICK], new_tick, &self.physics);
+            inspector.write(&self.header[H_INSPECT_SEQ], &self.header[H_INSPECT_CONTACT_N], &self.header[H_INSPECT_JOINT_N], &self.header[H_INSPECT_TICK], new_tick, &self.physics);
         }
 
         self.header[H_PAUSED].store(self.paused as u32, Ordering::Release);
@@ -343,9 +345,29 @@ impl Runtime {
             .then(|| [self.physics.pos_x[id], self.physics.pos_y[id], self.physics.pos_z[id]])
     }
 
+    /// Orientation `[x y z w]` of an active body, for tests and tools.
+    pub fn physics_rotation(&self, id: usize) -> Option<[f32; 4]> {
+        (self.physics_enabled && id < self.physics.capacity && self.physics.active[id])
+            .then(|| [self.physics.qx[id], self.physics.qy[id], self.physics.qz[id], self.physics.qw[id]])
+    }
+
     /// Shape code of an active body, for tests and tools.
     pub fn physics_shape(&self, id: usize) -> Option<u8> {
         (self.physics_enabled && id < self.physics.capacity && self.physics.active[id]).then(|| self.physics.shape[id])
+    }
+
+    /// `(id, distance between the two anchors)` of every joint, for tests and tools; near zero while a joint holds.
+    pub fn joint_anchor_gaps(&self) -> Vec<(u32, f32)> {
+        let p = &self.physics;
+        let at = |b: usize, local| crate::collision::add([p.pos_x[b], p.pos_y[b], p.pos_z[b]], crate::collision::rotate([p.qx[b], p.qy[b], p.qz[b], p.qw[b]], local));
+        p.joints.iter().map(|j| {
+            let (pa, pb) = (at(j.a as usize, j.la), at(j.b as usize, j.lb));
+            (j.id, ((pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2)).sqrt())
+        }).collect()
+    }
+
+    pub fn joint_count(&self) -> u32 {
+        self.physics.joints.len() as u32
     }
 
     /// Tick the world is at (the published `ticks` word is only written at the end of a step).
@@ -640,9 +662,10 @@ impl Runtime {
         h[H_LIVE].store(self.live.as_ptr() as u32, Ordering::Release);
         h[H_BUCKETS].store(self.bucket_view.as_ptr() as u32, Ordering::Release);
         h[H_BUCKET_LEN].store(self.bucket_view.len() as u32, Ordering::Release);
-        let (bodies, contacts) = self.inspector.as_ref().map_or((0, 0), |i| (i.bodies.as_ptr() as u32, i.contacts.as_ptr() as u32));
+        let (bodies, contacts, joints) = self.inspector.as_ref().map_or((0, 0, 0), |i| (i.bodies.as_ptr() as u32, i.contacts.as_ptr() as u32, i.joints.as_ptr() as u32));
         h[H_INSPECT_BODIES].store(bodies, Ordering::Release);
         h[H_INSPECT_CONTACTS].store(contacts, Ordering::Release);
+        h[H_INSPECT_JOINTS].store(joints, Ordering::Release);
     }
 
     /// The first Inspect(on) allocates the snapshot; later toggles only start and stop publishing, so a reader still
@@ -1251,8 +1274,8 @@ mod tests {
         w.spawn(1, &crate::physics::BodyDesc::box_at([0.0, 0.9, 0.0], [0.5; 3], 1.0, 0.0));
         w.step();
         let mut ins = Inspector::new(2);
-        let (seq, count, tick) = (AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0));
-        ins.write(&seq, &count, &tick, 9, &w);
+        let (seq, count, joints, tick) = (AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0));
+        ins.write(&seq, &count, &joints, &tick, 9, &w);
         assert_eq!(seq.load(Ordering::Relaxed), 2);
         assert_eq!(tick.load(Ordering::Relaxed), 9);
         assert!(count.load(Ordering::Relaxed) >= 1);
@@ -1283,8 +1306,8 @@ mod tests {
         w.contacts = vec![one; crate::inspector::MAX_INSPECT_CONTACTS + 50];
         let mut ins = Inspector::new(2);
         let seq = AtomicU32::new(0);
-        let (count, tick) = (AtomicU32::new(0), AtomicU32::new(0));
-        ins.write(&seq, &count, &tick, 77, &w);
+        let (count, joints, tick) = (AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0));
+        ins.write(&seq, &count, &joints, &tick, 77, &w);
         assert_eq!((count.load(Ordering::Relaxed), tick.load(Ordering::Relaxed)), (crate::inspector::MAX_INSPECT_CONTACTS as u32, 77));
         assert_eq!(ins.contact_count as usize, crate::inspector::MAX_INSPECT_CONTACTS);
         assert_eq!(seq.load(Ordering::Relaxed), 2);
@@ -2243,15 +2266,57 @@ mod tests {
     }
 
     #[test]
+    fn inspector_publishes_one_row_per_joint_with_both_anchors_and_follows_create_and_destroy() {
+        use crate::physics::{BodyDesc, JointDesc, JOINT_BALL, JOINT_FIXED};
+        let mut rt = Runtime::new(4, 8);
+        rt.enable_physics();
+        rt.set_gravity(0.0, 0.0, 0.0);
+        let spawn = |id, b| Command::Spawn { id, generation: 0, body: b };
+        rt.ring.push(&spawn(0, BodyDesc::box_at([0.0, 5.0, 0.0], [0.25; 3], 0.0, 0.0)));
+        rt.ring.push(&spawn(1, BodyDesc::sphere_at([1.0, 5.0, 2.0], 0.2, 1.0, 0.0)));
+        rt.ring.push(&spawn(2, BodyDesc::sphere_at([3.0, 6.0, 2.0], 0.2, 1.0, 0.0)));
+        rt.ring.push(&Command::Inspect { on: true });
+        rt.step();
+        assert_ne!(header(&rt, H_INSPECT_JOINTS), 0);
+        let ins_row = |rt: &Runtime, k: usize| -> Vec<u32> {
+            let ins = rt.inspector.as_ref().unwrap();
+            ins.joints[k * crate::inspector::JOINT_WORDS..(k + 1) * crate::inspector::JOINT_WORDS].iter().map(|v| v.load(Ordering::Relaxed)).collect()
+        };
+        let desc = |kind, a, b, anchor| JointDesc { kind, a, b, anchor, axis: [0.0; 3], limits: None, motor_vel: 0.0, motor_max: 0.0 };
+        rt.ring.push(&Command::JointCreate { id: 7, gen_a: 0, gen_b: 0, desc: desc(JOINT_BALL, 0, 1, [0.5, 5.0, 1.0]) });
+        rt.ring.push(&Command::JointCreate { id: 9, gen_a: 0, gen_b: 0, desc: desc(JOINT_FIXED, 1, 2, [2.0, 5.5, 2.0]) });
+        rt.step();
+        assert_eq!(header(&rt, H_INSPECT_JOINT_N), 2);
+        assert_eq!(header(&rt, H_INSPECT_SEQ) % 2, 0);
+        let f = |w: &[u32], k: usize| f32::from_bits(w[k]);
+        let (r0, r1) = (ins_row(&rt, 0), ins_row(&rt, 1));
+        assert_eq!(r0[..4], [7, JOINT_BALL as u32, 0, 1]);
+        assert_eq!(r1[..4], [9, JOINT_FIXED as u32, 1, 2]);
+        for (r, at) in [(&r0, [0.5, 5.0, 1.0]), (&r1, [2.0, 5.5, 2.0])] {
+            for (k, want) in at.into_iter().enumerate() {
+                assert!((f(r, 4 + k) - want).abs() < 0.05, "anchor on a, axis {k}: {}", f(r, 4 + k));
+                assert!((f(r, 7 + k) - want).abs() < 0.05, "anchor on b, axis {k}: {}", f(r, 7 + k));
+            }
+        }
+        rt.ring.push(&Command::JointDestroy { id: 7 });
+        rt.step();
+        assert_eq!(header(&rt, H_INSPECT_JOINT_N), 1, "destroyed joint leaves the table");
+        assert_eq!(ins_row(&rt, 0)[..4], [9, JOINT_FIXED as u32, 1, 2], "the remaining joint moves up to row 0");
+        rt.ring.push(&Command::JointDestroy { id: 9 });
+        rt.step();
+        assert_eq!(header(&rt, H_INSPECT_JOINT_N), 0);
+    }
+
+    #[test]
     fn header_word_indices_and_size_are_pinned() {
         assert_eq!(
             [H_EPOCH, H_CAPACITY, H_BUF0, H_STATE, H_GENERATIONS, H_TICKS, H_STALE, H_MALFORMED, H_BUCKETS, H_BUCKET_LEN, H_RING_PENDING,
              H_DROPPED_CONTACTS, H_OVERRUNS, H_CONTACTS, H_INSPECT_SEQ, H_INSPECT_BODIES, H_INSPECT_CONTACTS, H_INSPECT_CONTACT_N,
              H_STEP_LAST_US, H_STEP_TOTAL_US, H_INSPECT_TICK, H_INSPECT_ON, H_REC_ON, H_REC_START, H_REC_END, H_HASH_LO, H_HASH_HI, H_KEYFRAMES,
-             H_PAUSED, H_SEEKS, H_LIVE, H_REC_SEQ],
-            [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33],
+             H_PAUSED, H_SEEKS, H_LIVE, H_REC_SEQ, H_INSPECT_JOINTS, H_INSPECT_JOINT_N],
+            [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35],
         );
-        assert_eq!(HEADER_WORDS, 34);
+        assert_eq!(HEADER_WORDS, 36);
     }
 
     #[test]

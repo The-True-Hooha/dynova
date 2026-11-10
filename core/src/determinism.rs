@@ -3,7 +3,7 @@
 //! seed so the native build and every browser can be compared hash for hash (Stage 5A, `docs/decisions/determinism.md`).
 
 use crate::command_ring::Command;
-use crate::physics::BodyDesc;
+use crate::physics::{BodyDesc, JointDesc, JOINT_BALL, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER};
 use crate::runtime::Runtime;
 
 pub const TICKS: u32 = 700;
@@ -108,6 +108,91 @@ pub fn run_scene() -> [u64; 4] {
     [live_end, middle, replay_middle, rt.state_hash().unwrap_or(0)]
 }
 
+pub const JOINT_TICKS: u32 = 1230;
+pub const JOINT_MIDDLE: u32 = 650;
+const CHAIN_LINKS: u32 = 6;
+const DOOR: u32 = 20;
+const WHEEL: u32 = 30;
+const SLIDER_BODY: u32 = 40;
+const WELD_A: u32 = 50;
+const WELD_B: u32 = 51;
+
+fn joint(id: u32, kind: u8, a: u32, b: u32, anchor: [f32; 3], axis: [f32; 3]) -> Command {
+    let desc = JointDesc { kind, a, b, anchor, axis, limits: None, motor_vel: 0.0, motor_max: 0.0 };
+    Command::JointCreate { id, gen_a: 0, gen_b: 0, desc }
+}
+
+/// A floor, a pendulum chain, a door with limits, a motor-driven wheel, a motor-driven slider and a welded pair, so every joint
+/// kind, limits and both motor rows run in one world.
+fn build_joints(rt: &mut Runtime) {
+    rt.ring.push(&spawn(0, 0, BodyDesc::box_at([0.0, -0.5, 0.0], [30.0, 0.5, 30.0], 0.0, 0.1)));
+    rt.ring.push(&spawn(1, 0, BodyDesc::box_at([0.0, 10.0, 0.0], [0.25; 3], 0.0, 0.0)));
+    for i in 1..=CHAIN_LINKS {
+        rt.ring.push(&spawn(1 + i, 0, BodyDesc::sphere_at([i as f32, 10.0, 0.0], 0.2, 1.0, 0.0)));
+        rt.ring.push(&joint(i, JOINT_BALL, i, 1 + i, [i as f32 - 0.5, 10.0, 0.0], [0.0; 3]));
+    }
+    rt.ring.push(&spawn(DOOR - 1, 0, BodyDesc::box_at([10.0, 3.0, 0.0], [0.1, 3.0, 0.1], 0.0, 0.1)));
+    rt.ring.push(&spawn(DOOR, 0, BodyDesc::box_at([11.0, 3.0, 0.0], [1.0, 0.1, 0.1], 1.0, 0.1)));
+    let door = JointDesc { kind: JOINT_HINGE, a: DOOR - 1, b: DOOR, anchor: [10.0, 3.0, 0.0], axis: [0.0, 1.0, 0.0], limits: Some((-0.8, 0.8)), motor_vel: 0.0, motor_max: 0.0 };
+    rt.ring.push(&Command::JointCreate { id: 20, gen_a: 0, gen_b: 0, desc: door });
+    rt.ring.push(&spawn(WHEEL - 1, 0, BodyDesc::box_at([-10.0, 3.0, -3.0], [0.2; 3], 0.0, 0.0)));
+    rt.ring.push(&spawn(WHEEL, 0, BodyDesc::box_at([-10.0, 3.0, 0.0], [0.8, 0.8, 0.1], 1.0, 0.1)));
+    let wheel = JointDesc { kind: JOINT_HINGE, a: WHEEL - 1, b: WHEEL, anchor: [-10.0, 3.0, 0.0], axis: [0.0, 0.0, 1.0], limits: None, motor_vel: 2.0, motor_max: 50.0 };
+    rt.ring.push(&Command::JointCreate { id: 30, gen_a: 0, gen_b: 0, desc: wheel });
+    rt.ring.push(&spawn(SLIDER_BODY - 1, 0, BodyDesc::box_at([0.0, 3.0, -10.8], [0.2; 3], 0.0, 0.0)));
+    rt.ring.push(&spawn(SLIDER_BODY, 0, BodyDesc::box_at([1.0, 3.0, -10.0], [0.3; 3], 1.0, 0.1)));
+    let slider = JointDesc { kind: JOINT_SLIDER, a: SLIDER_BODY - 1, b: SLIDER_BODY, anchor: [0.0, 3.0, -10.0], axis: [1.0, 0.0, 0.0], limits: Some((-1.0, 3.0)), motor_vel: 0.0, motor_max: 0.0 };
+    rt.ring.push(&Command::JointCreate { id: 40, gen_a: 0, gen_b: 0, desc: slider });
+    rt.ring.push(&spawn(WELD_A, 0, BodyDesc::box_at([5.0, 3.0, 5.0], [0.3; 3], 1.0, 0.2)));
+    rt.ring.push(&spawn(WELD_B, 0, BodyDesc::box_at([5.7, 3.0, 5.0], [0.3; 3], 1.0, 0.2)));
+    rt.ring.push(&joint(50, JOINT_FIXED, WELD_A, WELD_B, [5.35, 3.0, 5.0], [0.0; 3]));
+}
+
+/// Commands issued before the step that produces tick `t + 1`. Keyframes fall every 60 ticks, so the commands at 610, 625 and 640 lie
+/// between the keyframe at tick 600 and the seek target (`JOINT_MIDDLE`), and the one at 1210 between the last keyframe and the end:
+/// both seeks must replay joint and force commands, not just restore a keyframe.
+fn joint_script(rt: &mut Runtime, t: u32) {
+    match t {
+        30 => { rt.ring.push(&Command::Force { id: DOOR, generation: 0, x: 0.0, y: 0.0, z: 8.0 }); }
+        100 => { rt.ring.push(&Command::JointMotor { id: 40, vel: 1.5, max: 30.0 }); }
+        300 => { rt.ring.push(&Command::JointMotor { id: 30, vel: -3.0, max: 50.0 }); }
+        400 => { rt.ring.push(&Command::Force { id: DOOR, generation: 0, x: 0.0, y: 0.0, z: -8.0 }); }
+        610 => { rt.ring.push(&Command::JointMotor { id: 40, vel: -1.5, max: 30.0 }); }
+        625 => { rt.ring.push(&Command::Force { id: DOOR, generation: 0, x: 0.0, y: 0.0, z: 6.0 }); }
+        640 => { rt.ring.push(&Command::JointDestroy { id: 3 }); }
+        800 => { rt.ring.push(&Command::Destroy { id: WELD_B, generation: 0 }); }
+        1210 => { rt.ring.push(&Command::JointMotor { id: 30, vel: 1.0, max: 50.0 }); }
+        _ => {}
+    }
+}
+
+/// Same four values as `run_scene`, for the joint world.
+pub fn run_joint_scene() -> [u64; 4] {
+    let mut rt = Runtime::new(128, 1024);
+    rt.enable_physics();
+    build_joints(&mut rt);
+    rt.ring.push(&Command::Record { on: true });
+    rt.step();
+    let first = rt.tick();
+    let mut middle = 0;
+    for t in 0..JOINT_TICKS {
+        joint_script(&mut rt, t);
+        rt.step();
+        if rt.tick() == first + JOINT_MIDDLE {
+            middle = rt.state_hash().unwrap_or(0);
+        }
+    }
+    let end_tick = rt.tick();
+    let live_end = rt.state_hash().unwrap_or(0);
+    rt.ring.push(&Command::Pause { on: true });
+    rt.ring.push(&Command::Seek { tick: first + JOINT_MIDDLE });
+    rt.step();
+    let replay_middle = rt.state_hash().unwrap_or(0);
+    rt.ring.push(&Command::Seek { tick: end_tick });
+    rt.step();
+    [live_end, middle, replay_middle, rt.state_hash().unwrap_or(0)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +237,85 @@ mod tests {
         assert!(rt.physics_position(PROJECTILE as usize).unwrap()[1] > -0.2, "and it did not fall through the floor");
     }
 
+    #[test]
+    fn a_seek_reproduces_the_live_hash_of_the_joint_scene_and_the_run_is_deterministic_and_pinned() {
+        let first = run_joint_scene();
+        let [live_end, live_mid, replay_mid, replay_end] = first;
+        assert_ne!(live_mid, 0);
+        assert_eq!(replay_mid, live_mid, "the middle tick after a seek");
+        assert_eq!(replay_end, live_end, "the end after seeking back");
+        assert_ne!(live_mid, live_end);
+        assert_eq!(first, run_joint_scene());
+        assert_eq!(live_end, JOINT_PINNED_END, "update the pin and docs/decisions/determinism.md together if the solver changed on purpose");
+        assert_eq!(live_mid, JOINT_PINNED_MIDDLE);
+    }
+
+    #[test]
+    fn the_joint_scene_holds_every_joint_and_reaches_both_limits_for_10000_ticks() {
+        let mut rt = Runtime::new(128, 1024);
+        rt.enable_physics();
+        build_joints(&mut rt);
+        let mut worst: std::collections::BTreeMap<u32, f32> = std::collections::BTreeMap::new();
+        let (mut door_lo, mut door_hi, mut slide_lo, mut slide_hi, mut slide_off) = (0.0f32, 0.0f32, f32::MAX, f32::MIN, 0.0f32);
+        for t in 0..10_000 {
+            joint_script(&mut rt, t);
+            rt.step();
+            for (id, gap) in rt.joint_anchor_gaps() {
+                let w = worst.entry(id).or_insert(0.0);
+                *w = w.max(gap);
+            }
+            let q = rt.physics_rotation(DOOR as usize).unwrap();
+            let angle = 2.0 * q[1].atan2(q[3]);
+            door_lo = door_lo.min(angle);
+            door_hi = door_hi.max(angle);
+            let s = rt.physics_position(SLIDER_BODY as usize).unwrap();
+            slide_lo = slide_lo.min(s[0]);
+            slide_hi = slide_hi.max(s[0]);
+            slide_off = slide_off.max((s[1] - 3.0).abs()).max((s[2] + 10.0).abs());
+            if t % 100 == 0 || t == 9_999 {
+                for id in [1 + CHAIN_LINKS, DOOR, WHEEL, SLIDER_BODY, WELD_A] {
+                    let p = rt.physics_position(id as usize).expect("the body stays alive");
+                    assert!(p.iter().all(|c| c.is_finite() && c.abs() < 100.0), "tick {t} body {id} at {p:?}");
+                }
+            }
+        }
+        for id in 1..=CHAIN_LINKS {
+            if id != 3 {
+                assert!(worst[&id] < 0.2, "chain joint {id} came apart by {}", worst[&id]);
+            }
+        }
+        assert!(worst[&3] < 0.2, "chain joint 3 held until it was destroyed: {}", worst[&3]);
+        assert!(worst[&20] < 0.25, "a 2 m door hinged at its end sags but stays attached: {}", worst[&20]);
+        assert!(worst[&30] < 0.01, "wheel axle {}", worst[&30]);
+        assert!(worst[&50] < 0.01, "weld {}", worst[&50]);
+        assert!(door_lo < -0.78 && door_lo > -0.9 && door_hi > 0.78 && door_hi < 0.9, "the door reaches both limits and not much past them: {door_lo} {door_hi}");
+        assert!(slide_lo > -0.1 && slide_lo < 0.05 && slide_hi > 3.95 && slide_hi < 4.1, "the slider travels its whole [0, 4] range: {slide_lo} {slide_hi}");
+        assert!(slide_off < 0.05, "the slider stays on its rail: {slide_off}");
+        let ids: Vec<u32> = rt.joint_anchor_gaps().into_iter().map(|g| g.0).collect();
+        assert_eq!(ids, [1, 2, 4, 5, 6, 20, 30, 40], "joint 3 went with the destroy command, joint 50 with its body");
+        assert!(rt.physics_position(3).unwrap()[1] > 5.0, "the upper chain still hangs");
+        assert!(rt.physics_position(4).unwrap()[1] < 1.0, "the tail cut loose by the destroy command lies on the floor");
+        assert!(rt.physics_rotation(WHEEL as usize).unwrap()[2].abs() > 0.05, "the motor turned the wheel");
+        assert_eq!(rt.physics_position(WELD_B as usize), None, "a destroyed body is gone");
+    }
+
+    #[test]
+    fn the_joint_scene_loses_a_joint_to_a_destroy_command_and_a_destroyed_body() {
+        let mut rt = Runtime::new(128, 1024);
+        rt.enable_physics();
+        build_joints(&mut rt);
+        rt.step();
+        assert_eq!(rt.joint_count(), 10);
+        for t in 0..JOINT_TICKS {
+            joint_script(&mut rt, t);
+            rt.step();
+        }
+        assert_eq!(rt.joint_count(), 8, "joint 3 destroyed by command, the weld removed with its body");
+        assert_eq!(rt.stale_dropped() + rt.malformed_dropped(), 0);
+    }
+
+    const JOINT_PINNED_END: u64 = 15756670485398854027;
+    const JOINT_PINNED_MIDDLE: u64 = 13638603286812908320;
     const PINNED_END: u64 = 1177776368450856606;
     const PINNED_MIDDLE: u64 = 15081626903481916999;
 }

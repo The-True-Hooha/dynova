@@ -1,4 +1,4 @@
-import { InspectorView, World, layoutFromRuntime, SHAPE_SPHERE } from '@dynova/sdk';
+import { InspectorView, World, layoutFromRuntime, JOINT_BALL, JOINT_HINGE, SHAPE_SPHERE } from '@dynova/sdk';
 import { canvas2dAdapter } from '@dynova/canvas2d';
 import { mountInspector, type InspectorControls, type InspectorPanel } from '@dynova/inspector';
 
@@ -7,6 +7,7 @@ const N = Number(params.get('n') ?? 300);
 const paused = params.has('paused');
 const withPanel = params.get('panel') !== '0';
 const withControls = params.get('controls') !== '0';
+const withJoints = params.has('joints');
 
 const PPU = 16;
 const ARENA_HALF = 12;
@@ -32,16 +33,25 @@ async function run() {
         scales.set([hx * 2, hy * 2, hz * 2], h.id * 3);
     }
     const sphere = new Set<number>();
+    const dynamic: { h: ReturnType<World['spawn']>; x: number; y: number; z: number }[] = [];
     for (let i = 0; i < N; i++) {
         const isSphere = i % 2 === 0;
+        const x = ((i % COLUMNS) - (COLUMNS - 1) / 2) * 1.1 + ((i * 13) % 7) * 0.02;
+        const y = 2 + Math.floor(i / COLUMNS) * 1.1;
+        // The backdrop wall sits at z = 0; a jointed body on each side of it would be pushed apart by the contacts.
+        const z = withJoints && i < 3 ? 1.5 : ((i * 7) % 3 - 1) * 0.3;
         const h = world.spawn({
-            x: ((i % COLUMNS) - (COLUMNS - 1) / 2) * 1.1 + ((i * 13) % 7) * 0.02,
-            y: 2 + Math.floor(i / COLUMNS) * 1.1,
-            z: ((i * 7) % 3 - 1) * 0.3,
+            x, y, z,
             shape: isSphere ? SHAPE_SPHERE : undefined,
             hx: 0.5, hy: 0.5, hz: 0.5, invMass: 1, restitution: 0.1,
         });
         if (isSphere) sphere.add(h.id);
+        dynamic.push({ h, x, y, z });
+    }
+    if (withJoints) {
+        const mid = (a: number, b: number): [number, number, number] => [(dynamic[a].x + dynamic[b].x) / 2, (dynamic[a].y + dynamic[b].y) / 2, (dynamic[a].z + dynamic[b].z) / 2];
+        world.createJoint({ kind: JOINT_BALL, a: dynamic[0].h, b: dynamic[1].h, anchor: mid(0, 1) });
+        world.createJoint({ kind: JOINT_HINGE, a: dynamic[1].h, b: dynamic[2].h, anchor: mid(1, 2), axis: [0, 0, 1] });
     }
 
     const canvas = document.getElementById('view') as HTMLCanvasElement;
