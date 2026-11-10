@@ -7,3 +7,4 @@ sdk/typescript/wasm/
 sdk/typescript/wasm-st/
 test-results/
 playwright-report/
+NOT_VERIFIED.txt
