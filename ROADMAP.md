@@ -129,11 +129,31 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 - Decide fixed-point math commitment for lockstep based on the cross-browser f32 determinism results from the Stage 1B smoke test — extend that same harness to cover the actual solver now that it exists, don't write it fresh here
 - **Exit:** written decision doc, per item, backed by data — "BVH: no, grid histogram flat across 3 test scenes" or "BVH: yes, terrain+debris scene shows 40% of pairs in 2% of cells"
 
-### Stage 5B — Scope expansion based on 5A  ⏸ waiting on a user choice: neither decision greenlit a migration or a BVH (the grid fixes shipped as Step 23a); what remains is the second vertical (robotics, CAD or digital twin), which depends on inbound interest the repository cannot show
-- If lockstep verified feasible: fixed-point math migration for solver
-- If BVH warranted: implement as a swappable broad-phase behind the same `query_pairs()` interface, not a rewrite of narrow phase
-- Second vertical target selection (robotics/CAD/digital-twin) — pick one, not all three, based on which non-goal from VISION.md is getting the most inbound interest
-- **Exit:** whichever expansion was greenlit ships with its own Stage A/B breakdown, spun into Phase 6+.
+### Stage 5B — Scope expansion based on 5A  ✅ resolved 2026-11-10
+- No fixed-point migration and no BVH (5A decisions).
+- Second vertical: user chose all three, in order: digital twin, robotics, CAD, preceded by joints because robotics and CAD need them. Phases 6–9 below.
+
+---
+
+## Phase 6 — Joints and constraints
+- **6A** Joint table and solver: ball, hinge, fixed, slider with limits and motors, solved in the same iteration loop as contacts, warm started, sleeping-island aware. Commands `JointCreate`/`JointDestroy`/`JointMotor` through the ring.
+- **6B** Joints in snapshot, replay, state hash and determinism scene; SDK `World.joint*`; inspector shows joints.
+- **Exit:** a chain, a hinged door and a motor-driven wheel stay stable for 10k ticks; seek round trip over joint scenes is bit-identical.
+
+## Phase 7 — Digital twin vertical
+- **7A** Data ingest: kinematic bodies driven by external samples (telemetry to commands, batched), bulk teleport/kinematic-target command, large-N scale pass.
+- **7B** Demo and docs: replayed telemetry scene with overlays through the inspector.
+- **Exit:** 5k moving tracked entities at 60 fps in the browser fed from a recorded telemetry stream; scrub and replay are bit-identical.
+
+## Phase 8 — Robotics vertical
+- **8A** Sensors: raycast and overlap queries on the read path via the command ring plus a result buffer.
+- **8B** Controller loop: joint motor targets from user code each tick, demo arm and wheeled robot.
+- **Exit:** a 3-joint arm reaches a target and a wheeled robot follows a path, deterministic under replay.
+
+## Phase 9 — CAD vertical
+- **9A** Assembly mates (fixed, revolute, slider, distance) built on joints, large-coordinate handling.
+- **9B** Import of assemblies from GLTF node hierarchy, demo.
+- **Exit:** an imported assembly with mates moves through its range without drift.
 
 ---
 
