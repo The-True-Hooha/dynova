@@ -176,6 +176,14 @@ fn broadphase_report() {
 }
 
 #[test]
+#[ignore = "timing repeat for the pile only; run like broadphase_report"]
+fn pile_report_repeated() {
+    for _ in 0..3 {
+        report(&run("pile 5000", pile(5000), &[60, 200, 400, 700]));
+    }
+}
+
+#[test]
 fn concentration_counts_pairs_not_bodies_and_takes_at_least_one_cell() {
     assert_eq!(concentration(&[]), Concentration { occupied: 0, fullest: 0, top_pair_share: 0.0 });
     assert_eq!(concentration(&[0, 0, 1, 1]).top_pair_share, 0.0, "singletons form no pair");
@@ -234,12 +242,14 @@ fn the_pile_alternates_spheres_and_boxes_and_the_mixed_scene_has_one_large_dynam
 }
 
 #[test]
-fn one_wide_dynamic_body_widens_the_cells_for_everybody() {
+fn one_wide_dynamic_body_no_longer_widens_the_cells_for_everybody() {
     let mut w = mixed_scale(200);
     w.step();
-    assert!(w.cell_size >= 20.0, "cell {}", w.cell_size);
+    assert_eq!(w.cell_size, MIN_CELL_SIZE);
+    assert_eq!(w.big_dynamics.len(), 1);
     let c = concentration(&w.bucket_counts);
-    assert!(c.top_pair_share > 0.4, "the small bodies crowd few cells: {c:?}");
+    assert!(c.top_pair_share < 0.3, "the small bodies spread over many cells: {c:?}");
+    assert!(c.occupied > 20, "{c:?}");
 }
 
 #[test]

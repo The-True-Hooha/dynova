@@ -45,7 +45,7 @@ Both defects are properties of the current grid code:
 - the big-static loop has no cheap reject, although the ordinary cell loop does (the bounding-sphere test with `reach`);
 - the cell size is set by the widest dynamic body, so one outlier sets it for everyone.
 
-A scratch experiment by the reviewer of this decision (a bounding-sphere reject in the big-static loop, a cap on the dynamic cell width, and wide dynamic bodies tested against everything instead of widening the grid) took terrain contact generation from about 130 ms to 12 to 15 ms and mixed-scale from 22 ms to 1 to 4 ms, with the pile and the wall unchanged. A BVH would also work, but it adds a second broad phase to build, keep in step with moving bodies and test, for scenes the grid can serve with about ten lines. Step 23 makes those changes and re-measures.
+A scratch experiment by the reviewer of this decision (a bounding-sphere reject in the big-static loop, a cap on the dynamic cell width, and wide dynamic bodies tested against everything instead of widening the grid) took terrain contact generation from about 130 ms to 12 to 15 ms and mixed-scale from 22 ms to 1 to 4 ms, with the pile and the wall unchanged. A BVH would also work, but it adds a second broad phase to build, keep in step with moving bodies and test, for scenes the grid can serve with a few dozen lines. Step 23 made those changes and re-measured (below).
 
 ## Acceptance for Step 23
 
@@ -53,10 +53,32 @@ A scratch experiment by the reviewer of this decision (a bounding-sphere reject 
 - Mixed scale: contact generation within 2x of the pile of the same body count.
 - Pile, wall and pyramid: step time within noise of the figures above, golden hash `4599892428385582693` unchanged, and the pair set still equal to a brute-force search on random scenes, including scenes with wide dynamic bodies and many large statics.
 
+## Result of Step 23
+
+The two fixes, in `generate_contacts`:
+
+- the big-static loop now applies the same bounding-sphere reject as the cell loop (`try_pair_near`);
+- dynamic bodies wider than 4 m (`MAX_CELL_SIZE`) stay out of the grid and sit in `big_dynamics`; the cell size is set by the widest body that is still gridded. A wide awake body tests every other body itself; every other awake body also tests the wide ones. That list scan is quadratic, so past 16 wide dynamic bodies (`MAX_WIDE_DYNAMICS`) the cell grows to fit them again, which is what the code did before: a lattice of 5000 spheres just over 4 m wide cost 68 ms per pass with the list scan and 1.4 ms with the larger cell.
+
+Same scenes, same command, median rows (state about 20 ticks after the tick shown):
+
+| scene | tick | cell | narrow calls per awake body | step ms before / after | contact generation ms before / after |
+|---|---|---|---|---|---|
+| terrain 1600 + debris 2000 | 60 | 2.0 | 1601 / **0.9** | 146 / **12.6** | 147 / **12.0** |
+| | 200 | 2.0 | 1602 / 2.8 | 171 / 39.9 | 148 / 13.9 |
+| | 400 | 2.0 | 1603 / 4.1 | 148 / 23.0 | 138 / 13.3 |
+| | 700 | 2.0 | 1603 / 4.4 | 137 / 23.0 | 129 / 14.3 |
+| 3000 small + one large box | 60 | 28.4 / **2.0** | 1.0 / 1.0 | 23 / 1.5 | 22 / 1.3 |
+| | 200 | 28.4 / 2.0 | 1.3 / 1.3 | 30 / 9.4 | 23 / 2.0 |
+| | 400 | 28.4 / 2.0 | 2.3 / 2.3 | 28 / 10.0 | 23 / 4.5 |
+| | 700 | 28.4 / 2.0 | 3.8 / 3.9 | 49 / 14.1 | 22 / 4.0 |
+
+Against the acceptance numbers: terrain contact generation is 8% to 11% of before (target under 20%); the mixed scene's contact generation (1.3 to 4.5 ms for 3000 bodies) is inside 2x of the 5000-body pile (2.1 to 8.6 ms; the pile has more bodies, so the comparison favours the pile, but it holds at every tick). The pile's step times, run three more times with the new code, span the old figures (2.5; 9.1 to 11.2; 15.8 to 26.9; 25 to 28.5 ms against 2.3; 9.0; 15.6; 24.8 ms): the change is not distinguishable from run-to-run spread there. The golden hash `4599892428385582693` is unchanged, and the pair set equals a brute-force search on 40 random scenes that include wide dynamic bodies, sleepers and about a dozen large statics each (no pair twice, and the contact's first body always awake); a separate test pins the distance check on 400 big statics. The remaining terrain cost is the narrow phase of 4 calls per body and the solver, not the broad phase.
+
 ## Revisit the BVH when
 
 - a scene has far more than 1600 static bodies (the big-static loop is linear in them even with a reject); or
-- dynamic bodies of many sizes coexist in large numbers, so no single cell size and "wide body" threshold suits them; or
+- dynamic bodies of many sizes coexist in large numbers (more than 16 wide ones alongside many small ones), so neither the 4 m cap nor a cell sized to the widest body suits them; or
 - the browser benchmark, not only native, shows contact generation dominating a step.
 
 Not decided here: the `sweep_statics` continuous-collision scan, which also visits every static for each fast body. It is linear in the static count too and shows up only for fast bodies; it is parked in `PLAN.md`.

@@ -20,6 +20,10 @@ fn max_contacts_for(capacity: usize) -> usize {
     (capacity.min(MAX_BODIES) * CONTACTS_PER_BODY).max(MIN_MAX_CONTACTS)
 }
 const MIN_CELL_SIZE: f32 = 2.0;
+/// Dynamic bodies wider than this stay out of the grid: one wide body would otherwise set the cell size for every body.
+const MAX_CELL_SIZE: f32 = 4.0;
+/// Past this many wide dynamic bodies the list scan costs more than a larger cell, so the cell grows to fit them instead.
+const MAX_WIDE_DYNAMICS: usize = 16;
 const BROAD_EPS: f32 = 1e-3;
 const SOLVER_ITERS: u32   = 12;
 // Largest velocity change (m/s) one contact update may still apply for the sweep to count as converged.
@@ -65,6 +69,7 @@ pub struct PhysicsWorld {
     cell_next:  Vec<i32>,
     reach: Vec<f32>,
     big_statics: Vec<u32>,
+    big_dynamics: Vec<u32>,
     targets: Vec<f32>,
     touching: Vec<bool>,
     penetrating: Vec<bool>,
@@ -183,6 +188,7 @@ impl PhysicsWorld {
             cell_next:  vec![-1i32; capacity],
             reach: vec![0.0; capacity],
             big_statics: Vec::new(),
+            big_dynamics: Vec::new(),
             targets: Vec::new(),
             touching: vec![false; capacity],
             penetrating: vec![false; capacity],
@@ -507,11 +513,17 @@ impl PhysicsWorld {
     fn generate_contacts(&mut self) {
         let cap = self.capacity;
         // Cells must be at least as wide as the widest gridded body so overlapping bodies sit in adjacent cells.
-        let mut widest = 0.0f32;
+        // Bodies wider than the cell (any static, or a dynamic one past MAX_CELL_SIZE) are kept in lists instead.
+        let mut wide = 0usize;
         for i in 0..cap {
             if !self.active[i] { continue; }
             self.reach[i] = extent(self, i);
-            if self.inv_mass[i] != 0.0 {
+            wide += usize::from(self.inv_mass[i] != 0.0 && 2.0 * self.reach[i] > MAX_CELL_SIZE);
+        }
+        let limit = if wide > MAX_WIDE_DYNAMICS { f32::INFINITY } else { MAX_CELL_SIZE };
+        let mut widest = 0.0f32;
+        for i in 0..cap {
+            if self.active[i] && self.inv_mass[i] != 0.0 && 2.0 * self.reach[i] <= limit {
                 widest = widest.max(2.0 * self.reach[i]);
             }
         }
@@ -521,11 +533,11 @@ impl PhysicsWorld {
         self.cell_heads.fill(-1);
         self.bucket_counts.fill(0);
         self.big_statics.clear();
+        self.big_dynamics.clear();
         for i in 0..cap {
             if !self.active[i] { continue; }
-            let diameter = 2.0 * self.reach[i];
-            if self.inv_mass[i] == 0.0 && diameter > self.cell_size {
-                self.big_statics.push(i as u32);
+            if 2.0 * self.reach[i] > self.cell_size {
+                if self.inv_mass[i] == 0.0 { self.big_statics.push(i as u32); } else { self.big_dynamics.push(i as u32); }
                 continue;
             }
             let h = self.cell_hash(self.pos_x[i], self.pos_y[i], self.pos_z[i]);
@@ -539,9 +551,21 @@ impl PhysicsWorld {
         for i in 0..cap {
             if !self.active[i] || self.inv_mass[i] == 0.0 || self.sleeping[i] { continue; }
 
+            if 2.0 * self.reach[i] > self.cell_size {
+                // A wide body is not in the grid, so nothing finds it from a neighbouring cell: it tests everyone itself.
+                for j in 0..cap {
+                    if j != i && self.active[j] { self.try_pair(i, j); }
+                }
+                continue;
+            }
+
             for k in 0..self.big_statics.len() {
                 let s = self.big_statics[k] as usize;
-                self.try_contact(i, s);
+                self.try_pair_near(i, s);
+            }
+            for k in 0..self.big_dynamics.len() {
+                let b = self.big_dynamics[k] as usize;
+                if b != i { self.try_pair(i, b); }
             }
 
             let (cells, ncells) = self.neighbor_cells(self.pos_x[i], self.pos_y[i], self.pos_z[i]);
@@ -550,17 +574,25 @@ impl PhysicsWorld {
                 while j_idx >= 0 {
                     let j = j_idx as usize;
                     j_idx = self.cell_next[j];
-                    if j == i { continue; }
-                    let awake_dynamic = self.inv_mass[j] != 0.0 && !self.sleeping[j];
-                    if awake_dynamic && j < i { continue; }
-                    // Bounding spheres that do not overlap cannot touch; this skips most of the narrow-phase calls in a dense pile.
-                    let (dx, dy, dz) = (self.pos_x[i] - self.pos_x[j], self.pos_y[i] - self.pos_y[j], self.pos_z[i] - self.pos_z[j]);
-                    let reach = self.reach[i] + self.reach[j] + BROAD_EPS;
-                    if dx * dx + dy * dy + dz * dz > reach * reach { continue; }
-                    self.try_contact(i, j);
+                    if j != i { self.try_pair(i, j); }
                 }
             }
         }
+    }
+
+    /// Narrow phase for `i` (awake, dynamic) against `j`, unless an awake dynamic `j` with a lower index will find the pair
+    /// from its own side or the bounding spheres cannot overlap.
+    fn try_pair(&mut self, i: usize, j: usize) {
+        if self.inv_mass[j] != 0.0 && !self.sleeping[j] && j < i { return; }
+        self.try_pair_near(i, j);
+    }
+
+    /// Bounding spheres that do not overlap cannot touch; this skips most of the narrow-phase calls in a dense pile.
+    fn try_pair_near(&mut self, i: usize, j: usize) {
+        let (dx, dy, dz) = (self.pos_x[i] - self.pos_x[j], self.pos_y[i] - self.pos_y[j], self.pos_z[i] - self.pos_z[j]);
+        let reach = self.reach[i] + self.reach[j] + BROAD_EPS;
+        if dx * dx + dy * dy + dz * dz > reach * reach { return; }
+        self.try_contact(i, j);
     }
 
     /// Radius of the sphere swept for continuous collision: the shape's thinnest half-extent.
@@ -1074,7 +1106,8 @@ mod tests {
             w.spawn(i, &BodyDesc::box_at([x, 0.0, z], [0.5; 3], 1.0, 0.0));
             w.sleeping[i] = true;
         }
-        w.spawn(n + 1, &BodyDesc::box_at([1000.0, 0.0, 1000.0], [0.5; 3], 1.0, 0.0));
+        // Inside the floor's bounding sphere (radius about 707), so the floor is still tested, but far from every sleeper.
+        w.spawn(n + 1, &BodyDesc::box_at([400.0, 0.0, 400.0], [0.5; 3], 1.0, 0.0));
         w.step();
         assert!(w.narrow_calls >= 1, "the isolated body must still be tested against the big static floor");
         assert!(w.narrow_calls < 30, "narrow phase ran {} times for one isolated awake body", w.narrow_calls);
@@ -1097,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn long_thin_dynamic_body_widens_the_grid_and_still_collides() {
+    fn long_thin_dynamic_body_stays_out_of_the_grid_and_still_collides() {
         let mut w = zero_g(4);
         w.spawn(0, &BodyDesc::box_at([0.0, 0.0, 0.0], [0.3, 0.3, 3.0], 1.0, 0.0));
         w.spawn(1, &BodyDesc::box_at([0.0, 0.0, 5.8], [0.3, 0.3, 3.0], 1.0, 0.0));
@@ -1107,6 +1140,87 @@ mod tests {
         assert_eq!(expected.len(), 3);
         w.step();
         assert_eq!(pair_set(&w), expected);
+        assert_eq!(w.cell_size, MIN_CELL_SIZE, "the long bodies did not widen the grid");
+        assert_eq!(w.big_dynamics, vec![0, 1]);
+    }
+
+    #[test]
+    fn many_wide_dynamic_bodies_grow_the_cell_instead_of_scanning_each_other() {
+        let n = 400;
+        let mut w = zero_g(n);
+        for i in 0..n {
+            w.spawn(i, &BodyDesc::sphere_at([(i % 20) as f32 * 4.6, (i / 20) as f32 * 4.6, 0.0], 2.05, 1.0, 0.0));
+        }
+        w.step();
+        assert_eq!(w.big_dynamics.len(), 0);
+        assert!(w.cell_size >= 4.1, "cell {}", w.cell_size);
+        assert!(w.narrow_calls < 8 * n as u32, "{} narrow calls: the pairs are found through the grid", w.narrow_calls);
+        let mut few = zero_g(10);
+        for i in 0..10 {
+            few.spawn(i, &BodyDesc::sphere_at([i as f32 * 4.6, 0.0, 0.0], 2.05, 1.0, 0.0));
+        }
+        few.step();
+        assert_eq!((few.big_dynamics.len(), few.cell_size), (10, MIN_CELL_SIZE), "a handful of wide bodies stay out of the grid");
+    }
+
+    #[test]
+    fn a_terrain_of_big_statics_costs_a_distance_check_not_a_narrow_phase_call_per_tile() {
+        let tiles = 400;
+        let mut w = zero_g(tiles + 2);
+        for i in 0..tiles {
+            w.spawn(i, &BodyDesc::box_at([(i % 20) as f32 * 4.0, 0.0, (i / 20) as f32 * 4.0 - 40.0], [1.5, 0.5, 1.5], 0.0, 0.0));
+        }
+        w.spawn(tiles, &BodyDesc::sphere_at([2.0, 1.2, -38.0], 0.4, 1.0, 0.0));
+        w.step();
+        assert_eq!(w.big_statics.len(), tiles);
+        assert!(w.narrow_calls <= 4, "{} narrow-phase calls for one body over {tiles} big statics", w.narrow_calls);
+    }
+
+    #[test]
+    fn broadphase_matches_brute_force_with_wide_dynamic_bodies_sleepers_and_large_statics() {
+        let (mut with_wide, mut with_big_static) = (0, 0);
+        for seed in 1..=40u32 {
+            let mut w = scatter(120, seed, 26.0, 1.0);
+            // A few wide dynamic bodies (under the 16 that would grow the cell instead) and large statics among small ones.
+            for (k, id) in [7usize, 13, 29, 41].into_iter().enumerate() {
+                let p = [w.pos_x[id], w.pos_y[id], w.pos_z[id]];
+                w.spawn(id, &if k % 2 == 0 { BodyDesc::box_at(p, [2.6, 0.7, 1.2], 1.0, 0.2) } else { BodyDesc::sphere_at(p, 2.4, 1.0, 0.2) });
+            }
+            for id in [9usize, 18, 54] {
+                let p = [w.pos_x[id], w.pos_y[id], w.pos_z[id]];
+                w.spawn(id, &BodyDesc::box_at(p, [3.5, 0.5, 3.0], 0.0, 0.2));
+            }
+            for id in (0..120).filter(|id| id % 5 == 1 && w.inv_mass[*id] != 0.0) { w.sleeping[id] = true; }
+            let awake: Vec<bool> = (0..120).map(|i| w.inv_mass[i] != 0.0 && !w.sleeping[i]).collect();
+            let awake_dynamic = |i: u32| awake[i as usize];
+            let expected: BTreeSet<(u32, u32)> = brute_force(&w).into_iter().filter(|&(a, b)| awake_dynamic(a) || awake_dynamic(b)).collect();
+            w.step();
+            assert_eq!(pair_set(&w), expected, "seed {seed}");
+            let mut keys: Vec<(u32, u32)> = w.contacts.iter().map(|c| (c.a.min(c.b), c.a.max(c.b))).collect();
+            keys.dedup();
+            let distinct = keys.iter().collect::<BTreeSet<_>>().len();
+            assert_eq!(distinct, keys.len(), "seed {seed}: a pair was reported twice");
+            assert!(w.contacts.iter().all(|c| awake_dynamic(c.a)), "seed {seed}: contact `a` must be the awake body");
+            with_wide += usize::from(!w.big_dynamics.is_empty());
+            with_big_static += usize::from(!w.big_statics.is_empty());
+        }
+        assert!(with_wide == 40 && with_big_static == 40, "the scenes must exercise both lists: {with_wide} / {with_big_static}");
+    }
+
+    #[test]
+    fn a_wide_dynamic_body_neither_widens_the_cell_nor_is_missed_by_small_neighbours() {
+        let mut w = zero_g(6);
+        w.spawn(0, &BodyDesc::box_at([0.0, 0.0, 0.0], [10.0, 1.0, 10.0], 1.0, 0.0));
+        for k in 1..5 {
+            w.spawn(k, &BodyDesc::sphere_at([-8.0 + 4.0 * k as f32, 1.3, 0.0], 0.4, 1.0, 0.0));
+        }
+        w.spawn(5, &BodyDesc::sphere_at([30.0, 1.3, 0.0], 0.4, 1.0, 0.0));
+        let expected = brute_force(&w);
+        assert_eq!(expected.len(), 4);
+        w.step();
+        assert_eq!(pair_set(&w), expected);
+        assert_eq!((w.cell_size, w.big_dynamics.clone()), (MIN_CELL_SIZE, vec![0]));
+        assert!(w.contacts.iter().all(|c| c.a < 5 && c.b < 5 || c.a == 0 || c.b == 0));
     }
 
     fn rest_y(w: &mut PhysicsWorld, id: usize, ticks: usize) -> f32 {
