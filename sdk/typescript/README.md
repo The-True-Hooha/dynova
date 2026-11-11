@@ -17,7 +17,7 @@ function frame() {
 frame();
 ```
 
-`launch` is `launchWorld` with this package's worker and wasm wired in. It needs a bundler that follows `new URL('./file', import.meta.url)` and bundles module workers. Only a Vite production build is tested; with a Vite dev server add `optimizeDeps: { exclude: ['@dynova/sdk'] }` (untested). Module workers need Chrome 80, Firefox 114 or Safari 15 or newer, and the worker file must be served from your own origin (a CDN `base` on another origin breaks `new Worker`).
+`launch` is `launchWorld` with this package's worker and wasm wired in. It needs a bundler that follows `new URL('./file', import.meta.url)` and bundles module workers. Tested: a Vite production build, the Vite dev server (no extra configuration; excluding `@dynova/sdk` from `optimizeDeps` is not needed) and a webpack 5 production build, each in Chromium and WebKit. Module workers need Chrome 80, Firefox 114 or Safari 15 or newer, and the worker file must be served from your own origin (a CDN `base` on another origin breaks `new Worker`).
 
 ## Pages that cannot use shared memory
 

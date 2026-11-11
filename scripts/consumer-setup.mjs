@@ -11,7 +11,10 @@ const dir = process.env.CONSUMER_DIR ?? join(tmpdir(), 'dynova-consumer');
 if (!dir.includes('dynova-consumer')) throw new Error(`CONSUMER_DIR must contain 'dynova-consumer' (it is deleted first), got ${dir}`);
 const version = JSON.parse(readFileSync(join(repo, 'sdk/typescript/package.json'), 'utf8')).version;
 const packages = { sdk: 'sdk/typescript', three: 'renderer/three', canvas2d: 'renderer/canvas2d', inspector: 'inspector' };
+const pm = process.env.CONSUMER_PM ?? 'npm';
+if (!['npm', 'pnpm'].includes(pm)) throw new Error(`CONSUMER_PM must be npm or pnpm, got ${pm}`);
 const run = (cmd, args, cwd) => execFileSync(cmd, args, { cwd, stdio: 'inherit' });
+const exec = (args, cwd) => (pm === 'pnpm' ? run('pnpm', ['exec', ...args], cwd) : run('npx', args, cwd));
 
 rmSync(dir, { recursive: true, force: true });
 mkdirSync(join(dir, 'tarballs'), { recursive: true });
@@ -36,12 +39,20 @@ writeFileSync(join(app, 'package.json'), JSON.stringify({
     overrides: { '@dynova/sdk': tarball('sdk') },
 }, null, 2));
 
-run('npm', ['install', '--no-audit', '--no-fund'], app);
-run('npx', ['tsc', '--noEmit'], app);
+if (pm === 'pnpm') {
+    // Outside the workspace: an empty workspace file keeps pnpm from walking up to the repo's.
+    writeFileSync(join(app, 'pnpm-workspace.yaml'), `packages: []\noverrides:\n  '@dynova/sdk': ${tarball('sdk')}\n`);
+    run('pnpm', ['install'], app);
+} else {
+    run('npm', ['install', '--no-audit', '--no-fund'], app);
+}
+exec(['tsc', '--noEmit'], app);
 // Third-party declarations (@webgpu/types against TypeScript 7's DOM lib) fail a full check, so the app skips library checks;
 // check our own declarations on their own: any error inside @dynova/* fails.
-const full = spawnSync('npx', ['tsc', '--noEmit', '--skipLibCheck', 'false'], { cwd: app, encoding: 'utf8' });
+const full = pm === 'pnpm'
+    ? spawnSync('pnpm', ['exec', 'tsc', '--noEmit', '--skipLibCheck', 'false'], { cwd: app, encoding: 'utf8' })
+    : spawnSync('npx', ['tsc', '--noEmit', '--skipLibCheck', 'false'], { cwd: app, encoding: 'utf8' });
 const ours = `${full.stdout}${full.stderr}`.split('\n').filter((l) => l.includes('node_modules/@dynova/'));
 if (ours.length) throw new Error(`errors in the packed declarations:\n${ours.join('\n')}`);
-run('npx', ['vite', 'build'], app);
+exec(['vite', 'build'], app);
 console.log(`consumer app ready in ${app}`);

@@ -33,7 +33,7 @@ Source of truth for work order. ROADMAP.md defines the stages; this file defines
 
 Every ROADMAP phase is done and committed on `nightly`: 1 to 5 (runtime, physics, Three.js and Canvas2D adapters, inspector and replay, profiling decisions), 6 (joints), 7 (digital twin), 8 (robotics), 9 (CAD) and 10 (consumable packages). ROADMAP.md marks each stage with what was delivered and what was not; the per-feature docs are in `docs/`; the full history of what each step changed is `git log` (commit bodies carry the review findings). The step-by-step plan that used to live here is gone: it described work that is finished.
 
-Open work is the parking lot below plus `NOT_VERIFIED.txt` (local, git-ignored: Firefox, real x86_64 browsers, timings on other machines, the Phase 7 frame time, bundlers other than Vite).
+Open work is the parking lot below plus `NOT_VERIFIED.txt` (local, git-ignored: Firefox, real x86_64 browsers, timings on other machines, bundlers other than Vite and webpack).
 
 ## Parking lot
 
@@ -85,7 +85,7 @@ Out-of-plan observations. Do not act on these without approval.
 - (Step 29, parked) Solver limits found building the demos, documented in `docs/robotics.md`: hinge chains with off-plane anchors under gravity grow out-of-plane tilt; a differential drive with more than about 15-20 percent wheel speed difference skids and tips (motor rows against friction rows in a fixed pass count); contacts between jointed links fight the joint. A wheeled robot that turns sharply needs a better solver (more passes, or a joint-aware friction model), which is a separate project.
 - (Step 30, parked) No command re-bases a running world (shift every body, keep velocities); mates are made from the current pose and ranges are relative to it.
 - (Step 31, parked) No import of CAD-native constraints (glTF has no place for them); no solver that assembles overlapping parts.
-- (Step 32, parked) Not published to npm; Vite dev server, webpack, other bundlers and pnpm/yarn installs untested; no release process.
+- (Step 32, parked) Not published to npm; Rollup, esbuild-only, Next.js and yarn untested (Vite production and dev, webpack 5 by hand, npm and pnpm installs tested); no release process.
 
 ## Plan changes
 

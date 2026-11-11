@@ -26,7 +26,7 @@ world.moveKinematic(frame.map((s, i) => ({ handle: handles[i], x: s.x, y: s.y, z
 
 ## Cost
 
-Measured on Apple silicon: 5000 moving bodies, one sample each every 12 ticks, mean step 1.8 ms in Chromium and WebKit (`e2e/telemetry.spec.ts` prints it and asserts only that it stays under 16 ms; release wasm); about 1.0 ms natively in a one-off run that is not kept as a test. The JavaScript cost of building 1667 slot writes per sample frame is on top of that and is not in the step time.
+Measured on Apple silicon: 5000 moving bodies, one sample each every 12 ticks, mean step 1.8 ms in Chromium and WebKit (`e2e/telemetry.spec.ts` prints it and asserts only that it stays under 16 ms; release wasm); about 1.0 ms natively in a one-off run that is not kept as a test. The whole control tick of the demo with 5000 entities (the feed build every 12th tick, the step, the Canvas2D draw of every entity, the inspector snapshot and the velocity overlay) takes a median of about 6 ms in Chromium and 7.5 ms in WebKit, 95th percentile under 9 ms, and the page keeps 60 fps in both (`e2e/frametime.spec.ts`, headless, one Apple-silicon laptop; a real GPU compositor, other machines and other browsers are not measured).
 
 ## Demo
 

@@ -140,7 +140,7 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 - **6B** Joints in snapshot, replay, state hash and determinism scene; SDK `World.joint*`; inspector shows joints.
 - **Exit:** a chain, a hinged door and a motor-driven wheel stay stable for 10k ticks; seek round trip over joint scenes is bit-identical.
 
-## Phase 7 — Digital twin vertical  ✅ done; the 60 fps frame time at 5000 entities with drawing is not measured (docs/digital-twin.md)
+## Phase 7 — Digital twin vertical  ✅ done; 60 fps at 5000 entities with drawing and overlay measured in headless Chromium and WebKit (docs/digital-twin.md)
 - **7A** Data ingest: kinematic bodies driven by external samples (telemetry to commands, batched), bulk teleport/kinematic-target command, large-N scale pass.
 - **7B** Demo and docs: replayed telemetry scene with overlays through the inspector.
 - **Exit:** 5k moving tracked entities at 60 fps in the browser fed from a recorded telemetry stream; scrub and replay are bit-identical.

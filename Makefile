@@ -1,4 +1,4 @@
-.PHONY: build build-release build-st e2e dev test install clean check all package consumer-test
+.PHONY: build build-release build-st e2e dev test install clean check all package consumer-test consumer-test-pnpm
 
 # Build WASM (dev, faster compile)
 build:
@@ -57,4 +57,9 @@ package: build-release build-st
 # Pack the packages, install the tarballs into a clean app, typecheck and bundle it, then run it in Chromium and WebKit
 consumer-test: package
 	node scripts/consumer-setup.mjs
+	pnpm exec playwright test -c playwright.consumer.config.ts
+
+# The same, installing with pnpm instead of npm
+consumer-test-pnpm: package
+	CONSUMER_PM=pnpm node scripts/consumer-setup.mjs
 	pnpm exec playwright test -c playwright.consumer.config.ts

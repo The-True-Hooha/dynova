@@ -11,6 +11,7 @@ export default defineConfig({
     webServer: [
         { command: 'npx vite preview --port 5191 --strictPort', cwd: app, url: 'http://localhost:5191/', reuseExistingServer: false, timeout: 30_000 },
         { command: 'npx vite preview --port 5192 --strictPort', cwd: app, url: 'http://localhost:5192/', env: { NO_ISOLATION: '1' }, reuseExistingServer: false, timeout: 30_000 },
+        { command: 'npx vite --port 5193 --strictPort', cwd: app, url: 'http://localhost:5193/', reuseExistingServer: false, timeout: 60_000 },
     ],
     projects: [
         { name: 'chromium', use: { ...devices['Desktop Chrome'] } },

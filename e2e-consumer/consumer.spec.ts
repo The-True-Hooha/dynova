@@ -2,6 +2,7 @@ import { test, expect, type Page } from '@playwright/test';
 
 const ISOLATED = 'http://localhost:5191/';
 const PLAIN = 'http://localhost:5192/';
+const DEV = 'http://localhost:5193/';
 
 const ready = (page: Page) => page.waitForFunction(() => (window as any).__ready === true || (window as any).__error !== undefined, null, { timeout: 45_000 });
 
@@ -81,4 +82,18 @@ test('on a page that supports shared memory but lacks the isolation headers the 
     expect(err.name).toBe('SharedMemoryUnavailableError');
     expect(err.message).toContain('Cross-Origin-Opener-Policy');
     expect(err.message).toContain('Cross-Origin-Embedder-Policy');
+});
+
+test('the Vite dev server (unbundled, with the documented optimizeDeps exclusion) runs the packaged world over shared memory', async ({ page }) => {
+    const errors = await open(page, DEV);
+    expect(await page.evaluate(() => (window as any).__error)).toBeUndefined();
+    await settle(page);
+    const r = await inspect(page);
+    expect(r.mode).toBe('shared');
+    expect(r.ballY).toBeLessThan(8);
+    expect(r.boxesOnFloor).toBe(20);
+    expect([r.drawnFloor, r.drawnBox, r.drawnBall]).toEqual([true, true, true]);
+    expect(r.rows).toBe(24);
+    expect(r.joints).toBe(1);
+    expect(errors).toEqual([]);
 });

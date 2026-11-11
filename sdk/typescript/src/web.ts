@@ -12,7 +12,7 @@ async function loadFallback(config: WorldConfig): Promise<FallbackLoad> {
 
 /**
  * `launchWorld` with the package's own worker and wasm already wired, for a bundler that follows `new URL(..., import.meta.url)` and
- * bundles module workers. Only Vite (production build) has been tested. On an isolated page the simulation runs in a Worker over shared memory;
+ * bundles module workers. Tested with Vite (production build and dev server) and webpack 5. On an isolated page the simulation runs in a Worker over shared memory;
  * on an isolated page where SharedArrayBuffer is nevertheless missing it runs on the calling thread; on a page that supports it but lacks the isolation headers it
  * throws `SharedMemoryUnavailableError`.
  */
