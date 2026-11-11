@@ -313,6 +313,8 @@ export interface BodyParams {
 export interface SpawnColliderOptions {
     /** Per-node body parameters. Default: static (`invMass` 0). */
     body?: (node: Object3D) => BodyParams;
+    /** Hull ids already uploaded, by `ColliderDesc.geometryKey`; pass the same map across calls so one geometry uploads once. */
+    hullCache?: Map<string, number>;
 }
 
 export interface SpawnedCollider {
@@ -329,7 +331,7 @@ export interface SpawnReport {
 export function spawnColliders(world: ColliderWorld, colliders: readonly ColliderDesc[], options: SpawnColliderOptions = {}): SpawnReport {
     const spawned: SpawnedCollider[] = [];
     const failed: { name: string; error: string }[] = [];
-    const hulls = new Map<string, number>();
+    const hulls = options.hullCache ?? new Map<string, number>();
     for (const c of colliders) {
         const params = options.body?.(c.node) ?? {};
         try {

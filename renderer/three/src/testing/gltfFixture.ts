@@ -11,6 +11,10 @@ export interface FixtureMesh extends Partial<Geometry> {
     indexType?: 5123 | 5125;
     /** Linear RGB base colour (0 to 1). */
     color?: number[];
+    /** glTF node extras; the loader exposes them as `userData`. */
+    extras?: Record<string, unknown>;
+    /** Index of another mesh in the same list that this node hangs under; default the root. */
+    parent?: number;
 }
 
 export interface FixtureTransform {
@@ -195,10 +199,17 @@ export function buildGlb(meshes: FixtureMesh[], root: FixtureTransform = {}): Ar
         if (m.translation) node.translation = m.translation;
         if (m.rotation) node.rotation = m.rotation;
         if (m.scale) node.scale = m.scale;
+        if (m.extras) node.extras = m.extras;
         meshNodes.push(node);
     });
 
-    const rootNode: Record<string, unknown> = { name: 'root', children: meshNodes.map((_, i) => i + 1) };
+    // Node 0 is the root and mesh i is node i + 1.
+    meshes.forEach((m, i) => {
+        if (m.parent === undefined) return;
+        const parent = meshNodes[m.parent] as { children?: number[] };
+        (parent.children ??= []).push(i + 1);
+    });
+    const rootNode: Record<string, unknown> = { name: 'root', children: meshes.map((m, i) => (m.parent === undefined ? i + 1 : -1)).filter((n) => n >= 0) };
     if (root.translation) rootNode.translation = root.translation;
     if (root.rotation) rootNode.rotation = root.rotation;
     if (root.scale) rootNode.scale = root.scale;
