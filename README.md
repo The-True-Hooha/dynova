@@ -59,7 +59,7 @@ dynova/
   examples/          # Runnable demos and e2e pages
   e2e/               # Playwright cross-browser tests
   inspector/         # Inspector panel with optional editing and timeline (@dynova/inspector)
-  docs/              # Hosting notes, adapter contract, Three.js adapter, scene colliders, inspector, replay, benchmark, joints, digital twin, sensors, robotics, assemblies, assembly import
+  docs/              # Hosting notes, adapter contract (Three.js and Canvas2D), scene colliders, inspector, replay, benchmark, joints, digital twin, sensors, robotics, assemblies, assembly import
 ```
 
 The four packages build to ESM with type declarations (`make package`) and install into an app outside the repo from packed tarballs; they are not published to npm. See [docs/packaging.md](./docs/packaging.md) and the package READMEs.
