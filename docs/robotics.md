@@ -6,12 +6,12 @@ A robot controller is user code that runs once per tick: read where the joints a
 
 ```ts
 world.step();                                   // the tick the controller reacts to
-const states = world.readJointStates();         // position and rate of every hinge and slider
+const states = world.readJointStates();         // position and rate of every hinge, slider and distance joint
 world.driveJoints(drives);                      // PD position control, one motor command per joint
 // or world.setJointMotor(joint, speed, maxTorque) for a wheel
 ```
 
-- `readJointStates()` returns `{ joint, kind, position, velocity }` for every hinge (angle in radians, in (-pi, pi]) and slider (offset in metres), with the sign that limits and the motor use: a positive motor speed raises `position`. They are the values after the last step; a seek republishes the values of the sought tick. The runtime writes the table after every step inside a sequence word and the reader copies it whole, so it never mixes two ticks.
+- `readJointStates()` returns `{ joint, kind, position, velocity }` for every hinge (angle in radians, in (-pi, pi]), slider (offset in metres) and distance joint (stretch in metres; it has no motor, so `driveJoints` refuses it), with the sign that limits and the motor use: a positive motor speed raises `position`. They are the values after the last step; a seek republishes the values of the sought tick. The runtime writes the table after every step inside a sequence word and the reader copies it whole, so it never mixes two ticks.
 - `driveJoints(drives)` reads the states once, runs `positionControl` for each `{ joint, target, gains }` and queues the commands. Every command is validated before any is queued, so a bad value queues nothing; a full command ring can still stop it part way. It returns the ids of joints it had no state for.
 - `positionControl(state, target, gains)` is the pure part: speed = `kp * error - kd * velocity`, clamped to `maxSpeed`, with `maxForce` as the motor's torque or force limit. A velocity motor holds exactly the speed it is told while the load stays under `maxForce`, so a joint reaches its target without a steady error as the speed goes to zero, up to the solver's own softness (below).
 - `solveArm`, `armJoints`, `pursue` (`robotics.ts`) are the arm and path maths the demos use: cyclic coordinate descent for a planar arm within joint limits, and pure pursuit for a differential drive. All pure and deterministic.

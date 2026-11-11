@@ -1,5 +1,5 @@
 import {
-    JOINT_BALL, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER,
+    JOINT_BALL, JOINT_DISTANCE, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER,
     BODY_STATE_AWAKE, BODY_STATE_INACTIVE, BODY_STATE_SLEEPING, BODY_STATE_STATIC,
     type InspectedBody, type InspectorSnapshot, type ProfilerSample, type RecordingState,
 } from '@dynova/sdk';
@@ -110,15 +110,15 @@ export function contactsOf(snapshot: InspectorSnapshot, id: number): EntityConta
     return out;
 }
 
-export const JOINT_KIND_NAMES: Record<number, string> = { [JOINT_BALL]: 'ball', [JOINT_HINGE]: 'hinge', [JOINT_FIXED]: 'fixed', [JOINT_SLIDER]: 'slider' };
+export const JOINT_KIND_NAMES: Record<number, string> = { [JOINT_BALL]: 'ball', [JOINT_HINGE]: 'hinge', [JOINT_FIXED]: 'fixed', [JOINT_SLIDER]: 'slider', [JOINT_DISTANCE]: 'distance' };
 
 export function jointKindName(kind: number): string {
     return JOINT_KIND_NAMES[kind] ?? `kind ${kind}`;
 }
 
-/** A slider's anchors move apart along its axis by design, so its distance is travel, not error. */
+/** A slider's anchors move apart along its axis by design and a distance joint's sit a rod's length apart, so their distance is not an error. */
 export function jointGapLabel(kind: number): string {
-    return kind === JOINT_SLIDER ? 'travel' : 'gap';
+    return kind === JOINT_SLIDER ? 'travel' : kind === JOINT_DISTANCE ? 'span' : 'gap';
 }
 
 export interface EntityJoint {

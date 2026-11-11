@@ -8,7 +8,7 @@ mod snapshot;
 pub(crate) use snapshot::Fnv;
 pub use kinematic::{Kin, MAX_KIN_TICKS};
 pub use query::{OverlapHit, RayHit, MAX_OVERLAP_HITS, MAX_QUERY_RANGE, NO_BODY};
-pub use joints::{Joint, JointDesc, MAX_JOINTS, JOINT_BALL, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER, MAX_JOINT_ID};
+pub use joints::{Joint, JointDesc, MAX_JOINTS, JOINT_BALL, JOINT_DISTANCE, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER, MAX_JOINT_ID, MIN_ROD_LENGTH};
 pub use snapshot::PhysicsSnapshot;
 
 const MIN_BUCKETS: usize = 4096;

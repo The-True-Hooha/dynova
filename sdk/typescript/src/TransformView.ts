@@ -148,7 +148,7 @@ export class TransformView {
     }
 
     /**
-     * `[joint id, kind, coordinate, rate]` rows of every hinge and slider as of the last tick the runtime published, copied inside the
+     * `[joint id, kind, coordinate, rate]` rows of every hinge, slider and distance joint as of the last tick the runtime published, copied inside the
      * runtime's sequence word so they all belong to one tick. Empty while no hinge or slider exists.
      */
     jointStates(): Array<{ id: number; kind: number; position: number; velocity: number }> {

@@ -163,12 +163,12 @@ describe('jointsOf', () => {
         expect(jointsOf(snapshot([1, 1]), 0)).toEqual([]);
     });
 
-    it('calls a slider\'s anchor distance travel and every other joint\'s gap', () => {
-        expect([0, 1, 2, 3].map(jointGapLabel)).toEqual(['gap', 'gap', 'gap', 'travel']);
+    it('calls a slider\'s anchor distance travel, a distance joint\'s span and every other joint\'s gap', () => {
+        expect([0, 1, 2, 3, 4].map(jointGapLabel)).toEqual(['gap', 'gap', 'gap', 'travel', 'span']);
     });
 
     it('names the four kinds and falls back for an unknown one', () => {
-        expect([0, 1, 2, 3].map(jointKindName)).toEqual(['ball', 'hinge', 'fixed', 'slider']);
+        expect([0, 1, 2, 3, 4].map(jointKindName)).toEqual(['ball', 'hinge', 'fixed', 'slider', 'distance']);
         expect(jointKindName(9)).toBe('kind 9');
     });
 });

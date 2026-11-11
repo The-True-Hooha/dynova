@@ -5,6 +5,11 @@ pub const JOINT_BALL: u8 = 0;
 pub const JOINT_HINGE: u8 = 1;
 pub const JOINT_FIXED: u8 = 2;
 pub const JOINT_SLIDER: u8 = 3;
+/// Holds two points, one on each body, at a fixed distance (a rod) or within a range of it (a rope or a slot's reach). The descriptor's
+/// `anchor` is the point on body `a` and its `axis` field carries the point on body `b`, so the wire format is unchanged.
+pub const JOINT_DISTANCE: u8 = 4;
+/// Two points closer than this are a ball joint, not a rod.
+pub const MIN_ROD_LENGTH: f32 = 1.0e-3;
 /// Joint ids are chosen by the caller, like hull ids; the table is sorted by id so its order never depends on history.
 pub const MAX_JOINT_ID: u32 = 1 << 24;
 /// Live joints are cloned into every keyframe and scanned when a body spawns or dies, so the count is bounded.
@@ -43,10 +48,14 @@ pub struct JointDesc {
 impl JointDesc {
     pub fn is_valid(&self) -> bool {
         let finite = |v: V3| v.iter().all(|c| c.is_finite());
-        if self.kind > JOINT_SLIDER || self.a == self.b || !finite(self.anchor) || !finite(self.axis) {
+        if self.kind > JOINT_DISTANCE || self.a == self.b || !finite(self.anchor) || !finite(self.axis) {
             return false;
         }
         if self.anchor.iter().any(|c| c.abs() > MAX_COORD) {
+            return false;
+        }
+        let distance = self.kind == JOINT_DISTANCE;
+        if distance && (self.axis.iter().any(|c| c.abs() > MAX_COORD) || len_sq(sub(self.anchor, self.axis)) < MIN_ROD_LENGTH * MIN_ROD_LENGTH) {
             return false;
         }
         let axial = self.kind == JOINT_HINGE || self.kind == JOINT_SLIDER;
@@ -59,7 +68,7 @@ impl JointDesc {
         {
             return false;
         }
-        if !axial && (self.limits.is_some() || self.motor_max > 0.0) {
+        if !axial && self.motor_max > 0.0 || !axial && !distance && self.limits.is_some() {
             return false;
         }
         let bound = if self.kind == JOINT_HINGE { MAX_ANGLE_LIMIT } else { MAX_LINEAR_LIMIT };
@@ -86,6 +95,8 @@ pub struct Joint {
     pub limits: Option<(f32, f32)>,
     pub motor_vel: f32,
     pub motor_max: f32,
+    /// Rest distance of a distance joint; zero for every other kind.
+    pub len: f32,
     pub acc: [f32; 9],
 }
 
@@ -175,7 +186,9 @@ impl PhysicsWorld {
         }
         let Err(at) = self.joints.binary_search_by_key(&id, |j| j.id) else { return false };
         let (qa, qb) = (self.body_quat(a), self.body_quat(b));
-        let axis = normalize(d.axis).unwrap_or([1.0, 0.0, 0.0]);
+        let distance = d.kind == JOINT_DISTANCE;
+        let axis = if distance { [1.0, 0.0, 0.0] } else { normalize(d.axis).unwrap_or([1.0, 0.0, 0.0]) };
+        let anchor_b = if distance { d.axis } else { d.anchor };
         let (perp, _) = basis_perp(axis);
         let joint = Joint {
             id,
@@ -183,7 +196,7 @@ impl PhysicsWorld {
             a: d.a,
             b: d.b,
             la: inv_rotate(qa, sub(d.anchor, self.body_pos(a))),
-            lb: inv_rotate(qb, sub(d.anchor, self.body_pos(b))),
+            lb: inv_rotate(qb, sub(anchor_b, self.body_pos(b))),
             axis_a: inv_rotate(qa, axis),
             axis_b: inv_rotate(qb, axis),
             ref_a: inv_rotate(qa, perp),
@@ -192,6 +205,7 @@ impl PhysicsWorld {
             limits: d.limits,
             motor_vel: d.motor_vel,
             motor_max: d.motor_max,
+            len: if distance { len_sq(sub(d.anchor, d.axis)).sqrt() } else { 0.0 },
             acc: [0.0; 9],
         };
         self.joints.insert(at, joint);
@@ -248,11 +262,20 @@ impl PhysicsWorld {
     /// axis), measured on the bodies as they stand. The coordinate and its sign are the ones limits and the motor use: a positive motor
     /// speed raises it. `None` for a joint with no free coordinate.
     pub fn joint_coordinate(&self, j: &Joint) -> Option<(f32, f32)> {
-        if j.kind != JOINT_HINGE && j.kind != JOINT_SLIDER { return None; }
+        if j.kind != JOINT_HINGE && j.kind != JOINT_SLIDER && j.kind != JOINT_DISTANCE { return None; }
         let (a, b) = (j.a as usize, j.b as usize);
         let (qa, qb) = (self.body_quat(a), self.body_quat(b));
         let aa = rotate(qa, j.axis_a);
         let (wa, wb) = ([self.ang_x[a], self.ang_y[a], self.ang_z[a]], [self.ang_x[b], self.ang_y[b], self.ang_z[b]]);
+        if j.kind == JOINT_DISTANCE {
+            let (ra, rb) = (rotate(qa, j.la), rotate(qb, j.lb));
+            let err = sub(add(self.body_pos(a), ra), add(self.body_pos(b), rb));
+            let dist = len_sq(err).sqrt();
+            let (va, vb) = ([self.vel_x[a], self.vel_y[a], self.vel_z[a]], [self.vel_x[b], self.vel_y[b], self.vel_z[b]]);
+            let rate = sub(add(va, cross(wa, ra)), add(vb, cross(wb, rb)));
+            let n = if dist > 1.0e-6 { scale(err, 1.0 / dist) } else { [0.0, 1.0, 0.0] };
+            return Some((dist - j.len, dot(rate, n)));
+        }
         if j.kind == JOINT_HINGE {
             let (ua, ub) = (rotate(qa, j.ref_a), rotate(qb, j.ref_b));
             return Some((atan2_det(dot(cross(ua, ub), aa), dot(ua, ub)), dot(sub(wb, wa), aa)));
@@ -290,6 +313,20 @@ impl PhysicsWorld {
         let ang = |dir: V3, slot: usize, target: f32| Spec { dir, ra, rb, linear: false, slot: slot as u8, target, lo: free.0, hi: free.1 };
         let axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
+        if j.kind == JOINT_DISTANCE {
+            let dist = len_sq(err).sqrt();
+            let dir = if dist > 1.0e-6 { scale(err, 1.0 / dist) } else { [0.0, 1.0, 0.0] };
+            // The row along the line reads the rate of the distance itself, like the rows along a slider's axis.
+            let coord = dist - j.len;
+            if let Some((lo, hi)) = j.limits {
+                let target = |gap: f32| if gap >= 0.0 { -gap / dt } else { -bias(gap) };
+                p.push(Spec { lo: 0.0, hi: f32::INFINITY, ..lin(dir, SLOT_LOWER, target(coord - lo)) });
+                p.push(Spec { lo: 0.0, hi: f32::INFINITY, ..lin(neg(dir), SLOT_UPPER, target(hi - coord)) });
+            } else {
+                p.push(lin(dir, SLOT_POINT, -bias(coord)));
+            }
+            return p;
+        }
         let (p1, p2) = basis_perp(aa);
         if j.kind == JOINT_SLIDER {
             p.push(lin(p1, SLOT_POINT, -bias(dot(err, p1))));
@@ -1117,5 +1154,256 @@ mod tests {
         let (angle, rate) = w.joint_coordinate(&w.joints[0]).unwrap();
         assert!((angle - 1.0).abs() < 0.06 && (rate - 1.0).abs() < 0.06, "{angle} {rate}");
         assert!(angle_of(&w, 1) < -0.9, "the body itself turned the other way: {}", angle_of(&w, 1));
+    }
+
+    fn rod(a: u32, b: u32, pa: V3, pb: V3) -> JointDesc {
+        JointDesc { kind: JOINT_DISTANCE, a, b, anchor: pa, axis: pb, limits: None, motor_vel: 0.0, motor_max: 0.0 }
+    }
+
+    #[test]
+    fn a_distance_descriptor_needs_two_distinct_bounded_finite_points_and_takes_limits_but_no_motor() {
+        let ok = rod(0, 1, [0.0; 3], [2.0, 0.0, 0.0]);
+        assert!(ok.is_valid());
+        let bad = [
+            rod(0, 1, [0.0; 3], [0.0; 3]),
+            rod(0, 1, [0.0; 3], [5.0e-4, 0.0, 0.0]),
+            rod(0, 1, [0.0; 3], [f32::NAN, 0.0, 0.0]),
+            rod(0, 1, [0.0; 3], [MAX_COORD * 2.0, 0.0, 0.0]),
+            rod(0, 1, [f32::INFINITY, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            rod(1, 1, [0.0; 3], [1.0, 0.0, 0.0]),
+            JointDesc { motor_max: 1.0, ..ok },
+            JointDesc { limits: Some((0.5, 1.0)), ..ok },
+            JointDesc { limits: Some((-1.0, -0.5)), ..ok },
+            JointDesc { limits: Some((-1.0, 2.0e4)), ..ok },
+        ];
+        for (n, d) in bad.iter().enumerate() {
+            assert!(!d.is_valid(), "case {n}");
+        }
+        assert!(JointDesc { limits: Some((-0.5, 1.0)), ..ok }.is_valid());
+        assert!(rod(0, 1, [MAX_COORD, 0.0, 0.0], [MAX_COORD - 1.0, 0.0, 0.0]).is_valid());
+        assert!(!JointDesc { kind: 5, ..ok }.is_valid());
+    }
+
+    #[test]
+    fn a_rod_stores_its_length_the_point_on_each_body_and_leaves_other_kinds_with_length_zero() {
+        let mut w = world(3);
+        anchor_body(&mut w, 0, [0.0, 10.0, 0.0]);
+        w.spawn(1, &BodyDesc::sphere_at([3.0, 10.0, 0.0], 0.3, 1.0, 0.0));
+        w.spawn(2, &BodyDesc::sphere_at([6.0, 10.0, 0.0], 0.3, 1.0, 0.0));
+        assert!(w.create_joint(0, &rod(0, 1, [0.0, 10.0, 0.0], [3.0, 11.0, 0.0])));
+        assert!(w.create_joint(1, &ball(1, 2, [4.5, 10.0, 0.0])));
+        let (r, b) = (w.joint(0).unwrap(), w.joint(1).unwrap());
+        assert!((r.len - 10f32.sqrt()).abs() < 1e-6, "{}", r.len);
+        assert!(near(r.la, [0.0; 3]) && near(r.lb, [0.0, 1.0, 0.0]), "{:?} {:?}", r.la, r.lb);
+        assert_eq!(b.len, 0.0);
+    }
+
+    fn near(a: V3, b: V3) -> bool {
+        (0..3).all(|k| (a[k] - b[k]).abs() < 1.0e-5)
+    }
+
+    #[test]
+    fn a_rod_swings_a_bob_on_a_circle_of_its_length_and_never_stretches() {
+        let mut w = world(2);
+        anchor_body(&mut w, 0, [0.0, 10.0, 0.0]);
+        w.spawn(1, &BodyDesc::sphere_at([2.0, 10.0, 0.0], 0.3, 1.0, 0.0));
+        assert!(w.create_joint(0, &rod(0, 1, [0.0, 10.0, 0.0], [2.0, 10.0, 0.0])));
+        let (mut worst, mut lowest) = (0.0f32, f32::MAX);
+        for _ in 0..1200 {
+            w.step();
+            let from_pivot = ((w.pos_x[1]).powi(2) + (w.pos_y[1] - 10.0).powi(2) + w.pos_z[1].powi(2)).sqrt();
+            worst = worst.max((from_pivot - 2.0).abs());
+            lowest = lowest.min(w.pos_y[1]);
+        }
+        assert!(worst < 0.06, "the bob stayed {worst} off its circle");
+        assert!(lowest < 8.2 && lowest > 7.9, "it swung down to the bottom of the circle: {lowest}");
+    }
+
+    #[test]
+    fn a_rod_holds_two_free_bodies_at_distance_while_one_is_thrown() {
+        let mut w = world(2);
+        w.gy = 0.0;
+        w.spawn(0, &BodyDesc::sphere_at([0.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+        w.spawn(1, &BodyDesc::sphere_at([2.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+        assert!(w.create_joint(0, &rod(0, 1, [0.0; 3], [2.0, 0.0, 0.0])));
+        w.vel_x[1] = 4.0;
+        w.vel_y[1] = 3.0;
+        for _ in 0..240 { w.step(); }
+        let d = ((w.pos_x[0] - w.pos_x[1]).powi(2) + (w.pos_y[0] - w.pos_y[1]).powi(2)).sqrt();
+        assert!((d - 2.0).abs() < 0.08, "{d}");
+        assert!(w.pos_x[0].abs() + w.pos_y[0].abs() > 1.0, "the free end dragged the other body along");
+    }
+
+    #[test]
+    fn a_rope_with_limits_is_slack_inside_its_range_and_taut_at_the_ends() {
+        let mut w = world(2);
+        w.gy = 0.0;
+        w.spawn(0, &BodyDesc::sphere_at([0.0, 0.0, 0.0], 0.3, 0.0, 0.0));
+        w.spawn(1, &BodyDesc::sphere_at([2.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+        let mut d = rod(0, 1, [0.0; 3], [2.0, 0.0, 0.0]);
+        d.limits = Some((-0.5, 1.0));
+        assert!(w.create_joint(0, &d));
+        w.vel_x[1] = 1.0;
+        for _ in 0..30 { w.step(); }
+        assert!(w.pos_x[1] > 2.3 && w.pos_x[1] < 3.0, "free inside the range: {}", w.pos_x[1]);
+        for _ in 0..120 { w.step(); }
+        assert!((w.pos_x[1] - 3.0).abs() < 0.06, "stopped at the long end: {}", w.pos_x[1]);
+        w.apply_impulse(1, -6.0, 0.0, 0.0);
+        for _ in 0..180 { w.step(); }
+        assert!((w.pos_x[1] - 1.5).abs() < 0.08, "stopped at the short end: {}", w.pos_x[1]);
+    }
+
+    #[test]
+    fn a_distance_joint_reports_its_stretch_and_rate() {
+        let mut w = world(2);
+        w.gy = 0.0;
+        w.spawn(0, &BodyDesc::sphere_at([0.0; 3], 0.3, 0.0, 0.0));
+        w.spawn(1, &BodyDesc::sphere_at([2.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+        assert!(w.create_joint(0, &rod(0, 1, [0.0; 3], [2.0, 0.0, 0.0])));
+        assert_eq!(w.joint_coordinate(&w.joints[0]), Some((0.0, 0.0)));
+        w.pos_x[1] = 2.5;
+        w.vel_x[1] = 3.0;
+        let (stretch, rate) = w.joint_coordinate(&w.joints[0]).unwrap();
+        assert!((stretch - 0.5).abs() < 1e-6 && (rate - 3.0).abs() < 1e-6, "b moving away from a lengthens the rod, so the rate is positive: {stretch} {rate}");
+        w.vel_x[0] = 1.0;
+        assert!((w.joint_coordinate(&w.joints[0]).unwrap().1 - 2.0).abs() < 1e-6, "a following b closes the gap by its own speed");
+    }
+
+    #[test]
+    fn a_rod_between_two_bodies_far_apart_in_index_and_space_still_solves() {
+        let mut w = world(300);
+        w.gy = 0.0;
+        w.spawn(7, &BodyDesc::box_at([-50.0, 0.0, 0.0], [0.5; 3], 1.0, 0.0));
+        w.spawn(250, &BodyDesc::box_at([50.0, 0.0, 0.0], [0.5; 3], 1.0, 0.0));
+        assert!(w.create_joint(0, &rod(7, 250, [-50.0, 0.0, 0.0], [50.0, 0.0, 0.0])));
+        w.vel_x[7] = -2.0;
+        for _ in 0..240 { w.step(); }
+        let d = (w.pos_x[250] - w.pos_x[7]).abs();
+        assert!((d - 100.0).abs() < 0.3, "{d}");
+    }
+
+    #[test]
+    fn distance_joints_survive_a_snapshot_and_hash_their_length_but_do_not_change_other_joint_hashes() {
+        let build = |len_end: f32| {
+            let mut w = world(2);
+            w.gy = 0.0;
+            anchor_body(&mut w, 0, [0.0, 0.0, 0.0]);
+            w.spawn(1, &BodyDesc::sphere_at([2.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+            assert!(w.create_joint(0, &rod(0, 1, [0.0; 3], [len_end, 0.0, 0.0])));
+            w
+        };
+        let w = build(2.0);
+        let snap = w.capture();
+        assert_eq!(snap.hash(), w.state_hash());
+        let mut other = build(2.0);
+        for _ in 0..30 { other.step(); }
+        assert!(other.restore(&snap));
+        assert_eq!(other.state_hash(), w.state_hash());
+        assert_eq!(other.joints[0].len, 2.0);
+        let (short, mut long) = (build(2.0), build(2.5));
+        long.pos_x[1] = 2.0;
+        long.joints[0].lb = short.joints[0].lb;
+        assert_eq!(long.joints[0].la, short.joints[0].la);
+        assert_eq!((long.pos_x[1], long.joints[0].lb), (short.pos_x[1], short.joints[0].lb));
+        assert_ne!(long.state_hash(), short.state_hash(), "two worlds identical except for the rod's rest length hash differently");
+        let mut ball_world = world(2);
+        anchor_body(&mut ball_world, 0, [0.0; 3]);
+        ball_world.spawn(1, &BodyDesc::sphere_at([2.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+        assert!(ball_world.create_joint(0, &ball(0, 1, [1.0, 0.0, 0.0])));
+        assert_eq!(ball_world.joints[0].len, 0.0);
+    }
+
+    #[test]
+    fn a_rod_is_removed_with_its_body_and_a_fresh_one_can_be_made() {
+        let mut w = world(3);
+        anchor_body(&mut w, 0, [0.0; 3]);
+        w.spawn(1, &BodyDesc::sphere_at([2.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+        assert!(w.create_joint(0, &rod(0, 1, [0.0; 3], [2.0, 0.0, 0.0])));
+        w.deactivate(1);
+        assert!(w.joints.is_empty());
+        w.spawn(1, &BodyDesc::sphere_at([3.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+        assert!(w.create_joint(0, &rod(0, 1, [0.0; 3], [3.0, 0.0, 0.0])));
+        assert!((w.joint(0).unwrap().len - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_distance_joint_refuses_a_motor_command() {
+        let mut w = world(2);
+        anchor_body(&mut w, 0, [0.0; 3]);
+        w.spawn(1, &BodyDesc::sphere_at([2.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+        assert!(w.create_joint(0, &rod(0, 1, [0.0; 3], [2.0, 0.0, 0.0])));
+        assert!(!w.set_joint_motor(0, 1.0, 10.0));
+        assert!(!w.set_joint_motor(0, 0.0, 0.0), "even a zero motor: a rod has no driven axis");
+    }
+
+    #[test]
+    fn the_shortest_accepted_rod_is_one_millimetre() {
+        let r = |len: f32| rod(0, 1, [0.0; 3], [len, 0.0, 0.0]);
+        assert!(r(1.0e-3).is_valid());
+        assert!(r(2.0e-3).is_valid());
+        assert!(r(1.2e-3).is_valid(), "between 1 mm and 3 cm");
+        assert!(!r(9.9e-4).is_valid());
+        assert!(!r(5.0e-4).is_valid());
+    }
+
+    #[test]
+    fn a_distance_joint_reports_the_spin_of_its_bodies_in_the_rate() {
+        let mut w = world(2);
+        w.gy = 0.0;
+        w.spawn(0, &BodyDesc::sphere_at([0.0; 3], 0.3, 1.0, 0.0));
+        w.spawn(1, &BodyDesc::sphere_at([4.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+        assert!(w.create_joint(0, &rod(0, 1, [0.0, 1.0, 0.0], [2.0, 1.0, 0.0])));
+        assert_eq!(w.joint_coordinate(&w.joints[0]), Some((0.0, 0.0)));
+        w.ang_z[0] = 1.0;
+        let (_, ra) = w.joint_coordinate(&w.joints[0]).unwrap();
+        assert!((ra - 1.0).abs() < 1e-5, "a's anchor, a metre up, swings along the rod at 1 m/s: {ra}");
+        w.ang_z[0] = 0.0;
+        w.ang_z[1] = 1.0;
+        let (_, rb) = w.joint_coordinate(&w.joints[0]).unwrap();
+        assert!((rb + 1.0).abs() < 1e-5, "b's anchor swings along the rod the other way: {rb}");
+    }
+
+    #[test]
+    fn a_rod_whose_anchors_coincide_pushes_them_apart_instead_of_producing_nan() {
+        let mut w = world(2);
+        w.gy = 0.0;
+        w.spawn(0, &BodyDesc::sphere_at([0.0; 3], 0.3, 1.0, 0.0));
+        w.spawn(1, &BodyDesc::sphere_at([3.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+        assert!(w.create_joint(0, &rod(0, 1, [0.0; 3], [2.0, 0.0, 0.0])));
+        // b's anchor sits a metre before its centre, so moving b to x = 1 lands the anchors on the same point with the bodies a metre apart.
+        w.pos_x[1] = 1.0;
+        assert!(near(w.joint_coordinate(&w.joints[0]).map(|c| [c.0, 0.0, 0.0]).unwrap(), [-2.0, 0.0, 0.0]));
+        for _ in 0..90 { w.step(); }
+        let c = w.joint_coordinate(&w.joints[0]).unwrap().0;
+        assert!(c.is_finite() && c.abs() < 0.2, "the rod recovered its length: stretch {c}");
+    }
+
+    #[test]
+    fn a_limit_exactly_at_the_current_stretch_is_taut_without_pushing() {
+        let mut w = world(2);
+        w.gy = 0.0;
+        w.spawn(0, &BodyDesc::sphere_at([0.0; 3], 0.3, 0.0, 0.0));
+        w.spawn(1, &BodyDesc::sphere_at([2.0, 0.0, 0.0], 0.3, 1.0, 0.0));
+        let mut d = rod(0, 1, [0.0; 3], [2.0, 0.0, 0.0]);
+        d.limits = Some((0.0, 0.5));
+        assert!(w.create_joint(0, &d));
+        for _ in 0..60 { w.step(); }
+        assert!((w.pos_x[1] - 2.0).abs() < 1e-3 && w.vel_x[1].abs() < 1e-3, "at rest on the lower bound: {} {}", w.pos_x[1], w.vel_x[1]);
+        w.apply_impulse(1, 1.0, 0.0, 0.0);
+        for _ in 0..120 { w.step(); }
+        assert!((w.pos_x[1] - 2.5).abs() < 0.05, "free to extend to the upper bound: {}", w.pos_x[1]);
+    }
+
+    #[test]
+    fn two_rod_linked_spheres_resting_on_the_ground_fall_asleep_together_and_wake_together() {
+        let mut w = world(3);
+        w.spawn(0, &BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.0));
+        w.spawn(1, &BodyDesc::sphere_at([0.0, 0.3, 0.0], 0.3, 1.0, 0.0));
+        w.spawn(2, &BodyDesc::sphere_at([1.0, 0.3, 0.0], 0.3, 1.0, 0.0));
+        assert!(w.create_joint(0, &rod(1, 2, [0.0, 0.3, 0.0], [1.0, 0.3, 0.0])));
+        for _ in 0..400 { w.step(); }
+        assert!(w.sleeping[1] && w.sleeping[2], "the rod links them into one island");
+        w.apply_impulse(2, 0.0, 3.0, 0.0);
+        assert!(!w.sleeping[1] && !w.sleeping[2], "waking one wakes the other");
     }
 }

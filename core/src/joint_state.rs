@@ -3,9 +3,9 @@ use std::sync::atomic::{fence, AtomicU32, Ordering};
 
 pub const ROW_WORDS: usize = 4;
 
-/// What a controller reads each tick: one row `[joint id, kind, coordinate, rate]` per hinge and slider, in joint-id order. The
+/// What a controller reads each tick: one row `[joint id, kind, coordinate, rate]` per hinge, slider and distance joint, in joint-id order. The
 /// runtime rewrites the whole table after every step (and after a seek) inside an odd/even sequence word, so a reader that sees the
-/// same even value before and after copying holds one tick's rows. The buffer is allocated when the first hinge or slider exists.
+/// same even value before and after copying holds one tick's rows. The buffer is allocated when the first hinge, slider or distance joint exists.
 pub struct JointStates {
     rows: Vec<AtomicU32>,
 }

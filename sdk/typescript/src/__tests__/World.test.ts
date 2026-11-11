@@ -3,7 +3,7 @@ import { World } from '../World.js';
 import { makeWorld, makeSyncWorld } from './helpers.js';
 import { H_QUERY_HEAD, H_QUERY_ROWS, H_JSTATE_SEQ, H_JSTATE_ROWS, H_JSTATE_N, QUERY_ROWS, QUERY_ROW_WORDS } from '../TransformView.js';
 import { H_GENERATIONS, H_LIVE, H_SEEKS, H_PAUSED, H_TICKS } from '../TransformView.js';
-import { SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, JOINT_BALL, JOINT_HINGE, JOINT_FIXED, JOINT_SLIDER } from '../CommandRing.js';
+import { SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, JOINT_DISTANCE, JOINT_BALL, JOINT_HINGE, JOINT_FIXED, JOINT_SLIDER } from '../CommandRing.js';
 
 const config = { capacity: 128, ringCapacity: 64 };
 const tight = { capacity: 8, ringCapacity: 2, maxDeferredCommands: 0 };
@@ -917,6 +917,16 @@ describe('World joint states and drives', () => {
         expect([b.vel, b.max]).toEqual([-2, 30]);
     });
 
+    it('driveJoints refuses a joint that has a state but no motor, and queues nothing', () => {
+        const { world, publish } = rig();
+        publish([[0, 1, 0, 0], [1, 4, 0.1, 0]]);
+        const before = world.pendingCommands;
+        expect(() => world.driveJoints([{ joint: { id: 0 }, target: 1, gains }, { joint: { id: 1 }, target: 1, gains }])).toThrow(/no motor/);
+        expect(world.pendingCommands).toBe(before);
+        publish([[2, 3, 0, 0]]);
+        expect(() => world.driveJoints([{ joint: { id: 2 }, target: 1, gains }])).not.toThrow();
+    });
+
     it('driveJoints skips a joint without a state and reports it, and still drives the rest', () => {
         const { world, rt, publish } = rig();
         publish([[4, 1, 0, 0]]);
@@ -944,5 +954,51 @@ describe('World joint states and drives', () => {
         world.dispose?.();
         expect(() => world.readJointStates()).toThrow();
         expect(() => world.driveJoints([])).toThrow();
+    });
+});
+
+describe('World distance joints', () => {
+    function pair() {
+        const made = makeWorld({ capacity: 64, ringCapacity: 64 });
+        return { ...made, a: made.world.spawn({ invMass: 0 }), b: made.world.spawn() };
+    }
+    const f = (rt: { dv: DataView; layout: { ringSlotsByteOffset: number } }, n: number, at: number) => rt.dv.getFloat32(rt.layout.ringSlotsByteOffset + n * SLOT_BYTES + at, true);
+
+    it('writes the point on body a into the anchor words and the point on body b into the axis words', () => {
+        const { world, rt, a, b } = pair();
+        const before = world.pendingCommands;
+        const j = world.createJoint({ kind: JOINT_DISTANCE, a, b, anchor: [1, 2, 3], anchorB: [4, 6, 3], limits: [-0.5, 1] });
+        const n = before;
+        const off = rt.layout.ringSlotsByteOffset + n * SLOT_BYTES;
+        expect([rt.dv.getUint8(off), rt.dv.getUint8(off + 5)]).toEqual([TAG_JOINT_CREATE, JOINT_DISTANCE]);
+        expect([16, 20, 24].map((at) => f(rt, n, at))).toEqual([1, 2, 3]);
+        expect([28, 32, 36].map((at) => f(rt, n, at))).toEqual([4, 6, 3]);
+        expect([f(rt, n, 40), f(rt, n, 44)]).toEqual([-0.5, 1]);
+        expect(j).toEqual({ id: 0 });
+    });
+
+    it('rejects a missing, non-finite, huge or too-close second anchor, an axis, a motor, and limits that exclude zero', () => {
+        const { world, a, b } = pair();
+        const base = { kind: JOINT_DISTANCE, a, b, anchor: [0, 0, 0] as [number, number, number], anchorB: [2, 0, 0] as [number, number, number] };
+        const bad: Array<Record<string, unknown>> = [
+            { anchorB: undefined }, { anchorB: [NaN, 0, 0] }, { anchorB: [2e6, 0, 0] }, { anchorB: [0, 0, 0] }, { anchorB: [5e-4, 0, 0] },
+            { anchorB: [1, 0] }, { axis: [0, 0, 1] }, { motor: { velocity: 1, maxForce: 1 } },
+            { limits: [0.5, 1] }, { limits: [-1, -0.5] }, { limits: [-2e4, 1] },
+        ];
+        const before = world.pendingCommands;
+        for (const [i, patch] of bad.entries()) expect(() => world.createJoint({ ...base, ...patch } as never), `case ${i}`).toThrow(RangeError);
+        expect(world.pendingCommands).toBe(before);
+        expect(() => world.createJoint({ ...base, anchorB: [1e-3, 0, 0] })).not.toThrow();
+        expect(() => world.createJoint({ ...base, limits: [-1, 1] })).not.toThrow();
+    });
+
+    it('refuses a second anchor on any other kind, and limits on ball and fixed joints', () => {
+        const { world, a, b } = pair();
+        for (const kind of [JOINT_BALL, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER]) {
+            expect(() => world.createJoint({ kind, a, b, anchor: [0, 0, 0], axis: [0, 0, 1], anchorB: [1, 0, 0] })).toThrow(RangeError);
+        }
+        expect(() => world.createJoint({ kind: JOINT_FIXED, a, b, anchor: [0, 0, 0], limits: [-1, 1] })).toThrow(RangeError);
+        expect(() => world.createJoint({ kind: JOINT_BALL, a, b, anchor: [0, 0, 0], limits: [-1, 1] })).toThrow(RangeError);
+        expect(() => world.createJoint({ kind: 5, a, b, anchor: [0, 0, 0] })).toThrow(RangeError);
     });
 });

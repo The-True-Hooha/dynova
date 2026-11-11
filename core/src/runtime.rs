@@ -3154,6 +3154,37 @@ mod tests {
     }
 
     #[test]
+    fn a_rod_made_through_the_ring_holds_its_length_publishes_its_stretch_and_replays_exactly() {
+        use crate::physics::JOINT_DISTANCE;
+        let mut rt = Runtime::new(8, 64);
+        rt.enable_physics();
+        rt.set_gravity(0.0, 0.0, 0.0);
+        rt.ring.push(&Command::Record { on: true });
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, 0.0, 0.0], [0.25; 3], 0.0, 0.0)));
+        rt.ring.push(&spawn_cmd(1, 0, BodyDesc::sphere_at([2.0, 0.0, 0.0], 0.3, 1.0, 0.0)));
+        let rod = JointDesc { kind: JOINT_DISTANCE, a: 0, b: 1, anchor: [0.0; 3], axis: [2.0, 0.0, 0.0], limits: None, motor_vel: 0.0, motor_max: 0.0 };
+        rt.ring.push(&Command::JointCreate { id: 3, gen_a: 0, gen_b: 0, desc: rod });
+        let mut hashes = vec![0u64];
+        let mut highest = 0.0f32;
+        for t in 0..120 {
+            if t == 10 { rt.ring.push(&Command::Force { id: 1, generation: 0, x: 0.0, y: 6.0, z: 0.0 }); }
+            rt.step();
+            highest = highest.max(rt.physics_position(1).unwrap()[1]);
+            hashes.push(rt.state_hash().unwrap());
+        }
+        assert_eq!(header(&rt, H_JSTATE_N), 1);
+        let (id, kind, stretch, _) = joint_row(&rt, 0);
+        assert_eq!((id, kind), (3, JOINT_DISTANCE as u32));
+        assert!(stretch.abs() < 0.05, "the rod held its length: {stretch}");
+        assert!(highest > 0.5, "the bob swung off the axis: {highest}");
+        assert_eq!(rt.malformed_dropped(), 0);
+        for t in [5u32, 40, 11, 120] {
+            seek_to(&mut rt, t);
+            assert_eq!(rt.state_hash().unwrap(), hashes[t as usize], "tick {t}");
+        }
+    }
+
+    #[test]
     fn a_rejected_joint_is_not_resurrected_by_a_replay() {
         let mut rt = Runtime::new(8, 64);
         rt.enable_physics();

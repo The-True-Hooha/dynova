@@ -1107,4 +1107,31 @@ mod tests {
         raw_slot(&mut ring, |b| *b = good_overlap(|b| wr_f32(b, OFF_QUERY_RADIUS, MAX_COORD)));
         assert_eq!(drain(&mut ring, &[]).len(), 2, "the largest allowed range is accepted");
     }
+
+    #[test]
+    fn a_distance_joint_round_trips_with_the_second_point_in_the_axis_words_and_hostile_ones_are_malformed() {
+        use crate::physics::JOINT_DISTANCE;
+        let rod = JointDesc { kind: JOINT_DISTANCE, a: 3, b: 9, anchor: [1.0, 2.0, 3.0], axis: [4.0, 2.0, 3.0], limits: Some((-0.5, 1.0)), motor_vel: 0.0, motor_max: 0.0 };
+        let mut ring = CommandRing::new(16);
+        assert!(ring.push(&Command::JointCreate { id: 4, gen_a: 1, gen_b: 2, desc: rod }));
+        assert_eq!(drain(&mut ring, &[]), vec![Command::JointCreate { id: 4, gen_a: 1, gen_b: 2, desc: rod }]);
+        let mut b = [0u8; SLOT_BYTES];
+        encode_slot(&Command::JointCreate { id: 4, gen_a: 1, gen_b: 2, desc: rod }, &mut b);
+        assert_eq!((b[0], b[OFF_JOINT_KIND]), (TAG_JOINT_CREATE, JOINT_DISTANCE));
+        assert_eq!(f32::from_le_bytes(b[OFF_JOINT_AXIS..OFF_JOINT_AXIS + 4].try_into().unwrap()), 4.0, "the point on body b rides in the axis words");
+        let slots = [
+            { let mut s = b; wr_f32x(&mut s, OFF_JOINT_AXIS, &[1.0, 2.0, 3.0]); s },
+            { let mut s = b; wr_f32(&mut s, OFF_JOINT_AXIS, f32::NAN); s },
+            { let mut s = b; wr_f32(&mut s, OFF_JOINT_AXIS, MAX_COORD * 2.0); s },
+            { let mut s = b; wr_f32(&mut s, OFF_JOINT_MOTOR + 4, 5.0); s },
+            { let mut s = b; wr_f32x(&mut s, OFF_JOINT_LIMITS, &[0.5, 1.0]); s },
+            { let mut s = b; s[OFF_JOINT_KIND] = 5; s },
+        ];
+        let n = slots.len() as u32;
+        for slot in slots {
+            raw_slot(&mut ring, |x| *x = slot);
+        }
+        assert!(drain(&mut ring, &[]).is_empty());
+        assert_eq!(ring.malformed_dropped(), n);
+    }
 }

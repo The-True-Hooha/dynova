@@ -32,6 +32,7 @@ export const JOINT_BALL = 0;
 export const JOINT_HINGE = 1;
 export const JOINT_FIXED = 2;
 export const JOINT_SLIDER = 3;
+export const JOINT_DISTANCE = 4;
 export const MAX_JOINT_ID = 1 << 24;
 export const MAX_ANGLE_LIMIT = 3.1;
 export const MAX_LINEAR_LIMIT = 1e4;

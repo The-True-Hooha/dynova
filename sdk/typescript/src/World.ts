@@ -1,7 +1,7 @@
 import { HEADER_WORDS, QUERY_ROW_WORDS, TransformView } from './TransformView.js';
 import { positionControl, type PositionGains } from './control.js';
 import type { RecordingState } from './TransformView.js';
-import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc, KIN_SAMPLES_PER_SLOT, MAX_KIN_TICKS, KinematicSample, RaycastDesc, OverlapSphereDesc, NO_ENTITY, MAX_QUERY_RANGE } from './CommandRing.js';
+import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, JOINT_DISTANCE, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc, KIN_SAMPLES_PER_SLOT, MAX_KIN_TICKS, KinematicSample, RaycastDesc, OverlapSphereDesc, NO_ENTITY, MAX_QUERY_RANGE } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import type { MemoryMode } from './memory.js';
 
@@ -101,15 +101,17 @@ export interface KinematicTarget {
 }
 
 export interface JointOptions {
-    /** One of `JOINT_BALL`, `JOINT_HINGE`, `JOINT_FIXED`, `JOINT_SLIDER`. */
+    /** One of `JOINT_BALL`, `JOINT_HINGE`, `JOINT_FIXED`, `JOINT_SLIDER`, `JOINT_DISTANCE`. */
     kind: number;
     a: EntityHandle;
     b: EntityHandle;
-    /** World-space point both bodies are pinned to at creation. */
+    /** World-space point both bodies are pinned to at creation. For `JOINT_DISTANCE` it is the point on body `a`. */
     anchor: readonly [number, number, number];
+    /** `JOINT_DISTANCE` only: the world-space point on body `b`. The two points must be at least 1 mm apart; their distance at creation is the rod length. */
+    anchorB?: readonly [number, number, number];
     /** World-space hinge or slider axis; required for those kinds. */
     axis?: readonly [number, number, number];
-    /** Hinge angle in radians (within +-3.1) or slider distance; only for hinge and slider. */
+    /** Hinge angle in radians (within +-3.1), slider offset, or the stretch of a distance joint (its length minus the rod length), all measured from the pose at creation; not for ball and fixed joints. */
     limits?: readonly [number, number];
     /** Motor target in rad/s or m/s and the largest torque or force it may apply; only for hinge and slider. */
     motor?: { velocity: number; maxForce: number };
@@ -398,15 +400,26 @@ export class World {
     createJoint(o: JointOptions): JointHandle {
         this.assertAlive();
         const finite3 = (v: readonly number[]) => v.length === 3 && v.every(Number.isFinite);
-        if (!Number.isInteger(o.kind) || o.kind < JOINT_BALL || o.kind > JOINT_SLIDER) throw new RangeError(`unknown joint kind ${o.kind}`);
+        if (!Number.isInteger(o.kind) || o.kind < JOINT_BALL || o.kind > JOINT_DISTANCE) throw new RangeError(`unknown joint kind ${o.kind}`);
         for (const h of [o.a, o.b]) if (!this.ids.isLive(h)) throw new Error(`stale handle {id: ${h.id}, gen: ${h.gen}}`);
         if (o.a.id === o.b.id) throw new RangeError('a joint needs two different bodies');
         if (!finite3(o.anchor) || o.anchor.some((v) => Math.abs(v) > MAX_TELEPORT_COORD)) throw new RangeError(`joint anchor must be finite and within +-${MAX_TELEPORT_COORD}`);
         const axial = o.kind === JOINT_HINGE || o.kind === JOINT_SLIDER;
-        const axis = o.axis ?? [0, 0, 0];
+        const distance = o.kind === JOINT_DISTANCE;
+        if (!distance && o.anchorB) throw new RangeError('only a distance joint takes a second anchor');
+        if (distance && o.axis) throw new RangeError('a distance joint is set by its two anchors, not an axis');
+        if (distance) {
+            const b = o.anchorB;
+            if (!b || !finite3(b) || b.some((v) => Math.abs(v) > MAX_TELEPORT_COORD)) throw new RangeError(`a distance joint needs a second anchor, finite and within +-${MAX_TELEPORT_COORD}`);
+            // The runtime squares the 32-bit differences, so the rod length is judged the same way here.
+            const sq = o.anchor.reduce((sum, v, k) => Math.fround(sum + Math.fround(Math.fround(Math.fround(v) - Math.fround(b[k])) ** 2)), 0);
+            if (!(sq >= 1e-6)) throw new RangeError('the two anchors of a distance joint must be at least 1 mm apart');
+        }
+        const axis = distance ? o.anchorB as readonly [number, number, number] : o.axis ?? [0, 0, 0];
         if (!finite3(axis)) throw new RangeError('joint axis must be finite');
         if (axial && !(Math.hypot(...axis) > 1e-6 && Number.isFinite(axis.reduce((sum, v) => Math.fround(sum + Math.fround(Math.fround(v) ** 2)), 0)))) throw new RangeError('hinge and slider joints need a finite, non-zero axis');
-        if (!axial && (o.limits || o.motor)) throw new RangeError('only hinge and slider joints take limits or a motor');
+        if (o.motor && !axial) throw new RangeError('only hinge and slider joints take a motor');
+        if (o.limits && !axial && !distance) throw new RangeError('only hinge, slider and distance joints take limits');
         if (o.limits) {
             const bound = o.kind === JOINT_HINGE ? MAX_ANGLE_LIMIT : MAX_LINEAR_LIMIT;
             const [lo, hi] = o.limits;
@@ -513,7 +526,7 @@ export class World {
     }
 
     /**
-     * Position and speed of every hinge and slider as of the last tick the runtime published (a seek republishes them for the sought
+     * Position and speed of every hinge, slider and distance joint as of the last tick the runtime published (a seek republishes them for the sought
      * tick). A controller reads these after `step()`, decides, and sends motor commands that take effect on the next step.
      */
     readJointStates(): JointState[] {
@@ -533,6 +546,8 @@ export class World {
         for (const d of drives) {
             const state = states.get(d.joint.id);
             if (!state) { skipped.push(d.joint.id); continue; }
+            // A distance joint publishes a state but has no motor: the runtime would refuse the command and count it malformed every tick.
+            if (state.kind !== JOINT_HINGE && state.kind !== JOINT_SLIDER) throw new RangeError(`joint ${d.joint.id} has no motor (only hinge and slider joints can be driven)`);
             commands.push({ joint: d.joint, ...positionControl(state, d.target, d.gains) });
         }
         for (const c of commands) this.assertMotor(c.velocity, c.maxForce);

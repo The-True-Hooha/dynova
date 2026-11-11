@@ -189,6 +189,8 @@ fn hash_state(
             Some((lo, hi)) => { h.word(1); h.word(lo.to_bits() as u64); h.word(hi.to_bits() as u64); }
             None => h.word(0),
         }
+        // Hashed only for distance joints so every other joint, and every world recorded before they existed, hashes as it did.
+        if j.kind == JOINT_DISTANCE { h.word(j.len.to_bits() as u64); }
         h.word(j.motor_vel.to_bits() as u64);
         h.word(j.motor_max.to_bits() as u64);
         slots = slots.wrapping_add(h.finish());
