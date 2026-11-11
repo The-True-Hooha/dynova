@@ -1,20 +1,38 @@
 {
   "name": "@dynova/canvas2d",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "build": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "prepack": "node ../../scripts/check-dist.mjs"
   },
   "dependencies": {
-    "@dynova/sdk": "workspace:*"
+    "@dynova/sdk": "workspace:^"
   },
   "devDependencies": {
     "typescript": "^7.0",
     "vitest": "^4.0"
+  },
+  "description": "Dynova Canvas2D adapter: draws a world as a 2D view.",
+  "license": "UNLICENSED",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js",
+        "default": "./dist/index.js"
+      },
+      "./package.json": "./package.json"
+    }
   }
 }

@@ -5,7 +5,7 @@ export type { InspectorSnapshot, InspectedBody, InspectedContact, InspectedJoint
 export { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, SHAPE_HULL, SLOT_BYTES, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, NO_ENTITY, MAX_QUERY_RANGE, KIN_SAMPLES_PER_SLOT, MAX_KIN_TICKS, JOINT_BALL, JOINT_HINGE, JOINT_FIXED, JOINT_SLIDER, JOINT_DISTANCE, MAX_JOINT_ID, MAX_ANGLE_LIMIT, MAX_LINEAR_LIMIT, MAX_MOTOR_SPEED, MAX_MOTOR_FORCE, MAX_CAPACITY, MAX_HULLS, MAX_HULL_VERTS, MAX_HULL_COORD } from './CommandRing.js';
 export { EntityIdAllocator } from './EntityIdAllocator.js';
 export { World, layoutFromRuntime } from './World.js';
-export { launchWorld } from './launch.js';
+export { launchWorld, SharedMemoryUnavailableError } from './launch.js';
 export { createMemory, detectMode } from './memory.js';
 export { positionControl } from './control.js';
 export { Assembly } from './assembly.js';
@@ -14,7 +14,7 @@ export { armJoints, solveArm, lookaheadIndex, pursue } from './robotics.js';
 export type { ArmSpec, Pose, PursuitOptions, V2 } from './robotics.js';
 export type { PositionGains, MotorCommand } from './control.js';
 export type { JointState, JointDrive, QueryResult, RaycastOptions, OverlapSphereOptions, JointOptions, JointHandle, WorldConfig, WorldLayout, SpawnOptions, RuntimePointers, StepDriver, GrowthEvent } from './World.js';
-export type { LaunchOptions, FallbackRuntime, SimInit, SimMessage } from './launch.js';
+export type { LaunchOptions, FallbackLoad, FallbackRuntime, SimInit, SimMessage } from './launch.js';
 export type { SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc } from './CommandRing.js';
 export type { EntityHandle } from './EntityIdAllocator.js';
 export type { MemoryMode, MemoryResult } from './memory.js';

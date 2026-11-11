@@ -1,4 +1,4 @@
-.PHONY: build build-release build-st e2e dev test install clean check all
+.PHONY: build build-release build-st e2e dev test install clean check all package consumer-test
 
 # Build WASM (dev, faster compile)
 build:
@@ -49,3 +49,12 @@ all: build-release build-st install
 clean:
 	cargo clean
 	rm -rf sdk/typescript/wasm sdk/typescript/wasm-st
+
+# Build the four packages for use outside the workspace (release wasm, then ESM and declarations into each dist/)
+package: build-release build-st
+	DYNOVA_RELEASE=1 pnpm --filter @dynova/sdk --filter @dynova/three --filter @dynova/canvas2d --filter @dynova/inspector build
+
+# Pack the packages, install the tarballs into a clean app, typecheck and bundle it, then run it in Chromium and WebKit
+consumer-test: package
+	node scripts/consumer-setup.mjs
+	pnpm exec playwright test -c playwright.consumer.config.ts

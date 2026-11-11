@@ -3,10 +3,18 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ESNext", "DOM"],
+    "lib": [
+      "ESNext",
+      "DOM"
+    ],
     "strict": true,
     "noEmit": true
   },
-  "include": ["src"],
-  "exclude": ["src/sim.worker.ts"]
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "src/sim.worker.ts",
+    "src/web.ts"
+  ]
 }

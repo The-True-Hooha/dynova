@@ -62,7 +62,7 @@ dynova/
   docs/              # Hosting notes, adapter contract, Three.js adapter, scene colliders, inspector, replay, benchmark, joints, digital twin, sensors, robotics, assemblies, assembly import
 ```
 
-The packages are workspace-internal for now (private, TypeScript source exports, the wasm built locally with `make build`); they are not published to npm.
+The four packages build to ESM with type declarations (`make package`) and install into an app outside the repo from packed tarballs; they are not published to npm. See [docs/packaging.md](./docs/packaging.md) and the package READMEs.
 
 ---
 
@@ -80,7 +80,7 @@ The packages are workspace-internal for now (private, TypeScript source exports,
 make install
 ```
 
-**Build WASM + run examples**
+**Build WASM + run examples** (to use the packages in your own app instead, see [docs/packaging.md](./docs/packaging.md))
 
 ```bash
 make build-release

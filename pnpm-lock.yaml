@@ -43,7 +43,7 @@ importers:
   inspector:
     dependencies:
       '@dynova/sdk':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../sdk/typescript
     devDependencies:
       typescript:
@@ -56,7 +56,7 @@ importers:
   renderer/canvas2d:
     dependencies:
       '@dynova/sdk':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../../sdk/typescript
     devDependencies:
       typescript:
@@ -69,7 +69,7 @@ importers:
   renderer/three:
     dependencies:
       '@dynova/sdk':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../../sdk/typescript
     devDependencies:
       '@types/node':
