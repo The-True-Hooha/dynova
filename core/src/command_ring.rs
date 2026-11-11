@@ -21,6 +21,8 @@ pub const TAG_JOINT_CREATE: u8 = 12;
 pub const TAG_JOINT_DESTROY: u8 = 13;
 pub const TAG_JOINT_MOTOR: u8 = 14;
 pub const TAG_KINEMATIC_BATCH: u8 = 15;
+pub const TAG_RAYCAST: u8 = 16;
+pub const TAG_OVERLAP_SPHERE: u8 = 17;
 pub const HULL_VERTS_PER_SLOT: usize = 4;
 pub const KIN_SAMPLES_PER_SLOT: usize = 3;
 /// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
@@ -39,6 +41,11 @@ const OFF_INV_MASS: usize   = 48;
 const OFF_RESTITUTION: usize = 52;
 const OFF_FRICTION: usize = 56;
 const OFF_HULL: usize = 60;
+
+const OFF_QUERY_DIR: usize = 18;
+const OFF_QUERY_RADIUS: usize = 18;
+const OFF_QUERY_MAX: usize = 30;
+const OFF_QUERY_IGNORE: usize = 34;
 
 const OFF_KIN_COUNT: usize = 1;
 const OFF_KIN_SAMPLES: usize = 4;
@@ -85,6 +92,9 @@ pub enum Command {
     JointDestroy { id: u32 },
     JointMotor { id: u32, vel: f32, max: f32 },
     KinematicBatch { count: u8, samples: [KinSample; KIN_SAMPLES_PER_SLOT] },
+    /// Read-only: answered with rows in the query result buffer, never logged or replayed. `dir` is any non-zero vector.
+    Raycast { id: u32, origin: V3, dir: V3, max_dist: f32, ignore: u32 },
+    OverlapSphere { id: u32, center: V3, radius: f32, ignore: u32 },
 }
 
 impl Command {
@@ -95,7 +105,8 @@ impl Command {
             | Command::Force   { id, generation, .. }
             | Command::Teleport { id, generation, .. } => Some((*id, *generation)),
             Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } | Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. }
-            | Command::JointCreate { .. } | Command::JointDestroy { .. } | Command::JointMotor { .. } | Command::KinematicBatch { .. } => None,
+            | Command::JointCreate { .. } | Command::JointDestroy { .. } | Command::JointMotor { .. } | Command::KinematicBatch { .. }
+            | Command::Raycast { .. } | Command::OverlapSphere { .. } => None,
         }
     }
 }
@@ -296,6 +307,21 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             b[OFF_ID..OFF_ID + 4].copy_from_slice(&id.to_le_bytes());
             wr_f32x(b, OFF_POS, &[*vel, *max]);
         }
+        Command::Raycast { id, origin, dir, max_dist, ignore } => {
+            b[0] = TAG_RAYCAST;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&id.to_le_bytes());
+            wr_f32x(b, OFF_POS, origin);
+            wr_f32x(b, OFF_QUERY_DIR, dir);
+            wr_f32(b, OFF_QUERY_MAX, *max_dist);
+            b[OFF_QUERY_IGNORE..OFF_QUERY_IGNORE + 4].copy_from_slice(&ignore.to_le_bytes());
+        }
+        Command::OverlapSphere { id, center, radius, ignore } => {
+            b[0] = TAG_OVERLAP_SPHERE;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&id.to_le_bytes());
+            wr_f32x(b, OFF_POS, center);
+            wr_f32(b, OFF_QUERY_RADIUS, *radius);
+            b[OFF_QUERY_IGNORE..OFF_QUERY_IGNORE + 4].copy_from_slice(&ignore.to_le_bytes());
+        }
         Command::KinematicBatch { count, samples } => {
             b.fill(0);
             b[0] = TAG_KINEMATIC_BATCH;
@@ -410,6 +436,24 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
         TAG_JOINT_MOTOR => {
             let [vel, max]: [f32; 2] = rd_f32x(b, OFF_POS);
             (vel.is_finite() && max.is_finite()).then_some(Command::JointMotor { id, vel, max })
+        }
+        TAG_RAYCAST => {
+            let origin: [f32; 3] = rd_f32x(b, OFF_POS);
+            let dir: [f32; 3] = rd_f32x(b, OFF_QUERY_DIR);
+            let max_dist = rd_f32(b, OFF_QUERY_MAX);
+            let ignore = u32::from_le_bytes([b[OFF_QUERY_IGNORE], b[OFF_QUERY_IGNORE + 1], b[OFF_QUERY_IGNORE + 2], b[OFF_QUERY_IGNORE + 3]]);
+            let dir_len_sq = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+            let ok = all_finite(&origin) && all_finite(&dir) && origin.iter().all(|f| f.abs() <= MAX_COORD)
+                && dir_len_sq.is_finite() && dir_len_sq > 1.0e-12
+                && max_dist.is_finite() && max_dist > 0.0 && max_dist <= crate::physics::MAX_QUERY_RANGE;
+            ok.then_some(Command::Raycast { id, origin, dir, max_dist, ignore })
+        }
+        TAG_OVERLAP_SPHERE => {
+            let center: [f32; 3] = rd_f32x(b, OFF_POS);
+            let radius = rd_f32(b, OFF_QUERY_RADIUS);
+            let ignore = u32::from_le_bytes([b[OFF_QUERY_IGNORE], b[OFF_QUERY_IGNORE + 1], b[OFF_QUERY_IGNORE + 2], b[OFF_QUERY_IGNORE + 3]]);
+            let ok = all_finite(&center) && center.iter().all(|f| f.abs() <= MAX_COORD) && radius.is_finite() && radius > 0.0 && radius <= crate::physics::MAX_QUERY_RANGE;
+            ok.then_some(Command::OverlapSphere { id, center, radius, ignore })
         }
         TAG_KINEMATIC_BATCH => {
             let count = b[OFF_KIN_COUNT] as usize;
@@ -751,15 +795,15 @@ mod tests {
 
     #[test]
     fn wire_tags_are_pinned_to_the_values_the_typescript_ring_writes() {
-        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
         let mut ring = CommandRing::new(8);
         raw_slot(&mut ring, |b| { b[0] = 8; b[OFF_ID] = 3; b[OFF_GEN] = 2; b[OFF_POS..OFF_POS + 4].copy_from_slice(&1.5f32.to_le_bytes()); });
         raw_slot(&mut ring, |b| { b[0] = 9; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 10; b[OFF_ID] = 7; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 2; });
-        raw_slot(&mut ring, |b| { b[0] = 16; });
+        raw_slot(&mut ring, |b| { b[0] = 18; });
         let mut out = Vec::new();
         ring.drain_commands(8, &mut out);
         assert_eq!(out, vec![
@@ -768,7 +812,7 @@ mod tests {
             Command::Seek { tick: 7 },
             Command::Pause { on: true },
         ]);
-        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 16 (unassigned) are malformed");
+        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 18 (unassigned) are malformed");
     }
 
     #[test]
@@ -982,5 +1026,85 @@ mod tests {
     #[test]
     fn a_kinematic_batch_names_no_body_for_the_generic_stale_check() {
         assert_eq!(Command::KinematicBatch { count: 1, samples: kin_samples() }.target(), None);
+    }
+
+    fn ray_cmd() -> Command {
+        Command::Raycast { id: 70_000, origin: [1.0, 2.0, 3.0], dir: [0.0, 0.0, -2.0], max_dist: 50.5, ignore: 9 }
+    }
+
+    #[test]
+    fn query_commands_round_trip_and_name_no_body_for_the_stale_check() {
+        let overlap = Command::OverlapSphere { id: 3, center: [-1.0, 0.5, 8.0], radius: 2.5, ignore: u32::MAX };
+        let mut ring = CommandRing::new(8);
+        assert!(ring.push(&ray_cmd()) && ring.push(&overlap));
+        assert_eq!(drain(&mut ring, &[]), vec![ray_cmd(), overlap.clone()]);
+        assert_eq!((ray_cmd().target(), overlap.target()), (None, None));
+    }
+
+    // Same bytes as RAY_FIXTURE_HEX and OVERLAP_FIXTURE_HEX in the TypeScript ring tests.
+    #[test]
+    fn query_bytes_match_cross_language_fixtures() {
+        let hex = |c: &Command| {
+            let mut b = [0u8; SLOT_BYTES];
+            encode_slot(c, &mut b);
+            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+        };
+        let zeros = "00".repeat(26);
+        assert_eq!(hex(&ray_cmd()), format!("{}{zeros}", concat!(
+            "10", "70110100", "00",
+            "0000803f", "00000040", "00004040",
+            "00000000", "00000000", "000000c0",
+            "00004a42", "09000000",
+        )));
+        assert_eq!(hex(&Command::OverlapSphere { id: 3, center: [-1.0, 0.5, 8.0], radius: 2.5, ignore: u32::MAX }), format!("{}{zeros}", concat!(
+            "11", "03000000", "00",
+            "000080bf", "0000003f", "00000041",
+            "00002040", "00000000", "00000000", "00000000",
+            "ffffffff",
+        )));
+    }
+
+    #[test]
+    fn hostile_query_slots_are_malformed_not_applied() {
+        let mut ring = CommandRing::new(32);
+        let good_ray = |f: fn(&mut [u8; SLOT_BYTES])| {
+            let mut b = [0u8; SLOT_BYTES];
+            encode_slot(&ray_cmd(), &mut b);
+            f(&mut b);
+            b
+        };
+        let good_overlap = |f: fn(&mut [u8; SLOT_BYTES])| {
+            let mut b = [0u8; SLOT_BYTES];
+            encode_slot(&Command::OverlapSphere { id: 3, center: [0.0; 3], radius: 2.5, ignore: 0 }, &mut b);
+            f(&mut b);
+            b
+        };
+        let slots = [
+            good_ray(|b| wr_f32(b, OFF_POS, f32::NAN)),
+            good_ray(|b| wr_f32(b, OFF_POS + 4, MAX_COORD * 2.0)),
+            good_ray(|b| wr_f32x(b, OFF_QUERY_DIR, &[0.0; 3])),
+            good_ray(|b| wr_f32x(b, OFF_QUERY_DIR, &[1.0e-7, 0.0, 0.0])),
+            good_ray(|b| wr_f32x(b, OFF_QUERY_DIR, &[1.0e30, 0.0, 0.0])),
+            good_ray(|b| wr_f32(b, OFF_QUERY_DIR + 4, f32::INFINITY)),
+            good_ray(|b| wr_f32(b, OFF_QUERY_MAX, 0.0)),
+            good_ray(|b| wr_f32(b, OFF_QUERY_MAX, -1.0)),
+            good_ray(|b| wr_f32(b, OFF_QUERY_MAX, f32::NAN)),
+            good_ray(|b| wr_f32(b, OFF_QUERY_MAX, MAX_COORD * 2.0)),
+            good_overlap(|b| wr_f32(b, OFF_POS + 8, f32::NAN)),
+            good_overlap(|b| wr_f32(b, OFF_POS, -MAX_COORD * 2.0)),
+            good_overlap(|b| wr_f32(b, OFF_QUERY_RADIUS, 0.0)),
+            good_overlap(|b| wr_f32(b, OFF_QUERY_RADIUS, -2.0)),
+            good_overlap(|b| wr_f32(b, OFF_QUERY_RADIUS, f32::INFINITY)),
+            good_overlap(|b| wr_f32(b, OFF_QUERY_RADIUS, MAX_COORD * 2.0)),
+        ];
+        let n = slots.len() as u32;
+        for slot in slots {
+            raw_slot(&mut ring, |b| *b = slot);
+        }
+        assert!(drain(&mut ring, &[]).is_empty());
+        assert_eq!(ring.malformed_dropped(), n);
+        raw_slot(&mut ring, |b| *b = good_ray(|b| wr_f32(b, OFF_QUERY_MAX, MAX_COORD)));
+        raw_slot(&mut ring, |b| *b = good_overlap(|b| wr_f32(b, OFF_QUERY_RADIUS, MAX_COORD)));
+        assert_eq!(drain(&mut ring, &[]).len(), 2, "the largest allowed range is accepted");
     }
 }

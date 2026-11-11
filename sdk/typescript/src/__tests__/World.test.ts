@@ -1,8 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { World } from '../World.js';
 import { makeWorld, makeSyncWorld } from './helpers.js';
+import { H_QUERY_HEAD, H_QUERY_ROWS, QUERY_ROWS, QUERY_ROW_WORDS } from '../TransformView.js';
 import { H_GENERATIONS, H_LIVE, H_SEEKS, H_PAUSED, H_TICKS } from '../TransformView.js';
-import { SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, JOINT_BALL, JOINT_HINGE, JOINT_FIXED, JOINT_SLIDER } from '../CommandRing.js';
+import { SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, JOINT_BALL, JOINT_HINGE, JOINT_FIXED, JOINT_SLIDER } from '../CommandRing.js';
 
 const config = { capacity: 128, ringCapacity: 64 };
 const tight = { capacity: 8, ringCapacity: 2, maxDeferredCommands: 0 };
@@ -655,5 +656,183 @@ describe('World kinematic targets', () => {
         world.destroy(handles[0]);
         world.dispose?.();
         expect(() => world.moveKinematic([])).toThrow();
+    });
+});
+
+describe('World queries', () => {
+    const AT = 300_000;
+    function rig() {
+        const made = makeWorld({ capacity: 64, ringCapacity: 64 });
+        const u = new Uint32Array(made.memory.buffer, AT, QUERY_ROWS * QUERY_ROW_WORDS);
+        const f = new Float32Array(made.memory.buffer, AT, QUERY_ROWS * QUERY_ROW_WORDS);
+        let written = 0;
+        const row = (words: Array<number | { f: number }>) => {
+            const at = (written % QUERY_ROWS) * QUERY_ROW_WORDS;
+            words.forEach((w, k) => { if (typeof w === 'number') u[at + k] = w; else f[at + k] = w.f; });
+            written++;
+            Atomics.store(made.rt.header, H_QUERY_ROWS, AT);
+            Atomics.store(made.rt.header, H_QUERY_HEAD, written);
+        };
+        return { ...made, row, raw: (n: number) => ({ tag: made.rt.dv.getUint8(made.layout.ringSlotsByteOffset + n * SLOT_BYTES) }) };
+    }
+
+    it('numbers queries from zero in the order asked, and queues one slot each', () => {
+        const { world, rt } = rig();
+        const before = world.pendingCommands;
+        const ids = [
+            world.raycast({ origin: [0, 0, 0], direction: [1, 0, 0], maxDistance: 5 }),
+            world.overlapSphere({ center: [0, 0, 0], radius: 1 }),
+            world.raycast({ origin: [0, 0, 0], direction: [0, 1, 0], maxDistance: 5 }),
+        ];
+        expect(ids).toEqual([0, 1, 2]);
+        expect(world.pendingCommands - before).toBe(3);
+        const tags = [0, 1, 2].map((n) => rt.dv.getUint8(rt.layout.ringSlotsByteOffset + (before + n) * SLOT_BYTES));
+        expect(tags).toEqual([TAG_RAYCAST, TAG_OVERLAP_SPHERE, TAG_RAYCAST]);
+    });
+
+    it('sends the ignored entity id, and the no-entity marker when nothing is ignored', () => {
+        const { world, rt } = rig();
+        const body = world.spawn();
+        const before = world.pendingCommands;
+        world.raycast({ origin: [0, 0, 0], direction: [1, 0, 0], maxDistance: 5, ignore: body });
+        world.overlapSphere({ center: [0, 0, 0], radius: 1 });
+        const ignore = (n: number) => rt.dv.getUint32(rt.layout.ringSlotsByteOffset + (before + n) * SLOT_BYTES + 34, true);
+        expect([ignore(0), ignore(1)]).toEqual([body.id, 0xffffffff]);
+    });
+
+    it('rejects bad arguments before anything is queued', () => {
+        const { world } = rig();
+        const before = world.pendingCommands;
+        const ray = { origin: [0, 0, 0] as [number, number, number], direction: [1, 0, 0] as [number, number, number], maxDistance: 5 };
+        const bad: Array<() => unknown> = [
+            () => world.raycast({ ...ray, origin: [NaN, 0, 0] }), () => world.raycast({ ...ray, origin: [2e6, 0, 0] }),
+            () => world.raycast({ ...ray, direction: [0, 0, 0] }), () => world.raycast({ ...ray, direction: [NaN, 0, 0] }),
+            () => world.raycast({ ...ray, direction: [1e-9, 0, 0] }), () => world.raycast({ ...ray, direction: [1e30, 1e30, 0] }),
+            () => world.raycast({ ...ray, maxDistance: 0 }), () => world.raycast({ ...ray, maxDistance: -1 }),
+            () => world.raycast({ ...ray, maxDistance: NaN }), () => world.raycast({ ...ray, maxDistance: 1e-50 }), () => world.overlapSphere({ center: [0, 0, 0], radius: 1e-50 }), () => world.raycast({ ...ray, maxDistance: 2e6 }),
+            () => world.raycast({ ...ray, direction: [1, 0] as never }),
+            () => world.overlapSphere({ center: [0, Infinity, 0], radius: 1 }), () => world.overlapSphere({ center: [0, 0, 0], radius: 0 }),
+            () => world.overlapSphere({ center: [0, 0, 0], radius: -1 }), () => world.overlapSphere({ center: [0, 0, 0], radius: 2e6 }),
+            () => world.overlapSphere({ center: [0, 0, 0], radius: NaN }),
+        ];
+        for (const [i, call] of bad.entries()) expect(call, `case ${i}`).toThrow(RangeError);
+        expect(world.pendingCommands).toBe(before);
+        expect(world.raycast({ ...ray, maxDistance: 1e6 })).toBe(0);
+        expect(world.overlapSphere({ center: [1e6, -1e6, 0], radius: 1e6 })).toBe(1);
+    });
+
+    it('a rejected query does not use up an id, and a full ring throws without using one either', () => {
+        const made = makeWorld({ capacity: 8, ringCapacity: 2, maxDeferredCommands: 0 } as never);
+        const { world } = made;
+        const ray = { origin: [0, 0, 0] as [number, number, number], direction: [1, 0, 0] as [number, number, number], maxDistance: 5 };
+        expect(() => world.raycast({ ...ray, maxDistance: 0 })).toThrow(RangeError);
+        expect(world.raycast(ray)).toBe(0);
+        expect(world.raycast(ray)).toBe(1);
+        expect(() => world.raycast(ray)).toThrow(/CommandRing full/);
+    });
+
+    it('reads every kind of result row once, in order, and returns nothing the second time', () => {
+        const { world, row } = rig();
+        expect(world.readQueryResults()).toEqual({ results: [], lost: 0 });
+        row([4, 0, 12, { f: 2.5 }, { f: 1 }, { f: 2 }, { f: 3 }, { f: 0 }, { f: 1 }, { f: 0 }]);
+        row([5, 1, 0xffffffff, 0, 0, 0, 0, 0, 0, 0]);
+        row([6, 2, 3, { f: 0.25 }, { f: 4 }, { f: 5 }, { f: 6 }, { f: -1 }, { f: 0 }, { f: 0 }]);
+        row([7, 3, 0xffffffff, 0, 0, 0, 0, 0, 0, 0]);
+        row([8, 4, 0xffffffff, 0, 0, 0, 0, 0, 0, 0]);
+        const r = world.readQueryResults();
+        expect(r.lost).toBe(0);
+        expect(r.results).toEqual([
+            { query: 4, kind: 'hit', entity: 12, distance: 2.5, point: [1, 2, 3], normal: [0, 1, 0] },
+            { query: 5, kind: 'miss' },
+            { query: 6, kind: 'overlap', entity: 3, depth: 0.25, point: [4, 5, 6], normal: [-1, 0, 0] },
+            { query: 7, kind: 'overlap-none' },
+            { query: 8, kind: 'overlap-more' },
+        ]);
+        expect(world.readQueryResults()).toEqual({ results: [], lost: 0 });
+    });
+
+    it('reads only the rows written since the last read', () => {
+        const { world, row } = rig();
+        row([1, 1, 0xffffffff, 0, 0, 0, 0, 0, 0, 0]);
+        expect(world.readQueryResults().results.map((r) => r.query)).toEqual([1]);
+        row([2, 1, 0xffffffff, 0, 0, 0, 0, 0, 0, 0]);
+        row([3, 1, 0xffffffff, 0, 0, 0, 0, 0, 0, 0]);
+        expect(world.readQueryResults().results.map((r) => r.query)).toEqual([2, 3]);
+    });
+
+    it('counts rows lost when the reader falls a full buffer behind and returns the newest 4095 (the slot being written still holds the oldest)', () => {
+        const { world, row } = rig();
+        const total = QUERY_ROWS + 7;
+        for (let q = 0; q < total; q++) row([q, 1, 0xffffffff, 0, 0, 0, 0, 0, 0, 0]);
+        const r = world.readQueryResults();
+        expect(r.lost).toBe(8);
+        expect(r.results).toHaveLength(QUERY_ROWS - 1);
+        expect(r.results[0].query).toBe(8);
+        expect(r.results[QUERY_ROWS - 2].query).toBe(total - 1);
+        expect(world.readQueryResults()).toEqual({ results: [], lost: 0 });
+    });
+
+    it('keeps reading correctly across the wrap of the running row counter at 2^32', () => {
+        const { world, memory, rt } = rig();
+        const u = new Uint32Array(memory.buffer, AT, QUERY_ROWS * QUERY_ROW_WORDS);
+        const start = 0xfffffffc;
+        const put = (n: number, q: number) => { const at = (n % QUERY_ROWS) * QUERY_ROW_WORDS; u[at] = q; u[at + 1] = 1; u[at + 2] = 0xffffffff; };
+        Atomics.store(rt.header, H_QUERY_ROWS, AT);
+        (world as unknown as { queryTail: number }).queryTail = start;
+        for (let n = 0; n < 7; n++) put((start + n) >>> 0, 100 + n);
+        Atomics.store(rt.header, H_QUERY_HEAD, (start + 7) | 0);
+        const r = world.readQueryResults();
+        expect(r.results.map((x) => x.query)).toEqual([100, 101, 102, 103, 104, 105, 106]);
+        expect(r.lost).toBe(0);
+        Atomics.store(rt.header, H_QUERY_HEAD, (start + 8) | 0);
+        put((start + 7) >>> 0, 107);
+        expect(world.readQueryResults().results.map((x) => x.query)).toEqual([107]);
+    });
+
+    it('retries a read the runtime lapped while it was copying, instead of returning a row that was being overwritten', () => {
+        const { world, row } = rig();
+        for (let q = 0; q < QUERY_ROWS - 1; q++) row([q, 1, 0xffffffff, 0, 0, 0, 0, 0, 0, 0]);
+        const real = Atomics.load as (ta: Int32Array, idx: number) => number;
+        let headLoads = 0;
+        const spy = vi.spyOn(Atomics, 'load').mockImplementation(((ta: Int32Array, idx: number) => {
+            const v = real(ta, idx);
+            if (idx === H_QUERY_HEAD && ++headLoads >= 2) return v + 1;
+            return v;
+        }) as never);
+        try {
+            const r = world.readQueryResults();
+            expect(r.lost).toBe(1);
+            expect(r.results).toHaveLength(QUERY_ROWS - 1);
+            expect(r.results[0].query).toBe(1);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it('query ids wrap at 2^32 instead of becoming unsafe numbers', () => {
+        const { world } = rig();
+        (world as unknown as { nextQuery: number }).nextQuery = 0xffffffff;
+        const ray = { origin: [0, 0, 0] as [number, number, number], direction: [1, 0, 0] as [number, number, number], maxDistance: 5 };
+        expect([world.raycast(ray), world.raycast(ray)]).toEqual([0xffffffff, 0]);
+    });
+
+    it('treats a row count without a buffer address as no rows', () => {
+        const { world, rt } = rig();
+        Atomics.store(rt.header, H_QUERY_HEAD, 5);
+        expect(world.readQueryResults()).toEqual({ results: [], lost: 0 });
+    });
+
+    it('reports nothing while the runtime has never answered, and rejects an unknown row kind', () => {
+        const { world, row } = rig();
+        expect(world.readQueryResults()).toEqual({ results: [], lost: 0 });
+        row([1, 9, 0, 0, 0, 0, 0, 0, 0, 0]);
+        expect(() => world.readQueryResults()).toThrow(/unknown query result kind 9/);
+    });
+
+    it('throws once the world is destroyed', () => {
+        const { world } = rig();
+        world.dispose?.();
+        expect(() => world.raycast({ origin: [0, 0, 0], direction: [1, 0, 0], maxDistance: 1 })).toThrow();
+        expect(() => world.readQueryResults()).toThrow();
     });
 });

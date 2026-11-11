@@ -30,6 +30,10 @@ The four values are the live end state, the live state at tick 350, tick 350 aft
 
 `determinism::run_kinematic_scene` (wasm: `determinism_kinematic_scene`) runs 700 ticks of telemetry-fed static bodies: a platform carrying six boxes, a wall shoving six balls, a joint anchor with a hanging bob, and samples rejected on purpose (aimed at dynamic bodies), plus a teleport. Keyframes fall every 60 ticks, so the middle seek replays the samples at 370 and 385 from the keyframe at 360, and the seek back replays the sample at 690 from the keyframe at 660. Live end `637658996748191174`, live tick 400 `17987134958895714485`; a seek reproduces both. Native aarch64 (opt-level 3 and debug), native x86_64 under Rosetta, Chromium and WebKit agree. Earlier pins are unchanged.
 
+### Sensor results
+
+`determinism::run_sensor_scene` (wasm: `determinism_sensor_scene`) settles the 700-tick scene's first 120 ticks, then answers 320 seeded raycasts and 40 sphere overlaps and hashes every result row: `7037252248839586730`. It matches native aarch64 (opt-level 3 and debug), native x86_64 under Rosetta, Chromium and WebKit. The queries use only add, subtract, multiply, divide, square root and comparisons, like the solver.
+
 The older checks still hold in the same two browsers: the 30-body golden scene (`4599892428385582693`) and the sin/cos/atan2/sqrt probe (`7496710723231958662`) match the native build. Firefox could not be launched in the development sandbox, so it is untested; run `pnpm exec playwright test e2e/determinism.spec.ts --project=firefox` to add it.
 
 The native rows are debug builds (the test profile); the pinned test was also run at opt-level 3 on both architectures. The browser rows run the release wasm (opt-level 3, LTO). Reproduce: `cargo test --lib determinism` (native, pinned), `cargo test --lib --target x86_64-apple-darwin determinism` (needs the x86_64 std; the repo's nightly `build-std` setup provides it), and `pnpm exec playwright test e2e/determinism.spec.ts --project=chromium --project=webkit` (needs `make build-st`).

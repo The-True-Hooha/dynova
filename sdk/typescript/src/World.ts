@@ -1,6 +1,6 @@
-import { HEADER_WORDS, TransformView } from './TransformView.js';
+import { HEADER_WORDS, QUERY_ROW_WORDS, TransformView } from './TransformView.js';
 import type { RecordingState } from './TransformView.js';
-import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc, KIN_SAMPLES_PER_SLOT, MAX_KIN_TICKS, KinematicSample } from './CommandRing.js';
+import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc, KIN_SAMPLES_PER_SLOT, MAX_KIN_TICKS, KinematicSample, RaycastDesc, OverlapSphereDesc, NO_ENTITY, MAX_QUERY_RANGE } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import type { MemoryMode } from './memory.js';
 
@@ -55,6 +55,28 @@ export interface SpawnOptions {
     hull?: number;
 }
 
+export type QueryResult =
+    | { query: number; kind: 'hit'; entity: number; distance: number; point: [number, number, number]; normal: [number, number, number] }
+    | { query: number; kind: 'miss' }
+    | { query: number; kind: 'overlap'; entity: number; depth: number; point: [number, number, number]; normal: [number, number, number] }
+    | { query: number; kind: 'overlap-none' }
+    | { query: number; kind: 'overlap-more' };
+
+export interface RaycastOptions {
+    origin: readonly [number, number, number];
+    /** Any non-zero direction; it is normalized, and `maxDistance` is in world units along it. */
+    direction: readonly [number, number, number];
+    maxDistance: number;
+    /** A body the ray passes through, for example the robot that carries the sensor. */
+    ignore?: EntityHandle;
+}
+
+export interface OverlapSphereOptions {
+    center: readonly [number, number, number];
+    radius: number;
+    ignore?: EntityHandle;
+}
+
 export interface KinematicTarget {
     handle: EntityHandle;
     x: number; y: number; z: number;
@@ -105,6 +127,8 @@ type Queued =
     | { k: 'jointDestroy'; id: number }
     | { k: 'jointMotor'; id: number; velocity: number; maxForce: number }
     | { k: 'kinematic'; samples: KinematicSample[] }
+    | { k: 'raycast'; d: RaycastDesc }
+    | { k: 'overlap'; d: OverlapSphereDesc }
     | { k: 'hullVerts'; hull: number; coords: number[] }
     | { k: 'hullCommit'; hull: number; count: number };
 
@@ -129,6 +153,8 @@ export class World {
     private deferred: Queued[] = [];
     private deferredHead = 0;
     private maxDeferred: number;
+    private nextQuery = 0;
+    private queryTail = 0;
     private deferredTotal = 0;
     private rejected = 0;
     private growths = 0;
@@ -266,6 +292,8 @@ export class World {
             case 'jointDestroy': return this.ring.jointDestroy(c.id);
             case 'jointMotor': return this.ring.jointMotor(c.id, c.velocity, c.maxForce);
             case 'kinematic': return this.ring.kinematicBatch(c.samples);
+            case 'raycast': return this.ring.raycast(c.d);
+            case 'overlap': return this.ring.overlapSphere(c.d);
             case 'hullVerts': return this.ring.hullVerts(c.hull, c.coords);
             case 'hullCommit': return this.ring.hullCommit(c.hull, c.count);
         }
@@ -410,6 +438,62 @@ export class World {
             const chunk = samples.slice(i, i + KIN_SAMPLES_PER_SLOT).map((s) => ({ id: s.handle.id, gen: s.handle.gen, x: s.x, y: s.y, z: s.z, ticks: s.ticks }));
             if (!this.enqueue({ k: 'kinematic', samples: chunk })) throw new Error('CommandRing full');
         }
+    }
+
+    private checkQuery(point: readonly number[], what: string): void {
+        if (point.length !== 3 || !point.every((v) => Number.isFinite(v) && Math.abs(v) <= MAX_TELEPORT_COORD)) throw new RangeError(`${what} must be three finite numbers within +-${MAX_TELEPORT_COORD}`);
+    }
+
+    /**
+     * Ask what a ray hits. The answer is one row, read later with `readQueryResults()` under the returned id: the nearest body, or a
+     * miss. The runtime answers while it applies this command, from the poses the last step left, so the result is there after the
+     * next `step()` (or, on a paused world, after the runtime next drains its ring). A query changes nothing and is not recorded.
+     */
+    raycast(o: RaycastOptions): number {
+        this.assertAlive();
+        this.checkQuery(o.origin, 'ray origin');
+        // The runtime squares the f32 components, so a direction whose square overflows f32 would be dropped there.
+        const lenSq = o.direction.reduce((sum, v) => Math.fround(sum + Math.fround(Math.fround(v) ** 2)), 0);
+        if (o.direction.length !== 3 || !o.direction.every(Number.isFinite) || !Number.isFinite(lenSq) || !(lenSq > 1e-12)) throw new RangeError('ray direction must be three finite numbers whose squares fit in 32 bits, and not zero');
+        if (!Number.isFinite(o.maxDistance) || !(Math.fround(o.maxDistance) > 0) || o.maxDistance > MAX_QUERY_RANGE) throw new RangeError(`ray length must be in (0, ${MAX_QUERY_RANGE}]`);
+        const id = this.nextQuery;
+        if (!this.enqueue({ k: 'raycast', d: { id, origin: o.origin, dir: o.direction, maxDistance: o.maxDistance, ignore: o.ignore?.id ?? NO_ENTITY } })) throw new Error('CommandRing full');
+        this.nextQuery = (this.nextQuery + 1) >>> 0;
+        return id;
+    }
+
+    /** Ask which bodies a sphere overlaps: up to 64 rows, lowest entity ids first, then an `overlap-more` row if there were more. */
+    overlapSphere(o: OverlapSphereOptions): number {
+        this.assertAlive();
+        this.checkQuery(o.center, 'sphere center');
+        if (!Number.isFinite(o.radius) || !(Math.fround(o.radius) > 0) || o.radius > MAX_QUERY_RANGE) throw new RangeError(`sphere radius must be in (0, ${MAX_QUERY_RANGE}]`);
+        const id = this.nextQuery;
+        if (!this.enqueue({ k: 'overlap', d: { id, center: o.center, radius: o.radius, ignore: o.ignore?.id ?? NO_ENTITY } })) throw new Error('CommandRing full');
+        this.nextQuery = (this.nextQuery + 1) >>> 0;
+        return id;
+    }
+
+    /**
+     * Rows answered since the last call, oldest first. `lost` counts rows the runtime overwrote before they were read (the buffer
+     * holds 4096 rows). A query that is still queued has no row yet.
+     */
+    readQueryResults(): { results: QueryResult[]; lost: number } {
+        this.assertAlive();
+        const { rows, next, lost } = this.transforms.queryRows(this.queryTail);
+        this.queryTail = next;
+        const f = new Float32Array(rows.buffer);
+        const results: QueryResult[] = [];
+        for (let o = 0; o < rows.length; o += QUERY_ROW_WORDS) {
+            const query = rows[o], kind = rows[o + 1];
+            const vec = (at: number): [number, number, number] => [f[o + at], f[o + at + 1], f[o + at + 2]];
+            if (kind === 0) results.push({ query, kind: 'hit', entity: rows[o + 2], distance: f[o + 3], point: vec(4), normal: vec(7) });
+            else if (kind === 1) results.push({ query, kind: 'miss' });
+            else if (kind === 2) results.push({ query, kind: 'overlap', entity: rows[o + 2], depth: f[o + 3], point: vec(4), normal: vec(7) });
+            else if (kind === 3) results.push({ query, kind: 'overlap-none' });
+            else if (kind === 4) results.push({ query, kind: 'overlap-more' });
+            else throw new Error(`unknown query result kind ${kind}`);
+        }
+        return { results, lost };
     }
 
     destroyJoint(joint: JointHandle): void {

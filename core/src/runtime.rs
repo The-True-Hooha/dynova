@@ -3,6 +3,7 @@ use crate::command_ring::{Command, CommandRing, MAX_CAPACITY};
 use crate::hull::{HullData, MAX_HULL_VERTS};
 use crate::inspector::Inspector;
 use crate::command_ring::KinSample;
+use crate::query_results::{self as qr, QueryResults};
 use crate::physics::{BodyDesc, Fnv, JointDesc, PhysicsSnapshot, PhysicsWorld, SHAPE_HULL};
 use crate::recorder::Recorder;
 use crate::transform_buffers::{Transform, TransformBuffers, INITIAL_STATE};
@@ -51,8 +52,10 @@ const H_SEEKS: usize = 31;
 const H_REC_SEQ: usize = 33;
 const H_INSPECT_JOINTS: usize = 34;
 const H_INSPECT_JOINT_N: usize = 35;
+const H_QUERY_ROWS: usize = 36;
+const H_QUERY_HEAD: usize = 37;
 const H_LIVE: usize = 32;
-pub const HEADER_WORDS: usize = 36;
+pub const HEADER_WORDS: usize = 38;
 
 /// What a step did to the tick counter.
 #[derive(Clone, Copy, PartialEq)]
@@ -76,6 +79,7 @@ pub struct Runtime {
     physics: PhysicsWorld,
     physics_enabled: bool,
     inspector: Option<Inspector>,
+    query_results: Option<QueryResults>,
     inspecting: bool,
     recorder: Option<Recorder>,
     /// Tick the world is at, ahead of the published `ticks` word while a step is still running (a seek moves it mid-step).
@@ -103,6 +107,7 @@ impl Runtime {
             physics: PhysicsWorld::new(capacity as usize),
             physics_enabled: false,
             inspector: None,
+            query_results: None,
             inspecting: false,
             recorder: None,
             head: 0,
@@ -116,7 +121,7 @@ impl Runtime {
         rt
     }
 
-    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts, inspector seq, bodies ptr, contacts ptr, contact count, step last us and step total us (written by the JS step driver), inspector tick, inspector on, recording on, recorded start tick, recorded end tick, state hash low and high words, keyframe count, paused, seek count, live flags pointer, recording seqlock, inspector joints pointer, inspector joint count].
+    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts, inspector seq, bodies ptr, contacts ptr, contact count, step last us and step total us (written by the JS step driver), inspector tick, inspector on, recording on, recorded start tick, recorded end tick, state hash low and high words, keyframe count, paused, seek count, live flags pointer, recording seqlock, inspector joints pointer, inspector joint count, query result rows pointer, query rows written].
     pub fn header_ptr(&self) -> *const u32 {
         self.header.as_ptr() as *const u32
     }
@@ -479,6 +484,14 @@ impl Runtime {
             }
             Command::JointMotor { id, vel, max } => return self.apply_joint_motor(id, vel, max),
             Command::KinematicBatch { count, samples } => return self.apply_kinematic_batch(&samples[..count as usize]),
+            Command::Raycast { id, origin, dir, max_dist, ignore } => {
+                self.apply_raycast(id, origin, dir, max_dist, ignore);
+                return false;
+            }
+            Command::OverlapSphere { id, center, radius, ignore } => {
+                self.apply_overlap(id, center, radius, ignore);
+                return false;
+            }
             _ => {}
         }
         let Some((id, generation)) = cmd.target() else { return false };
@@ -527,6 +540,72 @@ impl Runtime {
             self.ring.note_malformed();
         }
         ok
+    }
+
+    /// Hash of every row written so far, for the cross-build determinism check.
+    pub fn query_rows_hash(&self) -> u64 {
+        let mut h = Fnv::new();
+        if let Some(r) = &self.query_results {
+            for n in 0..r.written().min(qr::ROWS as u32) {
+                for w in r.row(n) { h.word(w as u64); }
+            }
+        }
+        h.finish()
+    }
+
+    #[cfg(test)]
+    pub fn query_row(&self, n: u32) -> [u32; qr::ROW_WORDS] {
+        self.query_results.as_ref().expect("a query was answered").row(n)
+    }
+
+    /// Stages every row of one query and announces them with a single store, so a reader on another thread never sees half an answer.
+    fn push_results(&mut self, rows: &[[u32; qr::ROW_WORDS]]) {
+        let ring = self.query_results.get_or_insert_with(QueryResults::new);
+        // The pointer goes first: a reader that sees a row count must find the buffer.
+        if ring.written() == 0 {
+            self.header[H_QUERY_ROWS].store(ring.rows_ptr() as u32, Ordering::Release);
+        }
+        for row in rows {
+            ring.stage(*row);
+        }
+        ring.publish(&self.header[H_QUERY_HEAD]);
+    }
+
+    /// A query reads the poses the last step left and changes nothing, so it is neither logged nor replayed; its rows are not part of the state.
+    fn apply_raycast(&mut self, id: u32, origin: [f32; 3], dir: [f32; 3], max_dist: f32, ignore: u32) {
+        let Some(unit) = crate::collision::normalize(dir).filter(|_| self.physics_enabled) else {
+            self.ring.note_malformed();
+            return;
+        };
+        let bits = |v: [f32; 3]| v.map(f32::to_bits);
+        let row = match self.physics.raycast(origin, unit, max_dist, ignore) {
+            Some(h) => {
+                let (p, n) = (bits(h.point), bits(h.normal));
+                [id, qr::KIND_RAY_HIT, h.body, h.t.to_bits(), p[0], p[1], p[2], n[0], n[1], n[2]]
+            }
+            None => [id, qr::KIND_RAY_MISS, crate::physics::NO_BODY, 0, 0, 0, 0, 0, 0, 0],
+        };
+        self.push_results(&[row]);
+    }
+
+    fn apply_overlap(&mut self, id: u32, center: [f32; 3], radius: f32, ignore: u32) {
+        if !self.physics_enabled {
+            self.ring.note_malformed();
+            return;
+        }
+        let mut hits = Vec::new();
+        let more = self.physics.overlap_sphere(center, radius, ignore, &mut hits);
+        let bits = |v: [f32; 3]| v.map(f32::to_bits);
+        let mut rows: Vec<[u32; qr::ROW_WORDS]> = hits.iter().map(|h| {
+            let (p, n) = (bits(h.point), bits(h.normal));
+            [id, qr::KIND_OVERLAP, h.body, h.depth.to_bits(), p[0], p[1], p[2], n[0], n[1], n[2]]
+        }).collect();
+        if rows.is_empty() {
+            rows.push([id, qr::KIND_OVERLAP_NONE, crate::physics::NO_BODY, 0, 0, 0, 0, 0, 0, 0]);
+        } else if more {
+            rows.push([id, qr::KIND_OVERLAP_MORE, crate::physics::NO_BODY, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        self.push_results(&rows);
     }
 
     /// Each sample stands alone: a stale or invalid one is counted and skipped, the rest of the slot still applies.
@@ -2333,10 +2412,10 @@ mod tests {
             [H_EPOCH, H_CAPACITY, H_BUF0, H_STATE, H_GENERATIONS, H_TICKS, H_STALE, H_MALFORMED, H_BUCKETS, H_BUCKET_LEN, H_RING_PENDING,
              H_DROPPED_CONTACTS, H_OVERRUNS, H_CONTACTS, H_INSPECT_SEQ, H_INSPECT_BODIES, H_INSPECT_CONTACTS, H_INSPECT_CONTACT_N,
              H_STEP_LAST_US, H_STEP_TOTAL_US, H_INSPECT_TICK, H_INSPECT_ON, H_REC_ON, H_REC_START, H_REC_END, H_HASH_LO, H_HASH_HI, H_KEYFRAMES,
-             H_PAUSED, H_SEEKS, H_LIVE, H_REC_SEQ, H_INSPECT_JOINTS, H_INSPECT_JOINT_N],
-            [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35],
+             H_PAUSED, H_SEEKS, H_LIVE, H_REC_SEQ, H_INSPECT_JOINTS, H_INSPECT_JOINT_N, H_QUERY_ROWS, H_QUERY_HEAD],
+            [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37],
         );
-        assert_eq!(HEADER_WORDS, 36);
+        assert_eq!(HEADER_WORDS, 38);
     }
 
     #[test]
@@ -2851,6 +2930,127 @@ mod tests {
             assert_eq!(frame_bits(&rt), takes[t as usize].frame, "frame at {t}");
             assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (stale, malformed), "replay re-counted at {t}");
         }
+    }
+
+    fn query_row(rt: &Runtime, n: u32) -> [u32; qr::ROW_WORDS] {
+        rt.query_results.as_ref().expect("a query was answered").row(n)
+    }
+
+    fn ray(id: u32, origin: [f32; 3], dir: [f32; 3], max_dist: f32, ignore: u32) -> Command {
+        Command::Raycast { id, origin, dir, max_dist, ignore }
+    }
+
+    #[test]
+    fn a_raycast_is_answered_in_the_same_step_with_one_row_per_query_and_the_query_id_echoed() {
+        let mut rt = Runtime::new(8, 64);
+        rt.enable_physics();
+        assert_eq!((header(&rt, H_QUERY_ROWS), header(&rt, H_QUERY_HEAD)), (0, 0), "nothing is allocated until the first query");
+        rt.ring.push(&ray(1, [0.0, 5.0, 0.0], [1.0, 0.0, 0.0], 50.0, u32::MAX));
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::sphere_at([6.0, 5.0, 0.0], 1.0, 0.0, 0.0)));
+        rt.ring.push(&ray(7, [0.0, 5.0, 0.0], [3.0, 0.0, 0.0], 50.0, u32::MAX));
+        rt.ring.push(&ray(9, [0.0, 5.0, 0.0], [0.0, 1.0, 0.0], 50.0, u32::MAX));
+        rt.ring.push(&ray(11, [0.0, 5.0, 0.0], [1.0, 0.0, 0.0], 50.0, 0));
+        rt.step();
+        assert_ne!(header(&rt, H_QUERY_ROWS), 0);
+        assert_eq!(header(&rt, H_QUERY_HEAD), 4);
+        let f = |bits: u32| f32::from_bits(bits);
+        let miss_before_spawn = query_row(&rt, 0);
+        assert_eq!(miss_before_spawn[..3], [1, qr::KIND_RAY_MISS, u32::MAX], "commands apply in ring order");
+        let hit = query_row(&rt, 1);
+        assert_eq!(hit[..3], [7, qr::KIND_RAY_HIT, 0]);
+        assert!((f(hit[3]) - 5.0).abs() < 1e-4, "an unnormalized direction still measures distance in metres");
+        assert!((f(hit[4]) - 5.0).abs() < 1e-4 && (f(hit[5]) - 5.0).abs() < 1e-4);
+        assert!((f(hit[7]) + 1.0).abs() < 1e-4);
+        assert_eq!(query_row(&rt, 2)[..3], [9, qr::KIND_RAY_MISS, u32::MAX]);
+        assert_eq!(query_row(&rt, 3)[..3], [11, qr::KIND_RAY_MISS, u32::MAX], "ignore skips the only body");
+        assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (0, 0));
+    }
+
+    #[test]
+    fn an_overlap_writes_a_row_per_body_a_none_row_when_empty_and_a_more_row_past_the_cap() {
+        let mut rt = Runtime::new(128, 256);
+        rt.enable_physics();
+        for i in 0..70u32 {
+            rt.ring.push(&spawn_cmd(i, 0, BodyDesc::sphere_at([i as f32 * 0.001, 0.0, 0.0], 1.0, 0.0, 0.0)));
+        }
+        rt.step();
+        rt.ring.push(&Command::OverlapSphere { id: 5, center: [0.0, 100.0, 0.0], radius: 1.0, ignore: u32::MAX });
+        rt.step();
+        assert_eq!(header(&rt, H_QUERY_HEAD), 1);
+        assert_eq!(query_row(&rt, 0)[..3], [5, qr::KIND_OVERLAP_NONE, u32::MAX]);
+        rt.ring.push(&Command::OverlapSphere { id: 6, center: [0.0; 3], radius: 1.0, ignore: 3 });
+        rt.step();
+        let written = header(&rt, H_QUERY_HEAD);
+        assert_eq!(written, 1 + 64 + 1);
+        let bodies: Vec<u32> = (1..65).map(|n| query_row(&rt, n)[2]).collect();
+        assert_eq!(bodies, (0..65u32).filter(|b| *b != 3).take(64).collect::<Vec<_>>(), "lowest ids first, the ignored one skipped");
+        assert!((1..65).all(|n| query_row(&rt, n)[..2] == [6, qr::KIND_OVERLAP]));
+        assert_eq!(query_row(&rt, 65)[..3], [6, qr::KIND_OVERLAP_MORE, u32::MAX]);
+        rt.ring.push(&Command::OverlapSphere { id: 8, center: [0.0; 3], radius: 0.5, ignore: u32::MAX });
+        rt.step();
+        assert_eq!(header(&rt, H_QUERY_HEAD) - written, 64 + 1, "the cap is on bodies, and more is still reported");
+    }
+
+    #[test]
+    fn an_overlap_with_exactly_the_cap_of_bodies_has_no_more_row() {
+        let mut rt = Runtime::new(80, 256);
+        rt.enable_physics();
+        for i in 0..64u32 {
+            rt.ring.push(&spawn_cmd(i, 0, BodyDesc::sphere_at([i as f32 * 0.001, 0.0, 0.0], 1.0, 0.0, 0.0)));
+        }
+        rt.step();
+        rt.ring.push(&Command::OverlapSphere { id: 1, center: [0.0; 3], radius: 1.0, ignore: u32::MAX });
+        rt.step();
+        assert_eq!(header(&rt, H_QUERY_HEAD), 64);
+        assert!((0..64).all(|n| query_row(&rt, n)[1] == qr::KIND_OVERLAP));
+    }
+
+    #[test]
+    fn queries_work_on_a_paused_world_and_are_neither_logged_nor_replayed() {
+        let mut rt = Runtime::new(8, 64);
+        rt.enable_physics();
+        rt.ring.push(&Command::Record { on: true });
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::sphere_at([3.0, 0.0, 0.0], 1.0, 0.0, 0.0)));
+        rt.step();
+        rt.step();
+        let logged = rt.recorder.as_ref().unwrap().log_len();
+        rt.ring.push(&Command::Pause { on: true });
+        rt.ring.push(&ray(1, [0.0; 3], [1.0, 0.0, 0.0], 10.0, u32::MAX));
+        rt.step();
+        assert_eq!(header(&rt, H_QUERY_HEAD), 1, "answered while paused");
+        assert_eq!(query_row(&rt, 0)[..3], [1, qr::KIND_RAY_HIT, 0]);
+        assert_eq!(rt.recorder.as_ref().unwrap().log_len(), logged, "a query is not a state change");
+        let hash = rt.state_hash();
+        rt.ring.push(&Command::OverlapSphere { id: 2, center: [3.0, 0.0, 0.0], radius: 1.0, ignore: u32::MAX });
+        rt.step();
+        assert_eq!(rt.state_hash(), hash);
+        for t in [1, 2, 1, 2] { seek_to(&mut rt, t); }
+        assert_eq!(header(&rt, H_QUERY_HEAD), 2, "a replay answers nothing");
+    }
+
+    #[test]
+    fn queries_on_a_world_without_physics_are_malformed_and_leave_no_rows() {
+        let mut rt = Runtime::new(4, 16);
+        rt.ring.push(&ray(1, [0.0; 3], [1.0, 0.0, 0.0], 10.0, u32::MAX));
+        rt.ring.push(&Command::OverlapSphere { id: 2, center: [0.0; 3], radius: 1.0, ignore: u32::MAX });
+        rt.step();
+        assert_eq!((rt.malformed_dropped(), header(&rt, H_QUERY_HEAD), header(&rt, H_QUERY_ROWS)), (2, 0, 0));
+    }
+
+    #[test]
+    fn the_result_ring_overwrites_the_oldest_rows_and_the_counter_keeps_counting_past_its_size() {
+        let mut rt = Runtime::new(4, 8192);
+        rt.enable_physics();
+        let total = qr::ROWS as u32 + 5;
+        let mut sent = 0;
+        while sent < total {
+            for _ in 0..8 { if sent < total { rt.ring.push(&ray(sent, [0.0; 3], [1.0, 0.0, 0.0], 1.0, u32::MAX)); sent += 1; } }
+            rt.step();
+        }
+        assert_eq!(header(&rt, H_QUERY_HEAD), total);
+        assert_eq!(query_row(&rt, total - 1)[0], total - 1, "the newest row is intact");
+        assert_eq!(query_row(&rt, total - qr::ROWS as u32)[0], total - qr::ROWS as u32, "the oldest kept row is intact");
+        assert_eq!(query_row(&rt, 0)[0], qr::ROWS as u32, "row 0 was overwritten by row {ROWS}", ROWS = qr::ROWS);
     }
 
     #[test]

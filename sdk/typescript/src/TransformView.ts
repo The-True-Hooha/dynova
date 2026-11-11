@@ -34,7 +34,12 @@ export const H_LIVE = 32;
 export const H_REC_SEQ = 33;
 export const H_INSPECT_JOINTS = 34;
 export const H_INSPECT_JOINT_N = 35;
-export const HEADER_WORDS = 36;
+export const H_QUERY_ROWS = 36;
+export const H_QUERY_HEAD = 37;
+export const HEADER_WORDS = 38;
+
+export const QUERY_ROW_WORDS = 10;
+export const QUERY_ROWS = 4096;
 
 const MAX_SPINS = 5_000_000;
 const NEW_FLAG = 0b100;
@@ -136,6 +141,34 @@ export class TransformView {
             if (Atomics.load(this.header, H_REC_SEQ) === seq) return state;
         }
         return null;
+    }
+
+    /**
+     * Rows the runtime wrote to the query result buffer since row number `from` (a running count that wraps at 2^32). Never more than
+     * `QUERY_ROWS - 1` come back (the slot the runtime writes next still holds the oldest row): when the reader fell further behind than the buffer holds, `lost` counts the rows that were overwritten.
+     */
+    queryRows(from: number): { rows: Uint32Array; next: number; lost: number } {
+        this.live();
+        for (let attempt = 0; attempt < RECORDING_ATTEMPTS; attempt++) {
+            const ptr = Atomics.load(this.header, H_QUERY_ROWS) >>> 0;
+            const head = Atomics.load(this.header, H_QUERY_HEAD) >>> 0;
+            if (ptr === 0 || head === from) return { rows: new Uint32Array(0), next: head, lost: 0 };
+            const behind = (head - from) >>> 0;
+            const lost = Math.max(0, behind - (QUERY_ROWS - 1));
+            const first = (from + lost) >>> 0;
+            const count = behind - lost;
+            const rows = new Uint32Array(count * QUERY_ROW_WORDS);
+            const view = new Uint32Array(this.memory.buffer, ptr, QUERY_ROWS * QUERY_ROW_WORDS);
+            for (let n = 0; n < count; n++) {
+                const at = ((first + n) % QUERY_ROWS) * QUERY_ROW_WORDS;
+                rows.set(view.subarray(at, at + QUERY_ROW_WORDS), n * QUERY_ROW_WORDS);
+            }
+            // The runtime writes row `after` into the slot of row `after - QUERY_ROWS` before it announces it, so that older row is
+            // already suspect: the copy is whole only if it started strictly newer.
+            const after = Atomics.load(this.header, H_QUERY_HEAD) >>> 0;
+            if (((after - first) >>> 0) < QUERY_ROWS) return { rows, next: head, lost };
+        }
+        throw new Error('query results kept being overwritten while they were read');
     }
 
     /**

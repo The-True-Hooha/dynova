@@ -31,7 +31,8 @@ async function run() {
     const scene = Array.from(glue.determinism_scene() as BigUint64Array, (v) => v.toString());
     const jointScene = Array.from(glue.determinism_joint_scene() as BigUint64Array, (v) => v.toString());
     const kinematicScene = Array.from(glue.determinism_kinematic_scene() as BigUint64Array, (v) => v.toString());
-    return { hash: h.toString(), probe: glue.determinism_probe().toString(), scene, jointScene, kinematicScene, userAgent: navigator.userAgent };
+    const sensorScene = (glue.determinism_sensor_scene() as bigint).toString();
+    return { hash: h.toString(), probe: glue.determinism_probe().toString(), scene, jointScene, kinematicScene, sensorScene, userAgent: navigator.userAgent };
 }
 
 run().then(

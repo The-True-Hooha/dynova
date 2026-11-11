@@ -55,3 +55,12 @@ test('a 700-tick kinematic scene (platform, wall and joint anchor fed by samples
     expect(r.error).toBeUndefined();
     expect(r.kinematicScene).toEqual(HOST_KINEMATIC_SCENE);
 });
+
+// Pinned from core/src/determinism.rs `SENSOR_PINNED`.
+test('raycast and overlap results against a settled mixed scene match the native build in this browser', async ({ page }) => {
+    await page.goto('/determinism.html');
+    await page.waitForFunction(() => (window as any).__result !== undefined, null, { timeout: 30_000 });
+    const r = await page.evaluate(() => (window as any).__result);
+    expect(r.error).toBeUndefined();
+    expect(r.sensorScene).toBe('7037252248839586730');
+});

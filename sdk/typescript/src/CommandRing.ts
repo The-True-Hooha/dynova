@@ -16,6 +16,10 @@ export const TAG_JOINT_CREATE = 12;
 export const TAG_JOINT_DESTROY = 13;
 export const TAG_JOINT_MOTOR = 14;
 export const TAG_KINEMATIC_BATCH = 15;
+export const TAG_RAYCAST = 16;
+export const TAG_OVERLAP_SPHERE = 17;
+export const NO_ENTITY = 0xffffffff;
+export const MAX_QUERY_RANGE = 1e6;
 export const KIN_SAMPLES_PER_SLOT = 3;
 export const MAX_KIN_TICKS = 65535;
 export const HULL_VERTS_PER_SLOT = 4;
@@ -68,6 +72,21 @@ export interface KinematicSample {
     id: number; gen: number;
     x: number; y: number; z: number;
     ticks: number;
+}
+
+export interface RaycastDesc {
+    id: number;
+    origin: readonly [number, number, number];
+    dir: readonly [number, number, number];
+    maxDistance: number;
+    ignore: number;
+}
+
+export interface OverlapSphereDesc {
+    id: number;
+    center: readonly [number, number, number];
+    radius: number;
+    ignore: number;
 }
 
 export interface JointCreateDesc {
@@ -284,6 +303,35 @@ export class CommandRing {
         this.view.setUint32(off + 1, id, true);
         this.view.setFloat32(off + 6, velocity, true);
         this.view.setFloat32(off + 10, maxForce, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    raycast(d: RaycastDesc): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_RAYCAST);
+        this.view.setUint32(off + 1, d.id, true);
+        d.origin.forEach((v, k) => this.view.setFloat32(off + 6 + k * 4, v, true));
+        d.dir.forEach((v, k) => this.view.setFloat32(off + 18 + k * 4, v, true));
+        this.view.setFloat32(off + 30, d.maxDistance, true);
+        this.view.setUint32(off + 34, d.ignore, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    overlapSphere(d: OverlapSphereDesc): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, TAG_OVERLAP_SPHERE);
+        this.view.setUint32(off + 1, d.id, true);
+        d.center.forEach((v, k) => this.view.setFloat32(off + 6 + k * 4, v, true));
+        this.view.setFloat32(off + 18, d.radius, true);
+        this.view.setUint32(off + 34, d.ignore, true);
         Atomics.add(this.tail, 0, 1);
         return true;
     }

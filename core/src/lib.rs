@@ -10,6 +10,7 @@ pub mod collision;
 pub mod hull;
 pub mod physics;
 pub mod inspector;
+pub mod query_results;
 pub mod recorder;
 pub mod determinism;
 
@@ -61,6 +62,12 @@ pub fn determinism_scene() -> Vec<u64> {
 #[wasm_bindgen]
 pub fn determinism_joint_scene() -> Vec<u64> {
     determinism::run_joint_scene().to_vec()
+}
+
+/// Hash of the rows a fixed batch of raycast and overlap queries produces against a settled mixed scene.
+#[wasm_bindgen]
+pub fn determinism_sensor_scene() -> u64 {
+    determinism::run_sensor_scene()
 }
 
 /// The same four values for the kinematic world (moving platform, wall and joint anchor fed by telemetry samples).

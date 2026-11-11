@@ -224,6 +224,32 @@ pub fn run_kinematic_scene() -> [u64; 4] {
     run_recorded(64, build_kinematic, kinematic_script, KIN_TICKS, KIN_MIDDLE)
 }
 
+/// Hash of every result row a fixed batch of queries produces against a settled mixed scene, so sensor output is compared across
+/// builds the same way the simulation state is.
+pub fn run_sensor_scene() -> u64 {
+    let mut rt = Runtime::new(CAPACITY, 4096);
+    rt.enable_physics();
+    build(&mut rt);
+    for _ in 0..120 {
+        rt.step();
+    }
+    let mut seed = 99u32;
+    let mut id = 0u32;
+    for _ in 0..40 {
+        for _ in 0..8 {
+            let origin = [lcg(&mut seed) * 24.0 - 12.0, lcg(&mut seed) * 6.0, lcg(&mut seed) * 24.0 - 12.0];
+            let dir = [lcg(&mut seed) - 0.5, lcg(&mut seed) - 0.5, lcg(&mut seed) - 0.5];
+            rt.ring.push(&Command::Raycast { id, origin, dir, max_dist: 40.0, ignore: u32::MAX });
+            id += 1;
+        }
+        let center = [lcg(&mut seed) * 24.0 - 12.0, lcg(&mut seed) * 4.0, lcg(&mut seed) * 24.0 - 12.0];
+        rt.ring.push(&Command::OverlapSphere { id, center, radius: 0.5 + lcg(&mut seed) * 2.0, ignore: u32::MAX });
+        id += 1;
+        rt.step();
+    }
+    rt.query_rows_hash()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +409,32 @@ mod tests {
         assert_eq!(rt.stale_dropped(), 0);
     }
 
+    #[test]
+    fn the_sensor_scene_hash_is_deterministic_non_trivial_and_pinned() {
+        let h = run_sensor_scene();
+        assert_eq!(h, run_sensor_scene());
+        assert_ne!(h, 0);
+        assert_eq!(h, SENSOR_PINNED, "update the pin and docs/decisions/determinism.md together if the queries or the scene changed on purpose");
+    }
+
+    #[test]
+    fn the_sensor_scene_queries_find_hits_and_overlaps_and_misses() {
+        let mut rt = Runtime::new(CAPACITY, 4096);
+        rt.enable_physics();
+        build(&mut rt);
+        for _ in 0..120 { rt.step(); }
+        for q in 0..60u32 {
+            let y = 0.3 + (q % 6) as f32 * 0.4;
+            rt.ring.push(&Command::Raycast { id: q, origin: [-14.0, y, (q / 6) as f32 * 2.0 - 8.0], dir: [1.0, 0.0, 0.0], max_dist: 40.0, ignore: u32::MAX });
+        }
+        rt.ring.push(&Command::Raycast { id: 100, origin: [0.0, 50.0, 0.0], dir: [0.0, 1.0, 0.0], max_dist: 10.0, ignore: u32::MAX });
+        rt.step();
+        let kinds: Vec<u32> = (0..61).map(|n| rt.query_row(n)[1]).collect();
+        assert!(kinds[..60].iter().filter(|k| **k == crate::query_results::KIND_RAY_HIT).count() > 30, "most rays cross the pile: {kinds:?}");
+        assert_eq!(kinds[60], crate::query_results::KIND_RAY_MISS);
+    }
+
+    const SENSOR_PINNED: u64 = 7037252248839586730;
     const KIN_PINNED_END: u64 = 637658996748191174;
     const KIN_PINNED_MIDDLE: u64 = 17987134958895714485;
 

@@ -227,9 +227,10 @@ describe('shared header layout', () => {
             tv.H_INSPECT_SEQ, tv.H_INSPECT_BODIES, tv.H_INSPECT_CONTACTS, tv.H_INSPECT_CONTACT_N,
             tv.H_STEP_LAST_US, tv.H_STEP_TOTAL_US, tv.H_INSPECT_TICK, tv.H_INSPECT_ON,
             tv.H_REC_ON, tv.H_REC_START, tv.H_REC_END, tv.H_HASH_LO, tv.H_HASH_HI, tv.H_KEYFRAMES,
-            tv.H_PAUSED, tv.H_SEEKS, tv.H_LIVE, tv.H_REC_SEQ, tv.H_INSPECT_JOINTS, tv.H_INSPECT_JOINT_N,
-        ]).toEqual([0, 5, 6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]);
-        expect(tv.HEADER_WORDS).toBe(36);
+            tv.H_PAUSED, tv.H_SEEKS, tv.H_LIVE, tv.H_REC_SEQ, tv.H_INSPECT_JOINTS, tv.H_INSPECT_JOINT_N, tv.H_QUERY_ROWS, tv.H_QUERY_HEAD,
+        ]).toEqual([0, 5, 6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37]);
+        expect(tv.HEADER_WORDS).toBe(38);
+        expect([tv.QUERY_ROW_WORDS, tv.QUERY_ROWS]).toEqual([10, 4096]);
     });
 });
 

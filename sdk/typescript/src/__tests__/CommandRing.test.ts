@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, SHAPE_HULL, SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, KIN_SAMPLES_PER_SLOT, JOINT_HINGE } from '../CommandRing.js';
+import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, SHAPE_HULL, SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, KIN_SAMPLES_PER_SLOT, JOINT_HINGE } from '../CommandRing.js';
 
 function makeRing(capacity = 16) {
     const mem = new WebAssembly.Memory({ initial: 1 });
@@ -288,5 +288,31 @@ describe('CommandRing', () => {
         const before = new Uint8Array(mem.buffer, 0, 2 * SLOT_BYTES).slice();
         expect(ring.kinematicBatch([{ ...s, id: 9 }])).toBe(false);
         expect(new Uint8Array(mem.buffer, 0, 2 * SLOT_BYTES)).toEqual(before);
+    });
+
+    it('pins the query tags', () => {
+        expect([TAG_RAYCAST, TAG_OVERLAP_SPHERE]).toEqual([16, 17]);
+    });
+
+    // Same bytes as the query fixtures in core/src/command_ring.rs.
+    it('query bytes match the Rust cross-language fixtures', () => {
+        const hex = (mem: WebAssembly.Memory) => Array.from(new Uint8Array(mem.buffer, 0, SLOT_BYTES)).map((b) => b.toString(16).padStart(2, '0')).join('');
+        const a = makeRing();
+        new Uint8Array(a.mem.buffer, 0, SLOT_BYTES).fill(0xff);
+        expect(a.ring.raycast({ id: 70_000, origin: [1, 2, 3], dir: [0, 0, -2], maxDistance: 50.5, ignore: 9 })).toBe(true);
+        expect(hex(a.mem)).toBe('10' + '70110100' + '00' + '0000803f' + '00000040' + '00004040' + '00000000' + '00000000' + '000000c0' + '00004a42' + '09000000' + '00'.repeat(26));
+        const b = makeRing();
+        new Uint8Array(b.mem.buffer, 0, SLOT_BYTES).fill(0xff);
+        expect(b.ring.overlapSphere({ id: 3, center: [-1, 0.5, 8], radius: 2.5, ignore: 0xffffffff })).toBe(true);
+        expect(hex(b.mem)).toBe('11' + '03000000' + '00' + '000080bf' + '0000003f' + '00000041' + '00002040' + '00000000' + '00000000' + '00000000' + 'ffffffff' + '00'.repeat(26));
+    });
+
+    it('query writers report a full ring without touching it', () => {
+        const { mem, ring } = makeRing(1);
+        expect(ring.raycast({ id: 1, origin: [0, 0, 0], dir: [1, 0, 0], maxDistance: 1, ignore: 0xffffffff })).toBe(true);
+        const before = new Uint8Array(mem.buffer, 0, SLOT_BYTES).slice();
+        expect(ring.raycast({ id: 2, origin: [9, 9, 9], dir: [0, 1, 0], maxDistance: 2, ignore: 0 })).toBe(false);
+        expect(ring.overlapSphere({ id: 3, center: [9, 9, 9], radius: 2, ignore: 0 })).toBe(false);
+        expect(new Uint8Array(mem.buffer, 0, SLOT_BYTES)).toEqual(before);
     });
 });
