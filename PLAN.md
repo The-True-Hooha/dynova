@@ -85,7 +85,7 @@ Out-of-plan observations. Do not act on these without approval.
 - (Step 29, parked) Solver limits found building the demos, documented in `docs/robotics.md`: hinge chains with off-plane anchors under gravity grow out-of-plane tilt; a differential drive with more than about 15-20 percent wheel speed difference skids and tips (motor rows against friction rows in a fixed pass count); contacts between jointed links fight the joint. A wheeled robot that turns sharply needs a better solver (more passes, or a joint-aware friction model), which is a separate project.
 - (Step 30, parked) No command re-bases a running world (shift every body, keep velocities); mates are made from the current pose and ranges are relative to it.
 - (Step 31, parked) No import of CAD-native constraints (glTF has no place for them); no solver that assembles overlapping parts.
-- (Step 32, parked) Not published to npm; licence undecided (UNLICENSED); Vite dev server, webpack, other bundlers and pnpm/yarn installs untested; no release process.
+- (Step 32, parked) Not published to npm; Vite dev server, webpack, other bundlers and pnpm/yarn installs untested; no release process.
 
 ## Plan changes
 
@@ -96,4 +96,4 @@ Approved changes to the plan and to the wire and header layouts. Delivery notes 
 - 2026-11-09: Phase 4B approved with adjustments: the command queue stays the only write path, so snapshots, `Teleport`, `Record`, `Seek` and `Pause` (tags 8 to 11) are ring commands; the header grew to 34 words (paused flag, seek count, live-flag pointer, recording seqlock).
 - 2026-11-10: autonomous execution to the end of the roadmap approved (implement, review, fix, commit, next step). Stage 5A decided no BVH (two grid fixes instead) and no fixed-point migration. All three verticals approved in order instead of picking one.
 - Phases 6 to 9 changed the wire and header layouts: ring tags 12 to 14 (joints), 15 (kinematic batch) and 16 to 17 (raycast, overlap sphere); the distance joint rides the joint descriptor's axis words; the header grew to 36 words (inspector joint table), 38 (query results) and 41 (joint states). A kinematic sample names the ticks to arrive in rather than a per-tick target. Queries are read-only: they answer into a result buffer and are not logged or replayed.
-- 2026-11-11: Phase 10 (consumable packages) added with the user's approval; publishing to npm is out of scope until a separate confirmation, and the licence is left `UNLICENSED` until the user chooses.
+- 2026-11-11: Phase 10 (consumable packages) added with the user's approval; publishing to npm is out of scope until a separate confirmation, and the licence is MIT (chosen 2026-11-11: anyone may fork, reproduce and contribute).

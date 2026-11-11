@@ -19,11 +19,12 @@
     "vitest": "^4.0"
   },
   "description": "Dynova inspector: a debug panel with entities, contacts, joints, profiler and an optional recording timeline.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "sideEffects": false,
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "publishConfig": {
     "exports": {

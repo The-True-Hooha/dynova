@@ -43,7 +43,7 @@ packs the four packages into a temporary directory, installs them with `npm` int
 
 ## Not done
 
-- Publishing to npm, a licence (`UNLICENSED` for now) and a release process. The packages are no longer `private`, so `pnpm publish` would not refuse; do not publish before a licence is chosen.
+- Publishing to npm and a release process. The licence is MIT, and the packages are no longer `private`, so `pnpm publish` would not refuse: do not publish without a deliberate decision (name ownership, versioning).
 - Windows (the build and consumer scripts shell out to `pnpm` and `npm`).
 - The Vite dev server, webpack and other bundlers are untested; Firefox is untested here as everywhere.
 - Versions are `0.1.0` and the API is not declared stable.

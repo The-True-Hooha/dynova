@@ -19,11 +19,12 @@
     "vitest": "^4.0"
   },
   "description": "Dynova Canvas2D adapter: draws a world as a 2D view.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "sideEffects": false,
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "publishConfig": {
     "exports": {

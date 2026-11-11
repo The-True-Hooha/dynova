@@ -27,11 +27,12 @@
     "vitest": "^4.0"
   },
   "description": "Dynova Three.js adapter: instanced rendering of a world, glTF and model loading, and scene meshes to colliders and assemblies.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "sideEffects": false,
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "publishConfig": {
     "exports": {

@@ -17,11 +17,12 @@
     "vitest": "^4.0"
   },
   "description": "Dynova SDK: a shared-memory simulation runtime for the web. Rust owns the world; JavaScript reads it.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "sideEffects": false,
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "publishConfig": {
     "exports": {
