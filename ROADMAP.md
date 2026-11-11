@@ -155,6 +155,11 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 - **9B** Import of assemblies from GLTF node hierarchy, demo.
 - **Exit:** an imported assembly with mates moves through its range without drift.
 
+## Phase 10 — Consumable packages (added 2026-11-11 with the user's approval)
+- **10A** Build the four packages (`@dynova/sdk`, `@dynova/three`, `@dynova/canvas2d`, `@dynova/inspector`) to ESM plus type declarations, ship the release wasm (threaded and single-threaded) and the worker inside the SDK, a one-call `launch` for the web, package metadata, per-package READMEs.
+- **10B** Prove it: pack the tarballs, install them into a clean Vite app outside the workspace, typecheck and bundle it, and run it in Chromium and WebKit in shared-memory, missing-headers and no-SharedArrayBuffer modes. Packaging docs. Not published to npm.
+- **Exit:** a clean app built from the packed tarballs runs a world with physics, the Three.js and Canvas2D adapters and the inspector in two browsers.
+
 ---
 
 ## Cross-phase invariants (never regress)
