@@ -135,7 +135,7 @@ fn build_joints(rt: &mut Runtime) {
         rt.ring.push(&spawn(1 + i, 0, BodyDesc::sphere_at([i as f32, 10.0, 0.0], 0.2, 1.0, 0.0)));
         rt.ring.push(&joint(i, JOINT_BALL, i, 1 + i, [i as f32 - 0.5, 10.0, 0.0], [0.0; 3]));
     }
-    rt.ring.push(&spawn(DOOR - 1, 0, BodyDesc::box_at([10.0, 3.0, 0.0], [0.1, 3.0, 0.1], 0.0, 0.1)));
+    rt.ring.push(&spawn(DOOR - 1, 0, BodyDesc::box_at([9.85, 3.0, 0.0], [0.1, 3.0, 0.1], 0.0, 0.1)));
     rt.ring.push(&spawn(DOOR, 0, BodyDesc::box_at([11.0, 3.0, 0.0], [1.0, 0.1, 0.1], 1.0, 0.1)));
     let door = JointDesc { kind: JOINT_HINGE, a: DOOR - 1, b: DOOR, anchor: [10.0, 3.0, 0.0], axis: [0.0, 1.0, 0.0], limits: Some((-0.8, 0.8)), motor_vel: 0.0, motor_max: 0.0 };
     rt.ring.push(&Command::JointCreate { id: 20, gen_a: 0, gen_b: 0, desc: door });
@@ -338,14 +338,14 @@ mod tests {
         }
         for id in 1..=CHAIN_LINKS {
             if id != 3 {
-                assert!(worst[&id] < 0.2, "chain joint {id} came apart by {}", worst[&id]);
+                assert!(worst[&id] < 0.01, "chain joint {id} came apart by {}", worst[&id]);
             }
         }
-        assert!(worst[&3] < 0.2, "chain joint 3 held until it was destroyed: {}", worst[&3]);
-        assert!(worst[&20] < 0.25, "a 2 m door hinged at its end sags but stays attached: {}", worst[&20]);
+        assert!(worst[&3] < 0.01, "chain joint 3 held until it was destroyed: {}", worst[&3]);
+        assert!(worst[&20] < 0.03, "the 2 m door pushed into both limits stays on its hinge: {}", worst[&20]);
         assert!(worst[&30] < 0.01, "wheel axle {}", worst[&30]);
         assert!(worst[&50] < 0.01, "weld {}", worst[&50]);
-        assert!(door_lo < -0.78 && door_lo > -0.9 && door_hi > 0.78 && door_hi < 0.9, "the door reaches both limits and not much past them: {door_lo} {door_hi}");
+        assert!(door_lo < -0.78 && door_lo > -0.85 && door_hi > 0.78 && door_hi < 0.85, "the door reaches both limits and not much past them: {door_lo} {door_hi}");
         assert!(slide_lo > -0.1 && slide_lo < 0.05 && slide_hi > 3.95 && slide_hi < 4.1, "the slider travels its whole [0, 4] range: {slide_lo} {slide_hi}");
         assert!(slide_off < 0.05, "the slider stays on its rail: {slide_off}");
         let ids: Vec<u32> = rt.joint_anchor_gaps().into_iter().map(|g| g.0).collect();
@@ -435,11 +435,11 @@ mod tests {
     }
 
     const SENSOR_PINNED: u64 = 7037252248839586730;
-    const KIN_PINNED_END: u64 = 637658996748191174;
-    const KIN_PINNED_MIDDLE: u64 = 17987134958895714485;
+    const KIN_PINNED_END: u64 = 11061039626079077839;
+    const KIN_PINNED_MIDDLE: u64 = 4197951501668953752;
 
-    const JOINT_PINNED_END: u64 = 15756670485398854027;
-    const JOINT_PINNED_MIDDLE: u64 = 13638603286812908320;
+    const JOINT_PINNED_END: u64 = 10886105467219054376;
+    const JOINT_PINNED_MIDDLE: u64 = 16090749575230081017;
     const PINNED_END: u64 = 1177776368450856606;
     const PINNED_MIDDLE: u64 = 15081626903481916999;
 }

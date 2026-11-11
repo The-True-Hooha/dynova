@@ -1,6 +1,8 @@
 use crate::collision::{self as geo, Manifold};
 use crate::hull::{self, HullData, MAX_HULLS};
 
+#[cfg(test)]
+mod accuracy;
 mod joints;
 mod kinematic;
 mod query;
@@ -32,6 +34,8 @@ const MAX_CELL_SIZE: f32 = 4.0;
 const MAX_WIDE_DYNAMICS: usize = 16;
 const BROAD_EPS: f32 = 1e-3;
 const SOLVER_ITERS: u32   = 12;
+/// Steps a tick is split into while any joint exists; a power of two, so `dt / k` and the damping roots below are exact.
+pub const JOINT_SUBSTEPS: u32 = 4;
 // Largest velocity change (m/s) one contact update may still apply for the sweep to count as converged.
 const CONVERGED: f32 = 1e-4;
 const BIAS_FACTOR:  f32   = 0.2;
@@ -360,9 +364,31 @@ impl PhysicsWorld {
         self.vel_z[id] += iz * im;
     }
 
+    /// One tick. A world with joints runs `JOINT_SUBSTEPS` smaller steps inside it: a joint corrects position and velocity once per step, so
+    /// a light link carrying a heavy swinging mass drifts by the square of the rotation it turns in one step, and quartering the step
+    /// removes almost all of that. A world without joints takes one full step, exactly as before.
     pub fn step(&mut self) {
+        let k = if self.joints.is_empty() { 1 } else { JOINT_SUBSTEPS };
+        if k == 1 {
+            self.step_once(self.dt, 1, true);
+            return;
+        }
+        let full = self.dt;
+        let dropped = self.dropped_contacts;
+        self.dt = full / k as f32;
+        for i in 0..k {
+            // A contact dropped in every sub-step is one dropped contact per tick, not k.
+            self.dropped_contacts = dropped;
+            self.step_once(full, k, i + 1 == k);
+        }
+        self.dt = full;
+    }
+
+    /// `full` is the tick's duration, `k` how many steps share it and `last` whether this is the tick's final one; `self.dt` is this step's own.
+    fn step_once(&mut self, full: f32, k: u32, last: bool) {
         let dt   = self.dt;
         let cap  = self.capacity;
+        let (lin_damp, ang_damp) = (damp_per_step(LIN_DAMP, k), damp_per_step(ANG_DAMP, k));
 
         self.jointed.clear();
         if !self.joints.is_empty() {
@@ -374,7 +400,7 @@ impl PhysicsWorld {
                 }
             }
         }
-        self.begin_kinematic();
+        self.begin_kinematic(full);
         for i in 0..cap {
             if !self.active[i] || self.inv_mass[i] == 0.0 || self.sleeping[i] { continue; }
             let vsq = self.vel_x[i]*self.vel_x[i] + self.vel_y[i]*self.vel_y[i] + self.vel_z[i]*self.vel_z[i];
@@ -399,12 +425,12 @@ impl PhysicsWorld {
             self.vel_x[i] += self.gx * dt;
             self.vel_y[i] += self.gy * dt;
             self.vel_z[i] += self.gz * dt;
-            self.vel_x[i] *= LIN_DAMP;
-            self.vel_y[i] *= LIN_DAMP;
-            self.vel_z[i] *= LIN_DAMP;
-            self.ang_x[i] *= ANG_DAMP;
-            self.ang_y[i] *= ANG_DAMP;
-            self.ang_z[i] *= ANG_DAMP;
+            self.vel_x[i] *= lin_damp;
+            self.vel_y[i] *= lin_damp;
+            self.vel_z[i] *= lin_damp;
+            self.ang_x[i] *= ang_damp;
+            self.ang_y[i] *= ang_damp;
+            self.ang_z[i] *= ang_damp;
         }
 
         let mut eff_mass = self.inv_mass.clone();
@@ -528,7 +554,7 @@ impl PhysicsWorld {
             [self.qx[i], self.qy[i], self.qz[i], self.qw[i]] = q;
         }
 
-        let moved = self.advance_kinematic();
+        let moved = self.advance_kinematic(k, last);
         // The check before the solver used the old position, and a body that arrives this tick is not checked again, so a sleeper it
         // landed on would stay embedded.
         if !moved.is_empty() {
@@ -906,6 +932,18 @@ impl PhysicsWorld {
         }
         (cells, n)
     }
+}
+
+/// The factor that, applied `k` times, damps as much as `factor` applied once: the k-th root, by repeated square roots (`k` is a power of two)
+/// so it is exact and identical on every build.
+fn damp_per_step(factor: f32, k: u32) -> f32 {
+    let mut f = factor;
+    let mut n = k;
+    while n > 1 {
+        f = f.sqrt();
+        n /= 2;
+    }
+    f
 }
 
 fn integrate_quaternion(q: &mut [f32; 4], w: [f32; 3], dt: f32) {

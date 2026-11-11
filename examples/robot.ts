@@ -18,8 +18,8 @@ const ARM_GAINS = { kp: 8, kd: 0.2, maxSpeed: 3, maxForce: 400 };
 // A gentle arc: in the scenes tried, a differential drive stayed upright and on course only while the two wheel speeds stayed close, which
 // means a turning radius of several metres.
 const CAR_PATH: V2[] = [[2, 0.1], [4, 0.4], [6, 0.95], [8, 1.7], [10, 2.7]];
-// The widest wheel-speed split this path asks for is about 25 percent (docs/robotics.md).
-const CAR: PursuitOptions = { lookahead: 1.6, maxSpeed: 0.7, maxTurn: 0.12, arrive: 0.5, trackHalfWidth: 0.8, wheelRadius: 0.3 };
+// A slow robot on a gentle arc: at higher speeds the wheel and floor contacts still make the chassis tumble (docs/robotics.md).
+const CAR: PursuitOptions = { lookahead: 1.4, maxSpeed: 0.3, maxTurn: 0.05, arrive: 0.5, trackHalfWidth: 0.8, wheelRadius: 0.3 };
 const WHEEL_TORQUE = 15;
 const WHEEL_OFFSET = 0.8;
 

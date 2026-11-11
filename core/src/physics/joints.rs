@@ -208,7 +208,9 @@ impl PhysicsWorld {
             len: if distance { len_sq(sub(d.anchor, d.axis)).sqrt() } else { 0.0 },
             acc: [0.0; 9],
         };
+        let was_empty = self.joints.is_empty();
         self.joints.insert(at, joint);
+        self.rescale_warm_impulses(was_empty);
         self.wake(a);
         self.wake(b);
         true
@@ -217,6 +219,7 @@ impl PhysicsWorld {
     pub fn destroy_joint(&mut self, id: u32) -> bool {
         let Ok(at) = self.joints.binary_search_by_key(&id, |j| j.id) else { return false };
         let j = self.joints.remove(at);
+        self.rescale_warm_impulses(false);
         self.wake(j.a as usize);
         self.wake(j.b as usize);
         true
@@ -255,6 +258,23 @@ impl PhysicsWorld {
         });
         for other in gone {
             self.wake(other as usize);
+        }
+        self.rescale_warm_impulses(false);
+    }
+
+    /// Warm-start impulses are per sub-step. The first joint turns one step per tick into `JOINT_SUBSTEPS` smaller ones and the last joint
+    /// turns them back, so the cached impulses scale by the ratio of step lengths. Done here, at the command, so it needs no extra state in
+    /// the snapshot.
+    fn rescale_warm_impulses(&mut self, was_empty: bool) {
+        let now_empty = self.joints.is_empty();
+        let k = |empty: bool| if empty { 1.0 } else { JOINT_SUBSTEPS as f32 };
+        // `was_empty` is only meaningful for the insert path; removals pass false and are compared against a world that had joints.
+        let before = if was_empty { 1.0 } else { JOINT_SUBSTEPS as f32 };
+        let scale = before / k(now_empty);
+        if scale != 1.0 {
+            for e in &mut self.warm_cache {
+                e.lambda *= scale; e.lt1 *= scale; e.lt2 *= scale;
+            }
         }
     }
 

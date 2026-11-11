@@ -39,9 +39,9 @@ impl PhysicsWorld {
     }
 
     /// Contacts and the joint solver read velocities, so a moving platform carries and pushes what touches it.
-    pub(super) fn begin_kinematic(&mut self) {
+    pub(super) fn begin_kinematic(&mut self, tick_dt: f32) {
         if self.kin.is_empty() { return; }
-        let inv_dt = 1.0 / self.dt;
+        let inv_dt = 1.0 / tick_dt;
         for k in &self.kin {
             let i = k.id as usize;
             self.vel_x[i] = k.step[0] * inv_dt;
@@ -51,21 +51,22 @@ impl PhysicsWorld {
     }
 
     /// The last tick lands exactly on the sample so rounding never accumulates over a long stream.
-    pub(super) fn advance_kinematic(&mut self) -> Vec<u32> {
-        let moved: Vec<u32> = self.kin.iter().map(|k| k.id).collect();
-        for k in &mut self.kin {
-            let i = k.id as usize;
-            k.remaining -= 1;
-            if k.remaining == 0 {
-                [self.pos_x[i], self.pos_y[i], self.pos_z[i]] = k.to;
+    pub(super) fn advance_kinematic(&mut self, k: u32, last: bool) -> Vec<u32> {
+        let moved: Vec<u32> = self.kin.iter().map(|row| row.id).collect();
+        let share = 1.0 / k as f32;
+        for row in &mut self.kin {
+            let i = row.id as usize;
+            if last { row.remaining -= 1; }
+            if last && row.remaining == 0 {
+                [self.pos_x[i], self.pos_y[i], self.pos_z[i]] = row.to;
                 self.vel_x[i] = 0.0; self.vel_y[i] = 0.0; self.vel_z[i] = 0.0;
             } else {
-                self.pos_x[i] += k.step[0];
-                self.pos_y[i] += k.step[1];
-                self.pos_z[i] += k.step[2];
+                self.pos_x[i] += row.step[0] * share;
+                self.pos_y[i] += row.step[1] * share;
+                self.pos_z[i] += row.step[2] * share;
             }
         }
-        self.kin.retain(|k| k.remaining > 0);
+        self.kin.retain(|row| row.remaining > 0);
         moved
     }
 }
