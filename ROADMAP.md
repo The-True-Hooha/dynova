@@ -135,22 +135,22 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 
 ---
 
-## Phase 6 — Joints and constraints
+## Phase 6 — Joints and constraints  ✅ done (docs/joints.md)
 - **6A** Joint table and solver: ball, hinge, fixed, slider with limits and motors, solved in the same iteration loop as contacts, warm started, sleeping-island aware. Commands `JointCreate`/`JointDestroy`/`JointMotor` through the ring.
 - **6B** Joints in snapshot, replay, state hash and determinism scene; SDK `World.joint*`; inspector shows joints.
 - **Exit:** a chain, a hinged door and a motor-driven wheel stay stable for 10k ticks; seek round trip over joint scenes is bit-identical.
 
-## Phase 7 — Digital twin vertical
+## Phase 7 — Digital twin vertical  ✅ done; the 60 fps frame time at 5000 entities with drawing is not measured (docs/digital-twin.md)
 - **7A** Data ingest: kinematic bodies driven by external samples (telemetry to commands, batched), bulk teleport/kinematic-target command, large-N scale pass.
 - **7B** Demo and docs: replayed telemetry scene with overlays through the inspector.
 - **Exit:** 5k moving tracked entities at 60 fps in the browser fed from a recorded telemetry stream; scrub and replay are bit-identical.
 
-## Phase 8 — Robotics vertical
+## Phase 8 — Robotics vertical  ✅ done with a limit: a wheeled robot only follows a gentle arc (docs/robotics.md, docs/sensors.md)
 - **8A** Sensors: raycast and overlap queries on the read path via the command ring plus a result buffer.
 - **8B** Controller loop: joint motor targets from user code each tick, demo arm and wheeled robot.
 - **Exit:** a 3-joint arm reaches a target and a wheeled robot follows a path, deterministic under replay.
 
-## Phase 9 — CAD vertical
+## Phase 9 — CAD vertical  ✅ done (docs/assemblies.md, docs/assembly-import.md)
 - **9A** Assembly mates (fixed, revolute, slider, distance) built on joints, large-coordinate handling.
 - **9B** Import of assemblies from GLTF node hierarchy, demo.
 - **Exit:** an imported assembly with mates moves through its range without drift.

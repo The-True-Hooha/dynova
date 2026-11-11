@@ -59,10 +59,10 @@ dynova/
   examples/          # Runnable demos and e2e pages
   e2e/               # Playwright cross-browser tests
   inspector/         # Inspector panel with optional editing and timeline (@dynova/inspector)
-  docs/              # Hosting notes, adapter contract, Three.js adapter, scene colliders, inspector, replay, benchmark
+  docs/              # Hosting notes, adapter contract, Three.js adapter, scene colliders, inspector, replay, benchmark, joints, digital twin, sensors, robotics, assemblies, assembly import
 ```
 
-Planned, not yet built: `inspector/` (Phase 4).
+The packages are workspace-internal for now (private, TypeScript source exports, the wasm built locally with `make build`); they are not published to npm.
 
 ---
 
