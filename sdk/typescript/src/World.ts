@@ -1,4 +1,5 @@
 import { HEADER_WORDS, QUERY_ROW_WORDS, TransformView } from './TransformView.js';
+import { positionControl, type PositionGains } from './control.js';
 import type { RecordingState } from './TransformView.js';
 import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc, KIN_SAMPLES_PER_SLOT, MAX_KIN_TICKS, KinematicSample, RaycastDesc, OverlapSphereDesc, NO_ENTITY, MAX_QUERY_RANGE } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
@@ -75,6 +76,21 @@ export interface OverlapSphereOptions {
     center: readonly [number, number, number];
     radius: number;
     ignore?: EntityHandle;
+}
+
+export interface JointState {
+    joint: number;
+    kind: number;
+    /** Hinge angle in radians or slider offset in metres, with the sign limits and the motor use. */
+    position: number;
+    /** Rate of `position`, in rad/s or m/s. */
+    velocity: number;
+}
+
+export interface JointDrive {
+    joint: JointHandle;
+    target: number;
+    gains: PositionGains;
 }
 
 export interface KinematicTarget {
@@ -494,6 +510,34 @@ export class World {
             else throw new Error(`unknown query result kind ${kind}`);
         }
         return { results, lost };
+    }
+
+    /**
+     * Position and speed of every hinge and slider as of the last tick the runtime published (a seek republishes them for the sought
+     * tick). A controller reads these after `step()`, decides, and sends motor commands that take effect on the next step.
+     */
+    readJointStates(): JointState[] {
+        this.assertAlive();
+        return this.transforms.jointStates().map((r) => ({ joint: r.id, kind: r.kind, position: r.position, velocity: r.velocity }));
+    }
+
+    /**
+     * One control tick: read the joint states once, run position control for each drive and queue the motor commands (all are validated first, so a bad value queues nothing; a full ring can still stop it part way). A drive whose
+     * joint has no state yet (the joint command has not been applied, or the joint is gone) is skipped and its id returned.
+     */
+    driveJoints(drives: readonly JointDrive[]): number[] {
+        this.assertAlive();
+        const states = new Map(this.readJointStates().map((s) => [s.joint, s]));
+        const commands = [];
+        const skipped: number[] = [];
+        for (const d of drives) {
+            const state = states.get(d.joint.id);
+            if (!state) { skipped.push(d.joint.id); continue; }
+            commands.push({ joint: d.joint, ...positionControl(state, d.target, d.gains) });
+        }
+        for (const c of commands) this.assertMotor(c.velocity, c.maxForce);
+        for (const c of commands) this.setJointMotor(c.joint, c.velocity, c.maxForce);
+        return skipped;
     }
 
     destroyJoint(joint: JointHandle): void {

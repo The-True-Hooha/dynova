@@ -11,6 +11,7 @@ pub mod hull;
 pub mod physics;
 pub mod inspector;
 pub mod query_results;
+pub mod joint_state;
 pub mod recorder;
 pub mod determinism;
 

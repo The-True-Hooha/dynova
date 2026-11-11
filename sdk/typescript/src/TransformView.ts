@@ -36,8 +36,12 @@ export const H_INSPECT_JOINTS = 34;
 export const H_INSPECT_JOINT_N = 35;
 export const H_QUERY_ROWS = 36;
 export const H_QUERY_HEAD = 37;
-export const HEADER_WORDS = 38;
+export const H_JSTATE_SEQ = 38;
+export const H_JSTATE_ROWS = 39;
+export const H_JSTATE_N = 40;
+export const HEADER_WORDS = 41;
 
+export const JSTATE_ROW_WORDS = 4;
 export const QUERY_ROW_WORDS = 10;
 export const QUERY_ROWS = 4096;
 
@@ -141,6 +145,31 @@ export class TransformView {
             if (Atomics.load(this.header, H_REC_SEQ) === seq) return state;
         }
         return null;
+    }
+
+    /**
+     * `[joint id, kind, coordinate, rate]` rows of every hinge and slider as of the last tick the runtime published, copied inside the
+     * runtime's sequence word so they all belong to one tick. Empty while no hinge or slider exists.
+     */
+    jointStates(): Array<{ id: number; kind: number; position: number; velocity: number }> {
+        for (let attempt = 0; attempt < RECORDING_ATTEMPTS; attempt++) {
+            this.live();
+            const seq = Atomics.load(this.header, H_JSTATE_SEQ);
+            if (seq & 1) continue;
+            const ptr = Atomics.load(this.header, H_JSTATE_ROWS) >>> 0;
+            const n = Atomics.load(this.header, H_JSTATE_N) >>> 0;
+            if (ptr === 0 || n === 0) {
+                if (Atomics.load(this.header, H_JSTATE_SEQ) === seq) return [];
+                continue;
+            }
+            const words = new Uint32Array(this.memory.buffer, ptr, n * JSTATE_ROW_WORDS).slice();
+            if (Atomics.load(this.header, H_JSTATE_SEQ) !== seq) continue;
+            const f = new Float32Array(words.buffer);
+            const rows = [];
+            for (let r = 0; r < n; r++) rows.push({ id: words[r * 4], kind: words[r * 4 + 1], position: f[r * 4 + 2], velocity: f[r * 4 + 3] });
+            return rows;
+        }
+        throw new Error('joint states kept changing while they were read');
     }
 
     /**

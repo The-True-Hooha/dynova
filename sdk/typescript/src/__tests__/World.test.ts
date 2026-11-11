@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { World } from '../World.js';
 import { makeWorld, makeSyncWorld } from './helpers.js';
-import { H_QUERY_HEAD, H_QUERY_ROWS, QUERY_ROWS, QUERY_ROW_WORDS } from '../TransformView.js';
+import { H_QUERY_HEAD, H_QUERY_ROWS, H_JSTATE_SEQ, H_JSTATE_ROWS, H_JSTATE_N, QUERY_ROWS, QUERY_ROW_WORDS } from '../TransformView.js';
 import { H_GENERATIONS, H_LIVE, H_SEEKS, H_PAUSED, H_TICKS } from '../TransformView.js';
 import { SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, JOINT_BALL, JOINT_HINGE, JOINT_FIXED, JOINT_SLIDER } from '../CommandRing.js';
 
@@ -834,5 +834,115 @@ describe('World queries', () => {
         world.dispose?.();
         expect(() => world.raycast({ origin: [0, 0, 0], direction: [1, 0, 0], maxDistance: 1 })).toThrow();
         expect(() => world.readQueryResults()).toThrow();
+    });
+});
+
+describe('World joint states and drives', () => {
+    const AT = 250_000;
+    function rig() {
+        const made = makeWorld({ capacity: 64, ringCapacity: 64 });
+        const u = new Uint32Array(made.memory.buffer, AT, 64 * 4);
+        const f = new Float32Array(made.memory.buffer, AT, 64 * 4);
+        const publish = (rows: Array<[number, number, number, number]>) => {
+            Atomics.add(made.rt.header, H_JSTATE_SEQ, 1);
+            rows.forEach(([id, kind, pos, vel], n) => { u[n * 4] = id; u[n * 4 + 1] = kind; f[n * 4 + 2] = pos; f[n * 4 + 3] = vel; });
+            Atomics.store(made.rt.header, H_JSTATE_ROWS, AT);
+            Atomics.store(made.rt.header, H_JSTATE_N, rows.length);
+            Atomics.add(made.rt.header, H_JSTATE_SEQ, 1);
+        };
+        return { ...made, publish };
+    }
+    const gains = { kp: 4, kd: 0, maxSpeed: 2, maxForce: 30 };
+    const motorSlots = (rt: { dv: DataView; layout: { ringSlotsByteOffset: number } }, from: number, n: number) =>
+        Array.from({ length: n }, (_, k) => {
+            const off = rt.layout.ringSlotsByteOffset + (from + k) * SLOT_BYTES;
+            return { tag: rt.dv.getUint8(off), id: rt.dv.getUint32(off + 1, true), vel: rt.dv.getFloat32(off + 6, true), max: rt.dv.getFloat32(off + 10, true) };
+        });
+
+    it('reads nothing before any hinge or slider exists', () => {
+        const { world } = rig();
+        expect(world.readJointStates()).toEqual([]);
+    });
+
+    it('reads every published row with the joint id, kind, position and velocity', () => {
+        const { world, publish } = rig();
+        publish([[3, 1, 0.5, -0.25], [9, 3, 1.5, 2]]);
+        expect(world.readJointStates()).toEqual([
+            { joint: 3, kind: 1, position: 0.5, velocity: -0.25 },
+            { joint: 9, kind: 3, position: 1.5, velocity: 2 },
+        ]);
+        publish([]);
+        expect(world.readJointStates()).toEqual([]);
+    });
+
+    it('waits out a write in progress instead of returning half a table, and gives up on a table that never settles', () => {
+        const { world, publish, rt } = rig();
+        publish([[1, 1, 0.1, 0.2]]);
+        Atomics.add(rt.header, H_JSTATE_SEQ, 1);
+        expect(() => world.readJointStates()).toThrow(/kept changing/);
+        Atomics.add(rt.header, H_JSTATE_SEQ, 1);
+        expect(world.readJointStates()).toHaveLength(1);
+    });
+
+    it('retries when the sequence moves while it copies', () => {
+        const { world, publish, rt } = rig();
+        publish([[1, 1, 0.1, 0.2]]);
+        const real = Atomics.load as (ta: Int32Array, idx: number) => number;
+        let seqLoads = 0;
+        const spy = vi.spyOn(Atomics, 'load').mockImplementation(((ta: Int32Array, idx: number) => {
+            const v = real(ta, idx);
+            if (idx === H_JSTATE_SEQ && ++seqLoads === 2) { publish([[1, 1, 0.75, 0.5]]); return real(ta, idx); }
+            return v;
+        }) as never);
+        try {
+            expect(world.readJointStates()).toEqual([{ joint: 1, kind: 1, position: 0.75, velocity: 0.5 }]);
+        } finally {
+            spy.mockRestore();
+        }
+        expect(rt.header[H_JSTATE_SEQ] % 2).toBe(0);
+    });
+
+    it('driveJoints sends one motor command per drive, from one read of the states', () => {
+        const { world, rt, publish } = rig();
+        publish([[0, 1, 0.1, 0], [1, 3, 2.0, 0]]);
+        const before = world.pendingCommands;
+        const skipped = world.driveJoints([
+            { joint: { id: 0 }, target: 0.35, gains },
+            { joint: { id: 1 }, target: 1.0, gains },
+        ]);
+        expect(skipped).toEqual([]);
+        const [a, b] = motorSlots(rt, before, 2);
+        expect([a.tag, a.id, b.tag, b.id]).toEqual([TAG_JOINT_MOTOR, 0, TAG_JOINT_MOTOR, 1]);
+        expect([a.vel, a.max]).toEqual([1, 30]);
+        expect([b.vel, b.max]).toEqual([-2, 30]);
+    });
+
+    it('driveJoints skips a joint without a state and reports it, and still drives the rest', () => {
+        const { world, rt, publish } = rig();
+        publish([[4, 1, 0, 0]]);
+        const before = world.pendingCommands;
+        expect(world.driveJoints([{ joint: { id: 4 }, target: 0.1, gains }, { joint: { id: 77 }, target: 0.1, gains }])).toEqual([77]);
+        expect(world.pendingCommands - before).toBe(1);
+        expect(motorSlots(rt, before, 1)[0].id).toBe(4);
+    });
+
+    it('driveJoints queues all of its commands or none when one is out of the motor limits', () => {
+        const { world, publish } = rig();
+        publish([[0, 1, 0, 0], [1, 1, 0, 0]]);
+        const before = world.pendingCommands;
+        expect(() => world.driveJoints([
+            { joint: { id: 0 }, target: 1, gains },
+            { joint: { id: 1 }, target: 1, gains: { ...gains, maxSpeed: 5000, kp: 1e6 } },
+        ])).toThrow(RangeError);
+        expect(world.pendingCommands).toBe(before);
+        expect(() => world.driveJoints([{ joint: { id: 0 }, target: NaN, gains }])).toThrow(RangeError);
+        expect(world.pendingCommands).toBe(before);
+    });
+
+    it('throws once the world is destroyed', () => {
+        const { world } = rig();
+        world.dispose?.();
+        expect(() => world.readJointStates()).toThrow();
+        expect(() => world.driveJoints([])).toThrow();
     });
 });

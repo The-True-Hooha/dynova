@@ -244,6 +244,26 @@ impl PhysicsWorld {
         }
     }
 
+    /// `(coordinate, rate)` of a hinge (angle in radians, angular rate about its axis) or a slider (offset in metres, speed along its
+    /// axis), measured on the bodies as they stand. The coordinate and its sign are the ones limits and the motor use: a positive motor
+    /// speed raises it. `None` for a joint with no free coordinate.
+    pub fn joint_coordinate(&self, j: &Joint) -> Option<(f32, f32)> {
+        if j.kind != JOINT_HINGE && j.kind != JOINT_SLIDER { return None; }
+        let (a, b) = (j.a as usize, j.b as usize);
+        let (qa, qb) = (self.body_quat(a), self.body_quat(b));
+        let aa = rotate(qa, j.axis_a);
+        let (wa, wb) = ([self.ang_x[a], self.ang_y[a], self.ang_z[a]], [self.ang_x[b], self.ang_y[b], self.ang_z[b]]);
+        if j.kind == JOINT_HINGE {
+            let (ua, ub) = (rotate(qa, j.ref_a), rotate(qb, j.ref_b));
+            return Some((atan2_det(dot(cross(ua, ub), aa), dot(ua, ub)), dot(sub(wb, wa), aa)));
+        }
+        let (ra, rb) = (rotate(qa, j.la), rotate(qb, j.lb));
+        let err = sub(add(self.body_pos(a), ra), add(self.body_pos(b), rb));
+        let (va, vb) = ([self.vel_x[a], self.vel_y[a], self.vel_z[a]], [self.vel_x[b], self.vel_y[b], self.vel_z[b]]);
+        let rate = sub(add(vb, cross(wb, rb)), add(va, cross(wa, ra)));
+        Some((-dot(err, aa), dot(rate, aa)))
+    }
+
     pub(super) fn prepare_joints(&mut self) {
         let dt = self.dt;
         let mut prep = std::mem::take(&mut self.joint_prep);
@@ -970,5 +990,132 @@ mod tests {
         assert!(w.set_joint_motor(0, 1.0, 10.0));
         assert!(!w.sleeping[1], "a motor command wakes the body");
         assert_eq!(w.joints[0].acc[SLOT_MOTOR], 0.0);
+    }
+
+    #[test]
+    fn a_hinge_reports_its_angle_and_rate_with_the_sign_the_motor_uses() {
+        for sign in [1.0f32, -1.0] {
+            let mut w = world(2);
+            w.gy = 0.0;
+            anchor_body(&mut w, 0, [0.0, 0.0, -3.0]);
+            w.spawn(1, &BodyDesc::box_at([1.0, 0.0, 0.0], [0.5, 0.1, 0.1], 1.0, 0.0));
+            let mut d = hinge(0, 1, [0.0; 3], [0.0, 0.0, 1.0]);
+            d.motor_vel = 1.0 * sign;
+            d.motor_max = 50.0;
+            assert!(w.create_joint(0, &d));
+            let (a0, r0) = w.joint_coordinate(&w.joints[0]).unwrap();
+            assert_eq!((a0, r0), (0.0, 0.0), "a fresh joint sits at zero");
+            for _ in 0..60 { w.step(); }
+            let (angle, rate) = w.joint_coordinate(&w.joints[0]).unwrap();
+            assert!((angle - sign).abs() < 0.05, "sign {sign}: angle {angle}");
+            assert!((rate - sign).abs() < 0.05, "sign {sign}: rate {rate}");
+            assert!((angle - sign * 2.0 * atan2_det(w.qz[1].abs(), w.qw[1])).abs() < 0.05, "agrees with the body's own rotation");
+        }
+    }
+
+    #[test]
+    fn a_hinge_angle_stops_at_its_limit_and_the_rate_goes_to_zero() {
+        let mut w = world(2);
+        w.gy = 0.0;
+        anchor_body(&mut w, 0, [0.0, 0.0, -3.0]);
+        w.spawn(1, &BodyDesc::box_at([1.0, 0.0, 0.0], [0.5, 0.1, 0.1], 1.0, 0.0));
+        let mut d = hinge(0, 1, [0.0; 3], [0.0, 0.0, 1.0]);
+        d.limits = Some((-0.5, 0.5));
+        d.motor_vel = 2.0;
+        d.motor_max = 50.0;
+        assert!(w.create_joint(0, &d));
+        for _ in 0..180 { w.step(); }
+        let (angle, rate) = w.joint_coordinate(&w.joints[0]).unwrap();
+        assert!((angle - 0.5).abs() < 0.03, "{angle}");
+        assert!(rate.abs() < 0.1, "{rate}");
+    }
+
+    #[test]
+    fn a_slider_reports_its_offset_and_speed_along_the_axis_and_follows_a_reversed_axis() {
+        for axis in [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]] {
+            let mut w = world(2);
+            w.gy = 0.0;
+            anchor_body(&mut w, 0, [0.0, 0.0, -3.0]);
+            w.spawn(1, &BodyDesc::box_at([0.0, 0.0, 0.0], [0.3; 3], 1.0, 0.0));
+            let mut d = hinge(0, 1, [0.0; 3], axis);
+            d.kind = JOINT_SLIDER;
+            d.motor_vel = 1.0;
+            d.motor_max = 50.0;
+            assert!(w.create_joint(0, &d));
+            for _ in 0..60 { w.step(); }
+            let (offset, speed) = w.joint_coordinate(&w.joints[0]).unwrap();
+            assert!((offset - 1.0).abs() < 0.05 && (speed - 1.0).abs() < 0.05, "axis {axis:?}: {offset} {speed}");
+            assert!((w.pos_x[1] - axis[0]).abs() < 0.05, "the body moved along the axis: {}", w.pos_x[1]);
+        }
+    }
+
+    #[test]
+    fn ball_and_fixed_joints_have_no_coordinate() {
+        let mut w = world(3);
+        anchor_body(&mut w, 0, [0.0, 5.0, -3.0]);
+        w.spawn(1, &BodyDesc::sphere_at([1.0, 5.0, 0.0], 0.3, 1.0, 0.0));
+        w.spawn(2, &BodyDesc::sphere_at([2.0, 5.0, 0.0], 0.3, 1.0, 0.0));
+        assert!(w.create_joint(0, &ball(0, 1, [0.5, 5.0, 0.0])));
+        let mut f = ball(1, 2, [1.5, 5.0, 0.0]);
+        f.kind = JOINT_FIXED;
+        assert!(w.create_joint(1, &f));
+        assert!(w.joints.iter().all(|j| w.joint_coordinate(j).is_none()));
+    }
+
+    #[test]
+    fn a_hinge_angle_is_unchanged_by_moving_the_whole_assembly() {
+        let angle_after_motion = |shift: V3| {
+            let mut w = world(2);
+            w.gy = 0.0;
+            anchor_body(&mut w, 0, add([0.0, 0.0, -3.0], shift));
+            w.spawn(1, &BodyDesc::box_at(add([1.0, 0.0, 0.0], shift), [0.5, 0.1, 0.1], 1.0, 0.0));
+            let mut d = hinge(0, 1, shift, [0.0, 0.0, 1.0]);
+            d.motor_vel = 1.0;
+            d.motor_max = 50.0;
+            assert!(w.create_joint(0, &d));
+            for _ in 0..30 { w.step(); }
+            w.joint_coordinate(&w.joints[0]).unwrap().0
+        };
+        assert!((angle_after_motion([0.0; 3]) - angle_after_motion([40.0, -7.0, 12.0])).abs() < 0.02);
+    }
+
+    #[test]
+    fn a_slider_offset_and_speed_include_the_lever_arms_of_the_two_bodies() {
+        let mut w = world(3);
+        w.gy = 0.0;
+        w.spawn(0, &BodyDesc::box_at([0.0, 0.0, 0.0], [0.3; 3], 1.0, 0.0));
+        w.spawn(1, &BodyDesc::box_at([1.0, 0.0, 0.0], [0.3; 3], 1.0, 0.0));
+        let mut d = hinge(0, 1, [0.5, 0.5, 0.0], [1.0, 0.0, 0.0]);
+        d.kind = JOINT_SLIDER;
+        assert!(w.create_joint(0, &d));
+        w.pos_x[1] += 0.3;
+        let (offset, _) = w.joint_coordinate(&w.joints[0]).unwrap();
+        assert!((offset - 0.3).abs() < 1e-5, "anchors off the axis must not leak into the offset: {offset}");
+        w.ang_z[1] = 2.0;
+        let (_, speed) = w.joint_coordinate(&w.joints[0]).unwrap();
+        assert!((speed - (-1.0)).abs() < 1e-5, "body b spinning about a point off the anchor moves it by w x r: {speed}");
+        w.ang_z[0] = 1.0;
+        let (_, speed) = w.joint_coordinate(&w.joints[0]).unwrap();
+        assert!((speed - (-0.5)).abs() < 1e-5, "body a's spin counts with the opposite sign: {speed}");
+        w.vel_x[0] = 0.25;
+        w.vel_x[1] = 0.75;
+        let (_, speed) = w.joint_coordinate(&w.joints[0]).unwrap();
+        assert!((speed - 0.0).abs() < 1e-5, "(vb - va) adds 0.5: {speed}");
+    }
+
+    #[test]
+    fn a_hinge_with_the_dynamic_body_as_a_reports_the_same_sign_the_motor_uses() {
+        let mut w = world(2);
+        w.gy = 0.0;
+        anchor_body(&mut w, 0, [0.0, 0.0, -3.0]);
+        w.spawn(1, &BodyDesc::box_at([1.0, 0.0, 0.0], [0.5, 0.1, 0.1], 1.0, 0.0));
+        let mut d = hinge(1, 0, [0.0; 3], [0.0, 0.0, 1.0]);
+        d.motor_vel = 1.0;
+        d.motor_max = 50.0;
+        assert!(w.create_joint(0, &d));
+        for _ in 0..60 { w.step(); }
+        let (angle, rate) = w.joint_coordinate(&w.joints[0]).unwrap();
+        assert!((angle - 1.0).abs() < 0.06 && (rate - 1.0).abs() < 0.06, "{angle} {rate}");
+        assert!(angle_of(&w, 1) < -0.9, "the body itself turned the other way: {}", angle_of(&w, 1));
     }
 }

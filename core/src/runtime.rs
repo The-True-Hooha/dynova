@@ -3,6 +3,7 @@ use crate::command_ring::{Command, CommandRing, MAX_CAPACITY};
 use crate::hull::{HullData, MAX_HULL_VERTS};
 use crate::inspector::Inspector;
 use crate::command_ring::KinSample;
+use crate::joint_state::JointStates;
 use crate::query_results::{self as qr, QueryResults};
 use crate::physics::{BodyDesc, Fnv, JointDesc, PhysicsSnapshot, PhysicsWorld, SHAPE_HULL};
 use crate::recorder::Recorder;
@@ -54,8 +55,11 @@ const H_INSPECT_JOINTS: usize = 34;
 const H_INSPECT_JOINT_N: usize = 35;
 const H_QUERY_ROWS: usize = 36;
 const H_QUERY_HEAD: usize = 37;
+const H_JSTATE_SEQ: usize = 38;
+const H_JSTATE_ROWS: usize = 39;
+const H_JSTATE_N: usize = 40;
 const H_LIVE: usize = 32;
-pub const HEADER_WORDS: usize = 38;
+pub const HEADER_WORDS: usize = 41;
 
 /// What a step did to the tick counter.
 #[derive(Clone, Copy, PartialEq)]
@@ -80,6 +84,7 @@ pub struct Runtime {
     physics_enabled: bool,
     inspector: Option<Inspector>,
     query_results: Option<QueryResults>,
+    joint_states: Option<JointStates>,
     inspecting: bool,
     recorder: Option<Recorder>,
     /// Tick the world is at, ahead of the published `ticks` word while a step is still running (a seek moves it mid-step).
@@ -108,6 +113,7 @@ impl Runtime {
             physics_enabled: false,
             inspector: None,
             query_results: None,
+            joint_states: None,
             inspecting: false,
             recorder: None,
             head: 0,
@@ -121,7 +127,7 @@ impl Runtime {
         rt
     }
 
-    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts, inspector seq, bodies ptr, contacts ptr, contact count, step last us and step total us (written by the JS step driver), inspector tick, inspector on, recording on, recorded start tick, recorded end tick, state hash low and high words, keyframe count, paused, seek count, live flags pointer, recording seqlock, inspector joints pointer, inspector joint count, query result rows pointer, query rows written].
+    /// Address of the shared layout header: [epoch, capacity, buf0, buf1, buf2, state, generations, ticks, stale, malformed, buckets_ptr, bucket_len, ring_pending, dropped_contacts, overruns (written by the worker loop), contacts, inspector seq, bodies ptr, contacts ptr, contact count, step last us and step total us (written by the JS step driver), inspector tick, inspector on, recording on, recorded start tick, recorded end tick, state hash low and high words, keyframe count, paused, seek count, live flags pointer, recording seqlock, inspector joints pointer, inspector joint count, query result rows pointer, query rows written, joint state sequence, joint state rows pointer, joint state rows].
     pub fn header_ptr(&self) -> *const u32 {
         self.header.as_ptr() as *const u32
     }
@@ -257,6 +263,7 @@ impl Runtime {
             inspector.write(&self.header[H_INSPECT_SEQ], &self.header[H_INSPECT_CONTACT_N], &self.header[H_INSPECT_JOINT_N], &self.header[H_INSPECT_TICK], new_tick, &self.physics);
         }
 
+        self.publish_joint_states();
         self.header[H_PAUSED].store(self.paused as u32, Ordering::Release);
         self.record_tick(new_tick, mode);
 
@@ -556,6 +563,19 @@ impl Runtime {
     #[cfg(test)]
     pub fn query_row(&self, n: u32) -> [u32; qr::ROW_WORDS] {
         self.query_results.as_ref().expect("a query was answered").row(n)
+    }
+
+    fn publish_joint_states(&mut self) {
+        if !self.physics_enabled { return; }
+        if self.joint_states.is_none() {
+            if !self.physics.joints.iter().any(|j| self.physics.joint_coordinate(j).is_some()) { return; }
+            let states = JointStates::new();
+            self.header[H_JSTATE_ROWS].store(states.rows_ptr() as u32, Ordering::Release);
+            self.joint_states = Some(states);
+        }
+        if let Some(states) = &self.joint_states {
+            states.write(&self.header[H_JSTATE_SEQ], &self.header[H_JSTATE_N], &self.physics);
+        }
     }
 
     /// Stages every row of one query and announces them with a single store, so a reader on another thread never sees half an answer.
@@ -2412,10 +2432,10 @@ mod tests {
             [H_EPOCH, H_CAPACITY, H_BUF0, H_STATE, H_GENERATIONS, H_TICKS, H_STALE, H_MALFORMED, H_BUCKETS, H_BUCKET_LEN, H_RING_PENDING,
              H_DROPPED_CONTACTS, H_OVERRUNS, H_CONTACTS, H_INSPECT_SEQ, H_INSPECT_BODIES, H_INSPECT_CONTACTS, H_INSPECT_CONTACT_N,
              H_STEP_LAST_US, H_STEP_TOTAL_US, H_INSPECT_TICK, H_INSPECT_ON, H_REC_ON, H_REC_START, H_REC_END, H_HASH_LO, H_HASH_HI, H_KEYFRAMES,
-             H_PAUSED, H_SEEKS, H_LIVE, H_REC_SEQ, H_INSPECT_JOINTS, H_INSPECT_JOINT_N, H_QUERY_ROWS, H_QUERY_HEAD],
-            [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37],
+             H_PAUSED, H_SEEKS, H_LIVE, H_REC_SEQ, H_INSPECT_JOINTS, H_INSPECT_JOINT_N, H_QUERY_ROWS, H_QUERY_HEAD, H_JSTATE_SEQ, H_JSTATE_ROWS, H_JSTATE_N],
+            [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40],
         );
-        assert_eq!(HEADER_WORDS, 38);
+        assert_eq!(HEADER_WORDS, 41);
     }
 
     #[test]
@@ -3051,6 +3071,86 @@ mod tests {
         assert_eq!(query_row(&rt, total - 1)[0], total - 1, "the newest row is intact");
         assert_eq!(query_row(&rt, total - qr::ROWS as u32)[0], total - qr::ROWS as u32, "the oldest kept row is intact");
         assert_eq!(query_row(&rt, 0)[0], qr::ROWS as u32, "row 0 was overwritten by row {ROWS}", ROWS = qr::ROWS);
+    }
+
+    fn joint_row(rt: &Runtime, n: usize) -> (u32, u32, f32, f32) {
+        let r = rt.joint_states.as_ref().expect("a hinge or slider exists").row(n);
+        (r[0], r[1], f32::from_bits(r[2]), f32::from_bits(r[3]))
+    }
+
+    fn motor_rig(rt: &mut Runtime) {
+        rt.set_gravity(0.0, 0.0, 0.0);
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, 0.0, -3.0], [0.25; 3], 0.0, 0.0)));
+        rt.ring.push(&spawn_cmd(1, 0, BodyDesc::box_at([1.0, 0.0, 0.0], [0.5, 0.1, 0.1], 1.0, 0.0)));
+        rt.ring.push(&spawn_cmd(2, 0, BodyDesc::box_at([5.0, 0.0, 0.0], [0.3; 3], 1.0, 0.0)));
+        rt.ring.push(&Command::JointCreate { id: 5, gen_a: 0, gen_b: 0, desc: joint_hinge(0, 1, [0.0; 3], 1.0, 50.0) });
+        rt.ring.push(&Command::JointCreate { id: 2, gen_a: 0, gen_b: 0, desc: joint_ball(0, 2, [2.5, 0.0, -1.0]) });
+    }
+
+    #[test]
+    fn joint_states_publish_one_row_per_hinge_and_slider_after_every_step_inside_the_sequence_word() {
+        let mut rt = Runtime::new(8, 64);
+        rt.enable_physics();
+        assert_eq!((header(&rt, H_JSTATE_ROWS), header(&rt, H_JSTATE_N), header(&rt, H_JSTATE_SEQ)), (0, 0, 0), "nothing before a joint exists");
+        motor_rig(&mut rt);
+        rt.step();
+        assert_ne!(header(&rt, H_JSTATE_ROWS), 0);
+        assert_eq!(header(&rt, H_JSTATE_SEQ) % 2, 0);
+        assert_eq!(header(&rt, H_JSTATE_N), 1, "the ball joint has no coordinate");
+        for _ in 0..59 { rt.step(); }
+        let (id, kind, angle, rate) = joint_row(&rt, 0);
+        assert_eq!((id, kind), (5, crate::physics::JOINT_HINGE as u32));
+        assert!((angle - 1.0).abs() < 0.06 && (rate - 1.0).abs() < 0.06, "{angle} {rate}");
+        let seq = header(&rt, H_JSTATE_SEQ);
+        rt.step();
+        assert_eq!(header(&rt, H_JSTATE_SEQ), seq + 2, "one bracket per step");
+    }
+
+    #[test]
+    fn joint_states_follow_create_destroy_and_a_destroyed_body() {
+        let mut rt = Runtime::new(8, 64);
+        rt.enable_physics();
+        motor_rig(&mut rt);
+        rt.ring.push(&Command::JointCreate { id: 1, gen_a: 0, gen_b: 0, desc: joint_hinge(0, 2, [2.5, 0.0, -1.0], 0.0, 0.0) });
+        rt.step();
+        assert_eq!(header(&rt, H_JSTATE_N), 2);
+        assert_eq!((joint_row(&rt, 0).0, joint_row(&rt, 1).0), (1, 5), "ascending joint id");
+        rt.ring.push(&Command::JointDestroy { id: 1 });
+        rt.step();
+        assert_eq!((header(&rt, H_JSTATE_N), joint_row(&rt, 0).0), (1, 5));
+        rt.ring.push(&Command::Destroy { id: 1, generation: 0 });
+        rt.step();
+        assert_eq!(header(&rt, H_JSTATE_N), 0, "a joint dies with its body");
+    }
+
+    #[test]
+    fn a_seek_republishes_the_joint_states_of_the_sought_tick() {
+        let mut rt = Runtime::new(8, 64);
+        rt.enable_physics();
+        rt.ring.push(&Command::Record { on: true });
+        motor_rig(&mut rt);
+        let mut live = vec![(0.0, 0.0)];
+        for _ in 0..90 {
+            rt.step();
+            let (_, _, a, r) = joint_row(&rt, 0);
+            live.push((a, r));
+        }
+        for t in [30u32, 61, 2, 90, 45] {
+            seek_to(&mut rt, t);
+            let (_, _, a, r) = joint_row(&rt, 0);
+            assert_eq!((a.to_bits(), r.to_bits()), (live[t as usize].0.to_bits(), live[t as usize].1.to_bits()), "tick {t}");
+        }
+    }
+
+    #[test]
+    fn joint_states_of_a_world_with_only_ball_joints_allocate_nothing() {
+        let mut rt = Runtime::new(4, 16);
+        rt.enable_physics();
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, 5.0, 0.0], [0.25; 3], 0.0, 0.0)));
+        rt.ring.push(&spawn_cmd(1, 0, BodyDesc::sphere_at([1.0, 5.0, 0.0], 0.3, 1.0, 0.0)));
+        rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_ball(0, 1, [0.5, 5.0, 0.0]) });
+        for _ in 0..5 { rt.step(); }
+        assert_eq!((header(&rt, H_JSTATE_ROWS), header(&rt, H_JSTATE_N)), (0, 0));
     }
 
     #[test]
