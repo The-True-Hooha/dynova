@@ -28,6 +28,12 @@ world.moveKinematic(frame.map((s, i) => ({ handle: handles[i], x: s.x, y: s.y, z
 
 Measured on Apple silicon: 5000 moving bodies, one sample each every 12 ticks, mean step 1.8 ms in Chromium and WebKit (`e2e/telemetry.spec.ts` prints it and asserts only that it stays under 16 ms; release wasm); about 1.0 ms natively in a one-off run that is not kept as a test. The JavaScript cost of building 1667 slot writes per sample frame is on top of that and is not in the step time.
 
+## Demo
+
+`make dev`, then open `/telemetry.html` (`?n=` sets the entity count, default 2000, clamped to 0..10000, a non-number falls back to the default; `?paused=1` starts without stepping and only redraws, so the panel's scrub shows on the canvas). It spawns static tracked entities on a grid and replays a feed into them every 12 ticks. The feed is a seeded pseudo-random sine feed standing in for recorded telemetry: it is generated once and then only read. Each frame depends on the tick alone, so a seek followed by live stepping feeds the same samples; a paused world does not re-queue the batch of its tick. Recording starts on the first step, so tick 0 is not seekable; after that, pause and drag the scrubber to any recorded tick. The green lines are each entity's velocity, drawn from the inspector snapshot (`InspectorView`), a read-only copy of shared memory, so the overlay's reads never touch the command ring (the feed, seeks and the inspector switch do use it).
+
+`e2e/telemetry.spec.ts` checks, in Chromium and WebKit: entity positions equal home plus the feed offset after each arrival (including ids beyond the first 64), one batch per 12 ticks, green overlay pixels on the canvas, a scrub reproducing the hash, and live stepping after a seek matching the first run's hashes tick for tick.
+
 ## Limits
 
 - A moving body wider than the grid cell scans every body slot each tick it moves, so many wide tracked bodies in a large world are costly.
