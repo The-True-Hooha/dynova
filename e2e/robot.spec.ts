@@ -36,7 +36,7 @@ const runAndScrub = (page: Page, ticks: number, scrubs: number[]) => page.evalua
 
 // Pinned: the same run gives this hash in Chromium and WebKit, which is the cross-engine check for the controller loop.
 const ARM_HASH = '4558083059200603469';
-const CAR_HASH = '13147996104729170434';
+const CAR_HASH = '6492401232290832991';
 
 test('a 3-joint arm reaches its target, holds it, and reaches a second one, with an exact scrub of the recorded motor commands', async ({ page }) => {
     const errors = await open(page, 'scene=arm');
@@ -77,15 +77,16 @@ test('a differential-drive robot follows a path to its end without tipping over,
         const t = (window as any).__robot;
         let tallest = 0;
         let arrivedAt = -1;
-        for (let i = 0; i < 2600; i++) {
+        for (let i = 0; i < 1400; i++) {
             t.step(1);
             tallest = Math.max(tallest, t.world.readTransforms()[7 + 2]);
             if (arrivedAt < 0 && t.done()) arrivedAt = i;
         }
-        return { tallest, arrivedAt, left: t.distanceToEnd(), pose: t.pose(), index: t.index() };
+        return { tallest, arrivedAt, left: t.distanceToEnd(), pose: t.pose(), index: t.index(), maxSplit: t.maxSplit() };
     });
     expect(r.arrivedAt, 'the robot reached the last waypoint').toBeGreaterThan(0);
-    expect(r.arrivedAt).toBeLessThan(2400);
+    expect(r.arrivedAt).toBeLessThan(1200);
+    expect(r.maxSplit, 'the path asked for wheel speeds that differ by at least half').toBeGreaterThanOrEqual(0.5);
     expect(r.left).toBeLessThan(0.6);
     expect(r.tallest, 'the chassis stayed on the floor').toBeLessThan(0.2);
     const run = await runAndScrub(await freshCar(page, errors), 1000, [100, 333, 500, 777]);
@@ -121,14 +122,14 @@ for (const scene of ['arm', 'car'] as const) {
             t.step(8);
             const stayed = { end: w.recording.end === endBefore, hash: w.recording.hash.toString() === hashBefore, keyframes: w.recording.keyframes === keyframesBefore };
             w.pause(false);
-            t.step(t.scene === 'arm' ? 400 : 900);
+            t.step(t.scene === 'arm' ? 400 : 500);
             return { stayed, endBefore, endAfter: w.recording.end, left: metric(), leftAtSeek, counters: w.runtimeCounters };
         });
         expect(r.stayed).toEqual({ end: true, hash: true, keyframes: true });
         expect(r.endAfter).toBeGreaterThan(r.endBefore);
         // The arm settles on its target; the robot, restarted from tick 50 of its run, closes on the end of its path (it may not stop on it).
         if (scene === 'arm') expect(r.left).toBeLessThan(0.08);
-        else expect(r.left).toBeLessThan(r.leftAtSeek - 1.5);
+        else expect(r.left).toBeLessThan(r.leftAtSeek - 3);
         expect(r.counters).toMatchObject({ malformedDropped: 0, staleDropped: 0 });
         expect(errors).toEqual([]);
     });

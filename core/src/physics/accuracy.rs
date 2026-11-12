@@ -1,5 +1,5 @@
 //! The solver-accuracy targets of Phase 11, written as tests before the fixes. Each measures a case the earlier phases documented as a
-//! limit; the chain, door and sub-step tests pass and guard against regression. The two differential-drive tests are ignored: they fail today (Phase 11 exit not met) and run with `cargo test -- --ignored`.
+//! limit; the chain, door and sub-step tests pass and guard against regression. The differential-drive tests drive a wheeled chassis at wheel-speed splits up to 100 percent.
 
 use super::*;
 use crate::collision::{add, rotate, sub, V3};
@@ -80,23 +80,24 @@ fn robot(left: f32, right: f32) -> PhysicsWorld {
 }
 
 #[test]
-#[ignore = "known limit: a differential drive at speed still tumbles (see docs/robotics.md); the target for a later solver step"]
 fn a_differential_drive_with_a_fifty_percent_wheel_speed_split_stays_upright_and_turns_the_right_way() {
-    // The left wheel at y = +0.8 runs twice as fast as the right one, so the robot turns right (clockwise from above: negative yaw).
+    // The left wheel at y = +0.8 runs twice as fast as the right one, so the robot turns right (clockwise from above: negative yaw) on a circle
+    // of radius 0.8 * (6 + 3) / (6 - 3) = 2.4 m at 0.3 * 3 / 1.6 = 0.56 rad/s.
     let mut w = robot(6.0, 3.0);
-    let (mut tallest, mut yaw_rate_sum, mut samples) = (0.0f32, 0.0f32, 0);
+    let (mut tallest, mut yaw_rate_sum, mut samples, mut farthest) = (0.0f32, 0.0f32, 0, 0.0f32);
     for t in 0..900 {
         w.step();
         tallest = tallest.max(w.pos_z[1]);
+        farthest = farthest.max(w.pos_x[1].hypot(w.pos_y[1]));
         if t > 200 { yaw_rate_sum += w.ang_z[1]; samples += 1; }
     }
     assert!(tallest < 0.2, "the chassis stayed on the floor: {tallest}");
-    assert!(yaw_rate_sum / (samples as f32) < -0.1, "it turned right: mean yaw rate {}", yaw_rate_sum / samples as f32);
-    assert!(w.pos_x[1].is_finite() && w.pos_x[1] > 3.0, "and drove forward: x {}", w.pos_x[1]);
+    let mean = yaw_rate_sum / samples as f32;
+    assert!((mean + 0.56).abs() < 0.15, "it turned right at the rate the wheel speeds give: mean yaw rate {mean}");
+    assert!(farthest > 3.0 && farthest < 5.5, "and went round a circle about 2.4 m in radius: {farthest}");
 }
 
 #[test]
-#[ignore = "known limit: see the test above"]
 fn a_differential_drive_turning_in_place_does_not_tip_or_leave_the_floor() {
     let mut w = robot(3.0, -3.0);
     let mut tallest = 0.0f32;
@@ -279,4 +280,39 @@ fn the_first_joint_scales_cached_warm_start_impulses_to_the_sub_step_and_the_las
     for (e, b) in w.warm_cache.iter().zip(&before) {
         assert!((e.lambda - b).abs() < 1e-4 * b.abs().max(1.0));
     }
+}
+
+#[test]
+fn a_wheel_spinning_on_a_yawing_chassis_keeps_its_axle_aligned_with_the_chassis() {
+    let mut w = robot(3.0, -3.0);
+    let mut worst = 0.0f32;
+    for _ in 0..300 {
+        w.step();
+        let j = w.joint(0).unwrap().clone();
+        let (qa, qb) = ([w.qx[1], w.qy[1], w.qz[1], w.qw[1]], [w.qx[2], w.qy[2], w.qz[2], w.qw[2]]);
+        let (aa, ab) = (rotate(qa, j.axis_a), rotate(qb, j.axis_b));
+        let off = (1.0 - (aa[0] * ab[0] + aa[1] * ab[1] + aa[2] * ab[2])).max(0.0).sqrt();
+        assert!((aa[0] * ab[0] + aa[1] * ab[1] + aa[2] * ab[2]).is_finite(), "the axes went non-finite");
+        worst = worst.max(off);
+        assert!(w.ang_y[1].abs() < 5.0 && (w.ang_y[2] - w.ang_y[1]).abs() < 20.0);
+    }
+    assert!(w.ang_z[1] < -0.5, "the chassis was yawing: {}", w.ang_z[1]);
+    let j = w.joint(0).unwrap().clone();
+    let axis = rotate([w.qx[1], w.qy[1], w.qz[1], w.qw[1]], j.axis_a);
+    let rel = [w.ang_x[2] - w.ang_x[1], w.ang_y[2] - w.ang_y[1], w.ang_z[2] - w.ang_z[1]];
+    assert!((rel[0] * axis[0] + rel[1] * axis[1] + rel[2] * axis[2]).abs() > 2.0, "and the wheel was spinning about its axle");
+    assert!(worst < 0.01, "the wheel axis left the chassis axis by {worst} rad");
+}
+
+#[test]
+fn angular_velocity_turns_a_body_about_a_world_axis_whatever_its_orientation() {
+    // Yawed a quarter turn about z, the body's x axis points along world y. A turn about world x moves that axis towards z; a turn read in
+    // the body frame would be about world y and leave it where it is.
+    let quarter = std::f32::consts::FRAC_1_SQRT_2;
+    let mut q = [0.0, 0.0, quarter, quarter];
+    for _ in 0..60 { integrate_quaternion(&mut q, [1.0, 0.0, 0.0], 1.0 / 60.0); }
+    let x_axis = rotate(q, [1.0, 0.0, 0.0]);
+    assert!((x_axis[2] - 1.0f32.sin()).abs() < 0.01, "the body's x axis rose by {} (want {})", x_axis[2], 1.0f32.sin());
+    let y_axis = rotate(q, [0.0, 1.0, 0.0]);
+    assert!(y_axis[1].abs() < 0.9, "and its y axis (world -x) turned about world x only");
 }

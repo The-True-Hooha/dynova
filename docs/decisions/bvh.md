@@ -51,7 +51,7 @@ A scratch experiment by the reviewer of this decision (a bounding-sphere reject 
 
 - Terrain plus debris: contact generation under 20% of the figures above.
 - Mixed scale: contact generation within 2x of the pile of the same body count.
-- Pile, wall and pyramid: step time within noise of the figures above, golden hash `4599892428385582693` unchanged, and the pair set still equal to a brute-force search on random scenes, including scenes with wide dynamic bodies and many large statics.
+- Pile, wall and pyramid: step time within noise of the figures above, golden hash `2762124975456161600` unchanged, and the pair set still equal to a brute-force search on random scenes, including scenes with wide dynamic bodies and many large statics.
 
 ## Result of Step 23
 
@@ -73,7 +73,7 @@ Same scenes, same command, median rows (state about 20 ticks after the tick show
 | | 400 | 28.4 / 2.0 | 2.3 / 2.3 | 28 / 10.0 | 23 / 4.5 |
 | | 700 | 28.4 / 2.0 | 3.8 / 3.9 | 49 / 14.1 | 22 / 4.0 |
 
-Against the acceptance numbers: terrain contact generation is 8% to 11% of before (target under 20%); the mixed scene's contact generation (1.3 to 4.5 ms for 3000 bodies) is inside 2x of the 5000-body pile (2.1 to 8.6 ms; the pile has more bodies, so the comparison favours the pile, but it holds at every tick). The pile's step times, run three more times with the new code, span the old figures (2.5; 9.1 to 11.2; 15.8 to 26.9; 25 to 28.5 ms against 2.3; 9.0; 15.6; 24.8 ms): the change is not distinguishable from run-to-run spread there. The golden hash `4599892428385582693` is unchanged, and the pair set equals a brute-force search on 40 random scenes that include wide dynamic bodies, sleepers and about a dozen large statics each (no pair twice, and the contact's first body always awake); a separate test pins the distance check on 400 big statics. The remaining terrain cost is the narrow phase of 4 calls per body and the solver, not the broad phase.
+Against the acceptance numbers: terrain contact generation is 8% to 11% of before (target under 20%); the mixed scene's contact generation (1.3 to 4.5 ms for 3000 bodies) is inside 2x of the 5000-body pile (2.1 to 8.6 ms; the pile has more bodies, so the comparison favours the pile, but it holds at every tick). The pile's step times, run three more times with the new code, span the old figures (2.5; 9.1 to 11.2; 15.8 to 26.9; 25 to 28.5 ms against 2.3; 9.0; 15.6; 24.8 ms): the change is not distinguishable from run-to-run spread there. The golden hash `2762124975456161600` is unchanged, and the pair set equals a brute-force search on 40 random scenes that include wide dynamic bodies, sleepers and about a dozen large statics each (no pair twice, and the contact's first body always awake); a separate test pins the distance check on 400 big statics. The remaining terrain cost is the narrow phase of 4 calls per body and the solver, not the broad phase.
 
 ## Revisit the BVH when
 

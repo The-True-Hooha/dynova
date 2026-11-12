@@ -946,14 +946,16 @@ fn damp_per_step(factor: f32, k: u32) -> f32 {
     f
 }
 
+/// `w` is the angular velocity in the world frame, so the step is `w * q`; `q * w` would read it in the body frame and turn a spinning, yawed
+/// body about the wrong axis.
 fn integrate_quaternion(q: &mut [f32; 4], w: [f32; 3], dt: f32) {
     let [qx, qy, qz, qw] = *q;
     let [wx, wy, wz] = w;
     let h = dt * 0.5;
     let dqw = -h * (wx * qx + wy * qy + wz * qz);
-    let dqx =  h * (wx * qw + wz * qy - wy * qz);
-    let dqy =  h * (wy * qw - wz * qx + wx * qz);
-    let dqz =  h * (wz * qw + wy * qx - wx * qy);
+    let dqx =  h * (wx * qw + wy * qz - wz * qy);
+    let dqy =  h * (wy * qw + wz * qx - wx * qz);
+    let dqz =  h * (wz * qw + wx * qy - wy * qx);
     let n = [qx + dqx, qy + dqy, qz + dqz, qw + dqw];
     let inv_len = (n[0]*n[0] + n[1]*n[1] + n[2]*n[2] + n[3]*n[3]).sqrt().recip();
     *q = [n[0] * inv_len, n[1] * inv_len, n[2] * inv_len, n[3] * inv_len];

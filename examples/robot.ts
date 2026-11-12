@@ -17,9 +17,9 @@ const LINK_HALF_THICKNESS = 0.03;
 const ARM_GAINS = { kp: 8, kd: 0.2, maxSpeed: 3, maxForce: 400 };
 // A gentle arc: in the scenes tried, a differential drive stayed upright and on course only while the two wheel speeds stayed close, which
 // means a turning radius of several metres.
-const CAR_PATH: V2[] = [[2, 0.1], [4, 0.4], [6, 0.95], [8, 1.7], [10, 2.7]];
-// A slow robot on a gentle arc: at higher speeds the wheel and floor contacts still make the chassis tumble (docs/robotics.md).
-const CAR: PursuitOptions = { lookahead: 1.4, maxSpeed: 0.3, maxTurn: 0.05, arrive: 0.5, trackHalfWidth: 0.8, wheelRadius: 0.3 };
+const CAR_PATH: V2[] = [[1.5, 0], [3, 0.8], [4, 2.2], [5.5, 3.4], [7.5, 3.6], [9, 2.4], [10.5, 0.8]];
+// The tight bends make the pursuit ask for wheel speeds that differ by half or more.
+const CAR: PursuitOptions = { lookahead: 1.2, maxSpeed: 0.7, maxTurn: 0.4, arrive: 0.5, trackHalfWidth: 0.8, wheelRadius: 0.3 };
 const WHEEL_TORQUE = 15;
 const WHEEL_OFFSET = 0.8;
 
@@ -111,6 +111,7 @@ async function run() {
         }
         let index = 0;
         let done = false;
+        let maxSplit = 0;
         for (const [i, p] of CAR_PATH.entries()) add(world.spawn({ x: p[0], y: p[1], z: -0.4, shape: SHAPE_SPHERE, hx: 0.1, invMass: 0 }), [0.2, 0.2], i === CAR_PATH.length - 1 ? '#ff5577' : '#7fe0a0', 'circle');
         const pose = (): Pose => {
             const t = world.readTransforms();
@@ -128,11 +129,14 @@ async function run() {
             done = r.done;
             world.setJointMotor(wheels[0], r.left, WHEEL_TORQUE);
             world.setJointMotor(wheels[1], r.right, WHEEL_TORQUE);
+            const fast = Math.max(Math.abs(r.left), Math.abs(r.right));
+            if (!r.done && fast > 0) maxSplit = Math.max(maxSplit, Math.abs(r.left - r.right) / fast);
         });
         Object.assign(api, {
             pose,
             path: CAR_PATH,
             done: () => done,
+            maxSplit: () => maxSplit,
             index: () => index,
             distanceToEnd: () => { const p = pose(); const e = CAR_PATH[CAR_PATH.length - 1]; return Math.hypot(e[0] - p.x, e[1] - p.y); },
         });

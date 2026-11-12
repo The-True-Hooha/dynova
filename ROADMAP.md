@@ -162,10 +162,10 @@ Not a build phase, a setup checklist. Do this before Stage 1A, not during.
 
 ## Phase 11 — Solver accuracy (added 2026-11-11 with the user's approval)
 Goal: remove the solver limits found while building Phases 6 to 9 (heavy end masses pulling long chains apart, a 2 m hinged door sagging, wheeled robots skidding and tipping, out-of-plane tilt of hinge chains). Each step starts with tests that fail today and ends with every pin re-derived on native aarch64, native x86_64, Chromium and WebKit.
-- **11A** Per-body inertia tensors (principal moments applied in world space) instead of one scalar.
-- **11B (done first, since a spike showed tensors do not address the chain)** Sub-stepping or more solver passes, measured against step time at 1k, 5k and 10k bodies.
-- **11C** Better joint position correction than Baumgarte.
-- **11D (only if 11A to 11C fall short)** joint-aware friction ordering; then a direct solve for joint chains (articulated bodies), which is a separate large project.
+- **11A (not needed; a spike did not help the robot)** Per-body inertia tensors (principal moments applied in world space) instead of one scalar.
+- **11B (done)** Sub-stepping for jointed worlds, and a fix to the orientation step, which read world angular velocity in the body frame (the cause of the wheeled-robot tumble). Measured against step time at 1k and 5k bodies.
+- **11C (not needed)** Better joint position correction than Baumgarte.
+- **11D (not needed)** joint-aware friction ordering; then a direct solve for joint chains (articulated bodies), which is a separate large project.
 - **Exit:** a 10-link chain with a 50x end mass stays within 5 cm, a 2 m hinged door sags under 1 cm, the demo robot follows a path needing a 50 percent wheel-speed split without tipping, and the 5000-entity frame budget and every determinism pin hold.
 
 ---
