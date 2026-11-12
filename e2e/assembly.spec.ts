@@ -30,7 +30,7 @@ const sweep = (page: Page) => page.evaluate(() => {
 });
 
 // Pinned: the same run gives this hash in Chromium and WebKit.
-const ASSEMBLY_HASH = '1833353223114864011';
+const ASSEMBLY_HASH = '7198925136173128096';
 
 test('the crank-slider assembly moves through its range and returns to where it started, with the rod holding its length', async ({ page }) => {
     const errors = await open(page, 'offset=0');

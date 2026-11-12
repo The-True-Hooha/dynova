@@ -35,7 +35,7 @@ test('a 700-tick mixed scene (all four shapes, sleeping, forces, teleport, respa
 });
 
 // Pinned from core/src/determinism.rs `JOINT_PINNED_END` and `JOINT_PINNED_MIDDLE`.
-const HOST_JOINT_SCENE = ['13038881072997060142', '14824474706370248773', '14824474706370248773', '13038881072997060142'];
+const HOST_JOINT_SCENE = ['13978249971055882505', '309544726468439355', '309544726468439355', '13978249971055882505'];
 
 test('a 1230-tick joint scene (chain, limited door, motor wheel and slider, weld, joint and body destroy) and its seek round trip match the native build in this browser', async ({ page }) => {
     await page.goto('/determinism.html');
@@ -46,7 +46,7 @@ test('a 1230-tick joint scene (chain, limited door, motor wheel and slider, weld
 });
 
 // Pinned from core/src/determinism.rs `KIN_PINNED_END` and `KIN_PINNED_MIDDLE`.
-const HOST_KINEMATIC_SCENE = ['10229795484569577333', '15080968555229436244', '15080968555229436244', '10229795484569577333'];
+const HOST_KINEMATIC_SCENE = ['1104800618632004284', '6926923596733983700', '6926923596733983700', '1104800618632004284'];
 
 test('a 700-tick kinematic scene (platform, wall and joint anchor fed by samples, rejected samples) and its seek round trip match the native build in this browser', async ({ page }) => {
     await page.goto('/determinism.html');

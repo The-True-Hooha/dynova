@@ -35,8 +35,8 @@ const runAndScrub = (page: Page, ticks: number, scrubs: number[]) => page.evalua
 }, { ticks, scrubs });
 
 // Pinned: the same run gives this hash in Chromium and WebKit, which is the cross-engine check for the controller loop.
-const ARM_HASH = '4558083059200603469';
-const CAR_HASH = '6492401232290832991';
+const ARM_HASH = '2826087665793585159';
+const CAR_HASH = '14230732875360184978';
 
 test('a 3-joint arm reaches its target, holds it, and reaches a second one, with an exact scrub of the recorded motor commands', async ({ page }) => {
     const errors = await open(page, 'scene=arm');

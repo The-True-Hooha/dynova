@@ -108,6 +108,9 @@ struct Spec {
     linear: bool,
     slot: u8,
     target: f32,
+    /// The part of `target` that corrects position, for the angular rows that hold orientation (not limits). The velocity solve aims at `target - corr`; the correction is solved
+    /// apart, into pseudo-velocities that move positions and are then discarded, so it never feeds energy into the real velocities.
+    corr: f32,
     lo: f32,
     hi: f32,
 }
@@ -115,17 +118,30 @@ struct Spec {
 #[derive(Clone, Copy)]
 pub(super) struct Prepared {
     specs: [Spec; MAX_SPECS],
+    /// Accumulated pseudo impulse of each row, per step.
+    pseudo: [f32; MAX_SPECS],
     n: usize,
 }
 
 impl Prepared {
+    #[cfg(test)]
+    pub(super) fn dir(&self, row: usize) -> V3 {
+        self.specs[row].dir
+    }
+
     fn push(&mut self, s: Spec) {
         self.specs[self.n] = s;
         self.n += 1;
     }
 }
 
-const EMPTY_SPEC: Spec = Spec { dir: [0.0; 3], ra: [0.0; 3], rb: [0.0; 3], linear: false, slot: 0, target: 0.0, lo: 0.0, hi: 0.0 };
+const EMPTY_SPEC: Spec = Spec { dir: [0.0; 3], ra: [0.0; 3], rb: [0.0; 3], linear: false, slot: 0, target: 0.0, corr: 0.0, lo: 0.0, hi: 0.0 };
+
+/// A limit row keeps its correction in the velocity, linear or angular. Moved into a pseudo-velocity, a hinge turned back about its body's
+/// centre instead of its pivot, opened the anchor, and the anchor rows then threw it past the other stop.
+fn limit_row(s: Spec, _gap: f32) -> Spec {
+    Spec { corr: 0.0, ..s }
+}
 
 fn qmul(a: Quat, b: Quat) -> Quat {
     [
@@ -307,30 +323,35 @@ impl PhysicsWorld {
         Some((-dot(err, aa), dot(rate, aa)))
     }
 
-    pub(super) fn prepare_joints(&mut self) {
+    pub(super) fn prepare_joints(&mut self, k: u32) {
         let dt = self.dt;
         let mut prep = std::mem::take(&mut self.joint_prep);
         prep.clear();
         let mut joints = std::mem::take(&mut self.joints);
         for j in &mut joints {
-            prep.push(self.prepare_joint(j, dt));
+            prep.push(self.prepare_joint(j, dt, k));
         }
         self.joints = joints;
         self.joint_prep = prep;
     }
 
-    fn prepare_joint(&self, j: &mut Joint, dt: f32) -> Prepared {
+    fn prepare_joint(&self, j: &mut Joint, dt: f32, steps: u32) -> Prepared {
         let (a, b) = (j.a as usize, j.b as usize);
         let (qa, qb) = (self.body_quat(a), self.body_quat(b));
         let (ra, rb) = (rotate(qa, j.la), rotate(qb, j.lb));
         let err = sub(add(self.body_pos(a), ra), add(self.body_pos(b), rb));
-        let k = JOINT_BIAS / dt;
+        let k = super::bias_per_step(JOINT_BIAS, steps) / dt;
         let bias = |e: f32| (k * e).clamp(-MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL);
         let aa = rotate(qa, j.axis_a);
-        let mut p = Prepared { specs: [EMPTY_SPEC; MAX_SPECS], n: 0 };
+        let mut p = Prepared { specs: [EMPTY_SPEC; MAX_SPECS], pseudo: [0.0; MAX_SPECS], n: 0 };
         let free = (f32::NEG_INFINITY, f32::INFINITY);
-        let lin = |dir: V3, slot: usize, target: f32| Spec { dir, ra, rb, linear: true, slot: slot as u8, target, lo: free.0, hi: free.1 };
-        let ang = |dir: V3, slot: usize, target: f32| Spec { dir, ra, rb, linear: false, slot: slot as u8, target, lo: free.0, hi: free.1 };
+        // An angular row's whole target is a position correction, solved apart (see `Spec::corr`). A linear row keeps its correction in the
+        // velocity: measured on a hinge chain, correcting the axis error that way fed energy back through the links and tilted them out of
+        // plane within a few hundred ticks, while the same correction on the anchor points did not. The motor and a limit's approach speed
+        // are real velocities.
+        let lin = |dir: V3, slot: usize, target: f32| Spec { dir, ra, rb, linear: true, slot: slot as u8, target, corr: 0.0, lo: free.0, hi: free.1 };
+        let ang = |dir: V3, slot: usize, target: f32| Spec { dir, ra, rb, linear: false, slot: slot as u8, target, corr: target, lo: free.0, hi: free.1 };
+        let real = |s: Spec| Spec { corr: 0.0, ..s };
         let axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
         if j.kind == JOINT_DISTANCE {
@@ -340,14 +361,17 @@ impl PhysicsWorld {
             let coord = dist - j.len;
             if let Some((lo, hi)) = j.limits {
                 let target = |gap: f32| if gap >= 0.0 { -gap / dt } else { -bias(gap) };
-                p.push(Spec { lo: 0.0, hi: f32::INFINITY, ..lin(dir, SLOT_LOWER, target(coord - lo)) });
-                p.push(Spec { lo: 0.0, hi: f32::INFINITY, ..lin(neg(dir), SLOT_UPPER, target(hi - coord)) });
+                p.push(Spec { lo: 0.0, hi: f32::INFINITY, ..limit_row(lin(dir, SLOT_LOWER, target(coord - lo)), coord - lo) });
+                p.push(Spec { lo: 0.0, hi: f32::INFINITY, ..limit_row(lin(neg(dir), SLOT_UPPER, target(hi - coord)), hi - coord) });
             } else {
                 p.push(lin(dir, SLOT_POINT, -bias(coord)));
             }
             return p;
         }
-        let (p1, p2) = basis_perp(aa);
+        // Fixed in body a, so the rows turn smoothly with it; a basis rebuilt from the world axis jumps when the axis crosses a component
+        // threshold, and the warm-started impulses are stored per row.
+        let p1 = rotate(qa, j.ref_a);
+        let p2 = cross(aa, p1);
         if j.kind == JOINT_SLIDER {
             p.push(lin(p1, SLOT_POINT, -bias(dot(err, p1))));
             p.push(lin(p2, SLOT_POINT + 1, -bias(dot(err, p2))));
@@ -383,7 +407,7 @@ impl PhysicsWorld {
             };
             let make = |slot: usize, dir: V3, target: f32, lo: f32, hi: f32| {
                 let s = if j.kind == JOINT_HINGE { ang(dir, slot, target) } else { lin(dir, slot, target) };
-                Spec { lo, hi, ..s }
+                Spec { lo, hi, ..real(s) }
             };
             if j.motor_max > 0.0 {
                 let cap = j.motor_max * dt;
@@ -395,8 +419,8 @@ impl PhysicsWorld {
             // stops on the bound instead of overshooting it and being pushed back with Baumgarte energy.
             if let Some((lo, hi)) = j.limits {
                 let target = |gap: f32| if gap >= 0.0 { -gap / dt } else { -bias(gap) };
-                p.push(make(SLOT_LOWER, dir, target(coord - lo), 0.0, f32::INFINITY));
-                p.push(make(SLOT_UPPER, neg(dir), target(hi - coord), 0.0, f32::INFINITY));
+                p.push(limit_row(make(SLOT_LOWER, dir, target(coord - lo), 0.0, f32::INFINITY), coord - lo));
+                p.push(limit_row(make(SLOT_UPPER, neg(dir), target(hi - coord), 0.0, f32::INFINITY), hi - coord));
             } else {
                 j.acc[SLOT_LOWER] = 0.0;
                 j.acc[SLOT_UPPER] = 0.0;
@@ -461,7 +485,7 @@ pub(super) fn solve_joints(joints: &mut [Joint], prep: &[Prepared], inv_mass: &[
             let denom = spec_inv_mass(s, a, b, inv_mass, inv_i);
             if denom < 1e-10 { continue; }
             let acc = &mut j.acc[s.slot as usize];
-            let want = *acc + (s.target - spec_velocity(s, a, b, m)) / denom;
+            let want = *acc + (s.target - s.corr - spec_velocity(s, a, b, m)) / denom;
             let new = want.max(s.lo).min(s.hi);
             spec_apply(s, a, b, new - *acc, inv_mass, inv_i, m);
             residual = worst(residual, ((new - *acc) * denom).abs());
@@ -469,6 +493,23 @@ pub(super) fn solve_joints(joints: &mut [Joint], prep: &[Prepared], inv_mass: &[
         }
     }
     residual
+}
+
+/// One sweep of the position corrections alone, into pseudo-velocities.
+pub(super) fn solve_joint_corrections(prep: &mut [Prepared], joints: &[Joint], inv_mass: &[f32], inv_i: &[f32], m: &mut Motion) {
+    for (j, p) in joints.iter().zip(prep) {
+        let (a, b) = (j.a as usize, j.b as usize);
+        if inv_mass[a] == 0.0 && inv_mass[b] == 0.0 { continue; }
+        for (row, s) in p.specs[..p.n].iter().enumerate() {
+            if s.corr == 0.0 { continue; }
+            let denom = spec_inv_mass(s, a, b, inv_mass, inv_i);
+            if denom < 1e-10 { continue; }
+            let acc = &mut p.pseudo[row];
+            let new = (*acc + (s.corr - spec_velocity(s, a, b, m)) / denom).max(s.lo).min(s.hi);
+            spec_apply(s, a, b, new - *acc, inv_mass, inv_i, m);
+            *acc = new;
+        }
+    }
 }
 
 #[cfg(test)]

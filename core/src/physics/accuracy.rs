@@ -316,3 +316,329 @@ fn angular_velocity_turns_a_body_about_a_world_axis_whatever_its_orientation() {
     let y_axis = rotate(q, [0.0, 1.0, 0.0]);
     assert!(y_axis[1].abs() < 0.9, "and its y axis (world -x) turned about world x only");
 }
+
+fn hinge_rows_after_turning_the_anchor_body(angle: f32) -> [V3; 2] {
+    let mut w = world(2);
+    w.spawn(0, &BodyDesc::box_at([0.0, 0.0, 0.0], [0.1; 3], 0.0, 0.0));
+    w.spawn(1, &BodyDesc::box_at([1.0, 0.0, 0.0], [0.5, 0.1, 0.1], 1.0, 0.0));
+    let axis = [0.5705, 0.8, 0.19];
+    let d = JointDesc { kind: JOINT_HINGE, a: 0, b: 1, anchor: [0.0; 3], axis, limits: None, motor_vel: 0.0, motor_max: 0.0 };
+    assert!(w.create_joint(0, &d));
+    // The turn about z carries the world axis' x component across 0.57, where a basis rebuilt from the axis switches reference vectors.
+    w.qz[0] = (angle * 0.5).sin();
+    w.qw[0] = (angle * 0.5).cos();
+    w.prepare_joints(1);
+    [w.joint_prep[0].dir(3), w.joint_prep[0].dir(4)]
+}
+
+#[test]
+fn the_hinge_rows_turn_smoothly_when_the_axis_crosses_the_basis_threshold() {
+    let before = hinge_rows_after_turning_the_anchor_body(-0.002);
+    let after = hinge_rows_after_turning_the_anchor_body(0.002);
+    for (b, a) in before.iter().zip(&after) {
+        let d = sub(*a, *b);
+        let jump = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        assert!(jump < 0.01, "a row jumped by {jump} for a 0.004 rad turn");
+    }
+}
+
+fn two_overlapping_boxes(joined: bool) -> PhysicsWorld {
+    let mut w = world(2);
+    w.gy = 0.0;
+    w.spawn(0, &BodyDesc::box_at([0.0, 0.0, 0.0], [0.5; 3], 1.0, 0.0));
+    w.spawn(1, &BodyDesc::box_at([0.8, 0.0, 0.0], [0.5; 3], 1.0, 0.0));
+    if joined {
+        assert!(w.create_joint(0, &ball(0, 1, [0.4, 0.0, 0.0])));
+    }
+    w
+}
+
+#[test]
+fn two_bodies_held_by_a_joint_make_no_contact_with_each_other_but_unjoined_ones_do() {
+    let mut free = two_overlapping_boxes(false);
+    free.step();
+    assert!(!free.contacts.is_empty(), "control: overlapping boxes with no joint must collide");
+    let mut joined = two_overlapping_boxes(true);
+    joined.step();
+    assert!(joined.contacts.is_empty(), "{} contacts between jointed bodies", joined.contacts.len());
+}
+
+#[test]
+fn a_third_body_still_collides_with_both_ends_of_a_joint() {
+    let mut w = two_overlapping_boxes(true);
+    w.resize(3);
+    w.spawn(2, &BodyDesc::box_at([0.4, 0.0, 0.9], [0.5; 3], 1.0, 0.0));
+    w.step();
+    let hit = |id: u32| w.contacts.iter().any(|c| c.a.min(c.b) == id.min(2) && c.a.max(c.b) == id.max(2));
+    assert!(hit(0) && hit(1), "the third body must touch both jointed bodies");
+}
+
+fn ball_leaving_the_floor() -> PhysicsWorld {
+    let mut w = world(4);
+    w.gy = 0.0;
+    w.spawn(0, &BodyDesc::box_at([0.0, -0.5, 0.0], [10.0, 0.5, 10.0], 0.0, 0.0));
+    w.spawn(1, &BodyDesc::sphere_at([0.0, 0.4, 0.0], 0.5, 1.0, 0.0));
+    w.vel_y[1] = 20.0;
+    w
+}
+
+#[test]
+fn a_body_that_touched_in_any_sub_step_is_touching_and_penetrating_for_the_tick() {
+    let mut once = ball_leaving_the_floor();
+    once.step();
+    assert!(once.touching[1] && once.penetrating[1], "control: a single step sees the deep overlap at its start");
+    // Only the first of the four sub-steps starts with the ball deep in the floor; it has flown clear by the third.
+    let mut four = with_a_far_off_joint(ball_leaving_the_floor());
+    four.step();
+    assert!(four.touching[1], "touching must cover every sub-step, not only the last");
+    assert!(four.penetrating[1], "penetrating must cover every sub-step, not only the last");
+}
+
+#[test]
+fn the_per_step_bias_compounds_to_the_per_tick_fraction() {
+    assert!((bias_per_step(0.2, 1) - 0.2).abs() < 1e-6);
+    for k in [2u32, 4, 8] {
+        let kept = (1.0 - bias_per_step(0.2, k)).powi(k as i32);
+        assert!((kept - 0.8).abs() < 1e-5, "k={k}: {kept} of the error is left, want 0.8");
+    }
+}
+
+fn sunk_ball() -> PhysicsWorld {
+    let mut w = world(4);
+    w.gy = 0.0;
+    w.spawn(0, &BodyDesc::box_at([0.0, -0.5, 0.0], [10.0, 0.5, 10.0], 0.0, 0.0));
+    w.spawn(1, &BodyDesc::sphere_at([0.0, 0.4, 0.0], 0.5, 1.0, 0.0));
+    w
+}
+
+#[test]
+fn a_sunken_body_is_pushed_out_by_the_same_amount_per_tick_with_or_without_sub_steps() {
+    let rise = |mut w: PhysicsWorld| { w.step(); w.pos_y[1] - 0.4 };
+    let (once, four) = (rise(sunk_ball()), rise(with_a_far_off_joint(sunk_ball())));
+    assert!(once > 0.0, "control: the ball must rise");
+    assert!((four / once - 1.0).abs() < 0.25, "one step rose {once}, four sub-steps {four}");
+}
+
+#[test]
+fn a_joint_pulls_an_anchor_gap_closed_by_the_same_fraction_per_tick_whatever_the_sub_steps() {
+    let mut w = world(2);
+    w.gy = 0.0;
+    w.spawn(0, &BodyDesc::box_at([0.0, 0.0, 0.0], [0.1; 3], 0.0, 0.0));
+    w.spawn(1, &BodyDesc::sphere_at([1.0, 0.0, 0.0], 0.2, 1.0, 0.0));
+    assert!(w.create_joint(0, &ball(0, 1, [1.0, 0.0, 0.0])));
+    w.pos_x[1] = 1.1;
+    w.step();
+    let left = gap(&w, &w.joints[0]) / 0.1;
+    assert!((0.7..0.9).contains(&left), "{left} of the gap is left after one tick, want about 0.8");
+}
+
+fn off_plane_chain(links: usize, zoff: f32) -> PhysicsWorld {
+    let mut w = world(links + 1);
+    w.spawn(0, &BodyDesc::box_at([0.0, 20.0, 0.0], [0.1; 3], 0.0, 0.0));
+    for i in 1..=links {
+        w.spawn(i, &BodyDesc::box_at([i as f32 - 0.5, 20.0, 0.0], [0.45, 0.05, 0.1], 1.0, 0.0));
+        let d = JointDesc { kind: JOINT_HINGE, a: i as u32 - 1, b: i as u32, anchor: [i as f32 - 1.0, 20.0, zoff], axis: [0.0, 0.0, 1.0], limits: None, motor_vel: 0.0, motor_max: 0.0 };
+        assert!(w.create_joint(i as u32 - 1, &d));
+    }
+    w
+}
+
+fn tilt_of(w: &PhysicsWorld, id: usize) -> f32 {
+    let z = rotate([w.qx[id], w.qy[id], w.qz[id], w.qw[id]], [0.0, 0.0, 1.0]);
+    (z[0] * z[0] + z[1] * z[1]).sqrt()
+}
+
+#[test]
+fn an_eight_link_hinge_chain_with_anchors_off_its_plane_stays_planar_and_connected() {
+    for zoff in [0.0f32, 0.3, 1.0] {
+        let mut w = off_plane_chain(8, zoff);
+        w.ang_x[3] = 0.05;
+        let (mut tilt, mut apart) = (0.0f32, 0.0f32);
+        for _ in 0..1200 {
+            w.step();
+            for i in 1..=8 { tilt = tilt.max(tilt_of(&w, i)); }
+            for j in &w.joints { apart = apart.max(gap(&w, j)); }
+        }
+        assert!(tilt < 0.05, "anchors {zoff} m off the plane: a link tilted out of it by {tilt}");
+        assert!(apart < 0.03, "anchors {zoff} m off the plane: a joint came apart by {apart}");
+    }
+}
+
+fn glided_pendulum(ticks: u16, dx: f32) -> (f32, f32) {
+    let mut w = world(3);
+    w.spawn(0, &BodyDesc::box_at([12.0, 8.0, -8.0], [0.25; 3], 0.0, 0.0));
+    w.spawn(1, &BodyDesc::sphere_at([12.0, 7.1, -8.0], 0.3, 1.0, 0.0));
+    assert!(w.create_joint(0, &ball(0, 1, [12.0, 8.0, -8.0])));
+    assert!(w.set_kinematic_target(0, ticks, [12.0 + dx, 8.0, -8.0]));
+    let (mut worst, mut top) = (0.0f32, 0.0f32);
+    for _ in 0..400 {
+        w.step();
+        worst = worst.max(gap(&w, &w.joints[0]));
+        top = top.max(w.pos_y[1] - w.pos_y[0]);
+    }
+    (worst, top)
+}
+
+#[test]
+fn a_light_bob_swung_over_a_gliding_anchor_keeps_its_joint_within_five_centimetres() {
+    // A 0.3 m sphere on a 0.9 m lever, the anchor gliding 1 to 8 m in 5 to 100 ticks (up to 16 m/s); the bob swings up to the anchor's height.
+    for (ticks, dx) in [(100u16, -8.0f32), (40, -8.0), (30, -8.0), (15, -4.0), (10, -2.0), (5, -1.0), (60, 8.0), (30, 4.0)] {
+        let (worst, rose) = glided_pendulum(ticks, dx);
+        assert!(rose > 0.5 || ticks == 100, "control: the {dx} m glide in {ticks} ticks must swing the bob up (rose {rose})");
+        assert!(worst < 0.05, "{dx} m in {ticks} ticks stretched the joint by {worst}");
+    }
+}
+
+fn field_of_spheres(n: usize) -> PhysicsWorld {
+    let mut w = world(n + 2);
+    w.spawn(n, &BodyDesc::box_at([0.0, -0.5, 0.0], [500.0, 0.5, 500.0], 0.0, 0.0));
+    let side = (n as f32).sqrt().ceil() as usize;
+    for i in 0..n {
+        let (x, z) = ((i % side) as f32 * 1.2, (i / side) as f32 * 1.2);
+        w.spawn(i, &BodyDesc::sphere_at([x, 0.5, z], 0.5, 1.0, 0.0));
+    }
+    w
+}
+
+#[test]
+#[ignore = "timing; run with the release overrides and --nocapture"]
+fn jointed_step_cost_report() {
+    for n in [1000usize, 5000] {
+        for jointed in [false, true] {
+            for (label, y0) in [("falling", 60.0f32), ("resting", 0.5)] {
+                let mut w = field_of_spheres(n + 2);
+                for (i, y) in w.pos_y.iter_mut().enumerate().take(n) { *y = y0 + (i % 7) as f32 * 3.0; }
+                if jointed {
+                    let (a, b) = (n, n + 1);
+                    w.spawn(a, &BodyDesc::box_at([900.0, 5.0, 900.0], [0.25; 3], 0.0, 0.0));
+                    w.spawn(b, &BodyDesc::sphere_at([901.0, 5.0, 900.0], 0.2, 1.0, 0.0));
+                    assert!(w.create_joint(0, &ball(a as u32, b as u32, [900.5, 5.0, 900.0])));
+                }
+                let t = std::time::Instant::now();
+                for _ in 0..30 { w.step(); }
+                eprintln!("{n} {label} jointed={jointed}: {:.2} ms/step, asleep {}", t.elapsed().as_secs_f64() * 1000.0 / 30.0, w.sleeping.iter().filter(|s| **s).count());
+            }
+        }
+    }
+}
+
+fn scattered_with_a_fast_ball(candidate_cache: bool) -> PhysicsWorld {
+    let mut w = with_a_far_off_joint(world(40));
+    w.candidate_cache = candidate_cache;
+    w.spawn(0, &BodyDesc::box_at([0.0, -0.5, 0.0], [30.0, 0.5, 30.0], 0.0, 0.1));
+    w.gy = -9.81;
+    for i in 1..30usize {
+        let (x, z) = ((i % 6) as f32 * 1.1 - 3.0, (i / 6) as f32 * 1.1 - 3.0);
+        w.spawn(i, &BodyDesc::sphere_at([x, 0.5 + (i % 4) as f32 * 0.3, z], 0.5, 1.0, 0.1));
+    }
+    w.spawn(30, &BodyDesc::sphere_at([-12.0, 0.6, 0.0], 0.5, 1.0, 0.1));
+    w.vel_x[30] = 40.0;
+    w
+}
+
+#[test]
+fn reusing_the_broad_phase_across_sub_steps_matches_a_fresh_one_in_a_scene_with_fast_and_resting_bodies() {
+    let (mut cached, mut fresh) = (scattered_with_a_fast_ball(true), scattered_with_a_fast_ball(false));
+    for tick in 0..240 {
+        cached.step();
+        fresh.step();
+        for i in 0..40 {
+            assert_eq!(
+                (cached.pos_x[i], cached.pos_y[i], cached.pos_z[i], cached.vel_x[i]),
+                (fresh.pos_x[i], fresh.pos_y[i], fresh.pos_z[i], fresh.vel_x[i]),
+                "body {i} differs at tick {tick}"
+            );
+        }
+    }
+    assert!(cached.pos_x[1] > -5.0 && fresh.vel_x[30].abs() < 40.0, "control: the fast ball must have hit the field");
+}
+
+#[test]
+fn a_calm_world_finds_its_candidate_pairs_once_per_tick_and_a_fast_one_more_often() {
+    let mut calm = with_a_far_off_joint(field_of_spheres(60));
+    for _ in 0..200 { calm.step(); }
+    let before = calm.grid_builds;
+    for _ in 0..10 { calm.step(); }
+    assert_eq!(calm.grid_builds - before, 10, "a resting field should build the grid once a tick, not once a sub-step");
+    let mut fast = with_a_far_off_joint(field_of_spheres(60));
+    fast.vel_y[5] = 60.0;
+    let before = fast.grid_builds;
+    fast.step();
+    assert!(fast.grid_builds - before > 1, "a body moving 15 m per sub-step must outrun the candidates");
+}
+
+#[test]
+fn a_fast_body_reaches_a_target_that_was_outside_the_candidate_margin_when_the_tick_began() {
+    let build = |candidate_cache: bool| {
+        let mut w = with_a_far_off_joint(world(8));
+        w.candidate_cache = candidate_cache;
+        w.spawn(0, &BodyDesc::sphere_at([0.0, 0.0, 0.0], 0.5, 1.0, 0.0));
+        w.spawn(1, &BodyDesc::sphere_at([-1.3, 0.0, 0.0], 0.5, 1.0, 0.0));
+        w.vel_x[1] = 36.0;
+        w
+    };
+    let (mut cached, mut fresh) = (build(true), build(false));
+    for _ in 0..3 { cached.step(); fresh.step(); }
+    assert!(fresh.vel_x[0] > 1.0, "control: the target was hit");
+    assert_eq!((cached.pos_x[0], cached.vel_x[0], cached.vel_x[1]), (fresh.pos_x[0], fresh.vel_x[0], fresh.vel_x[1]));
+}
+
+#[test]
+fn bodies_joined_by_a_rod_still_collide_with_each_other() {
+    let boxes = |inv_mass_a: f32, rod: bool| {
+        let mut w = world(2);
+        w.gy = 0.0;
+        w.spawn(0, &BodyDesc::box_at([0.0, 0.0, 0.0], [0.5; 3], inv_mass_a, 0.0));
+        w.spawn(1, &BodyDesc::box_at([0.8, 0.0, 0.0], [0.5; 3], 1.0, 0.0));
+        let d = if rod {
+            JointDesc { kind: JOINT_DISTANCE, a: 0, b: 1, anchor: [0.0; 3], axis: [0.8, 0.0, 0.0], limits: None, motor_vel: 0.0, motor_max: 0.0 }
+        } else {
+            ball(0, 1, [0.4, 0.0, 0.0])
+        };
+        assert!(w.create_joint(0, &d));
+        w.step();
+        w
+    };
+    assert!(!boxes(1.0, true).contacts.is_empty(), "a rod does not stop its two bodies colliding");
+    assert!(boxes(1.0, false).contacts.is_empty(), "control: a ball joint does");
+}
+
+fn hinge_about_z(limits: Option<(f32, f32)>) -> PhysicsWorld {
+    let mut w = world(2);
+    w.gy = 0.0;
+    w.spawn(0, &BodyDesc::box_at([0.0, 0.0, 0.0], [0.1; 3], 0.0, 0.0));
+    w.spawn(1, &BodyDesc::box_at([1.0, 0.0, 0.0], [0.5, 0.1, 0.1], 1.0, 0.0));
+    let d = JointDesc { kind: JOINT_HINGE, a: 0, b: 1, anchor: [0.0; 3], axis: [0.0, 0.0, 1.0], limits, motor_vel: 0.0, motor_max: 0.0 };
+    assert!(w.create_joint(0, &d));
+    w
+}
+
+#[test]
+fn a_hinge_pulls_a_misaligned_axis_back_without_sleeping_misaligned() {
+    let mut w = hinge_about_z(None);
+    // Tip the body 0.1 rad about x, about the anchor, so the hinge axis and the anchor both stay consistent with a rotation of b alone.
+    let h = 0.05f32;
+    w.qx[1] = h.sin();
+    w.qw[1] = h.cos();
+    let off = |w: &PhysicsWorld| {
+        let b = rotate([w.qx[1], w.qy[1], w.qz[1], w.qw[1]], [0.0, 0.0, 1.0]);
+        (b[0] * b[0] + b[1] * b[1]).sqrt()
+    };
+    assert!(off(&w) > 0.09, "control: the axis starts tipped");
+    for _ in 0..180 { w.step(); }
+    assert!(off(&w) < 0.01, "the axis stayed {} rad off", off(&w));
+}
+
+#[test]
+fn a_hinge_driven_past_its_limit_is_brought_back_to_the_bound() {
+    let mut w = hinge_about_z(Some((-0.5, 0.5)));
+    let h = 0.35f32;
+    w.qz[1] = h.sin();
+    w.qw[1] = h.cos();
+    // Swung about the pivot, so the anchors still coincide and only the limit acts.
+    (w.pos_x[1], w.pos_y[1]) = ((2.0 * h).cos(), (2.0 * h).sin());
+    assert!(w.joint_coordinate(w.joint(0).unwrap()).unwrap().0 > 0.65, "control: it starts past the bound");
+    for _ in 0..240 { w.step(); }
+    let (angle, _) = w.joint_coordinate(w.joint(0).unwrap()).unwrap();
+    assert!(angle.abs() < 0.55, "the hinge angle is {angle} after starting at 0.7 past a 0.5 limit");
+}

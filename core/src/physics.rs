@@ -33,6 +33,8 @@ const MAX_CELL_SIZE: f32 = 4.0;
 /// Past this many wide dynamic bodies the list scan costs more than a larger cell, so the cell grows to fit them instead.
 const MAX_WIDE_DYNAMICS: usize = 16;
 const BROAD_EPS: f32 = 1e-3;
+/// How far a body may move from where the candidate pairs were found before they are found again.
+const CANDIDATE_SLACK: f32 = 0.05;
 const SOLVER_ITERS: u32   = 12;
 /// Steps a tick is split into while any joint exists; a power of two, so `dt / k` and the damping roots below are exact.
 pub const JOINT_SUBSTEPS: u32 = 4;
@@ -96,6 +98,14 @@ pub struct PhysicsWorld {
     pub kin: Vec<Kin>,
     joint_prep: Vec<joints::Prepared>,
     jointed: Vec<u8>,
+    joint_pairs: Vec<(u32, u32)>,
+    cache_broadphase: bool,
+    pub(crate) candidate_cache: bool,
+    pub(crate) grid_builds: u32,
+    cand_live: bool,
+    cand: Vec<(u32, u32)>,
+    cand_x: Vec<f32>, cand_y: Vec<f32>, cand_z: Vec<f32>,
+    cand_sleeping: Vec<bool>,
     pub bucket_counts: Vec<u32>,
     pub capacity:  usize,
     pub gx: f32, pub gy: f32, pub gz: f32,
@@ -219,6 +229,14 @@ impl PhysicsWorld {
             kin: Vec::new(),
             joint_prep: Vec::new(),
             jointed: Vec::new(),
+            joint_pairs: Vec::new(),
+            cache_broadphase: false,
+            candidate_cache: true,
+            grid_builds: 0,
+            cand_live: false,
+            cand: Vec::new(),
+            cand_x: Vec::new(), cand_y: Vec::new(), cand_z: Vec::new(),
+            cand_sleeping: Vec::new(),
             bucket_counts: vec![0u32; bucket_count_for(capacity)],
             capacity,
             gx: 0.0, gy: -9.81, gz: 0.0,
@@ -370,41 +388,61 @@ impl PhysicsWorld {
     pub fn step(&mut self) {
         let k = if self.joints.is_empty() { 1 } else { JOINT_SUBSTEPS };
         if k == 1 {
-            self.step_once(self.dt, 1, true);
+            self.step_once(self.dt, 1, true, true);
             return;
         }
         let full = self.dt;
         let dropped = self.dropped_contacts;
+        let (mut touching, mut penetrating) = (vec![false; self.capacity], vec![false; self.capacity]);
         self.dt = full / k as f32;
+        self.cache_broadphase = self.candidate_cache;
+        self.cand_live = false;
         for i in 0..k {
             // A contact dropped in every sub-step is one dropped contact per tick, not k.
             self.dropped_contacts = dropped;
-            self.step_once(full, k, i + 1 == k);
+            self.step_once(full, k, i == 0, i + 1 == k);
+            for (acc, now) in touching.iter_mut().zip(&self.touching) { *acc |= *now; }
+            for (acc, now) in penetrating.iter_mut().zip(&self.penetrating) { *acc |= *now; }
         }
         self.dt = full;
+        self.cache_broadphase = false;
+        self.cand_live = false;
+        // A body that touched in any sub-step touched in the tick, as it would in a world stepped once.
+        self.touching = touching;
+        self.penetrating = penetrating;
     }
 
-    /// `full` is the tick's duration, `k` how many steps share it and `last` whether this is the tick's final one; `self.dt` is this step's own.
-    fn step_once(&mut self, full: f32, k: u32, last: bool) {
+    /// `full` is the tick's duration, `k` how many steps share it, `first` and `last` whether this is the tick's first or final one; `self.dt` is this step's own.
+    fn step_once(&mut self, full: f32, k: u32, first: bool, last: bool) {
         let dt   = self.dt;
         let cap  = self.capacity;
         let (lin_damp, ang_damp) = (damp_per_step(LIN_DAMP, k), damp_per_step(ANG_DAMP, k));
 
         self.jointed.clear();
+        self.joint_pairs.clear();
         if !self.joints.is_empty() {
             self.jointed.resize(cap, 0);
             for j in &self.joints {
+                // A rod's bodies are far apart and may well collide; the other kinds hold their bodies together at the anchor.
+                if j.kind != joints::JOINT_DISTANCE {
+                    self.joint_pairs.push((j.a.min(j.b), j.a.max(j.b)));
+                }
                 let k = if j.motor_max > 0.0 { joints::DRIVEN } else { joints::JOINTED };
                 for b in [j.a as usize, j.b as usize] {
                     self.jointed[b] = self.jointed[b].max(k);
                 }
             }
         }
+        self.joint_pairs.sort_unstable();
         self.begin_kinematic(full);
         for i in 0..cap {
             if !self.active[i] || self.inv_mass[i] == 0.0 || self.sleeping[i] { continue; }
-            let vsq = self.vel_x[i]*self.vel_x[i] + self.vel_y[i]*self.vel_y[i] + self.vel_z[i]*self.vel_z[i];
-            let wsq = self.ang_x[i]*self.ang_x[i] + self.ang_y[i]*self.ang_y[i] + self.ang_z[i]*self.ang_z[i];
+            // A joint pulls a misaligned body back with pseudo-velocity, which is not in `vel`; without it the body would sleep misaligned.
+            // The first sub-step ignores it: what is left from the last tick is in no snapshot, so a restore could not match it.
+            let jointed = self.jointed.get(i).is_some_and(|&k| k != 0);
+            let (pv, pw) = if jointed && !first { ([self.pv_x[i], self.pv_y[i], self.pv_z[i]], [self.pa_x[i], self.pa_y[i], self.pa_z[i]]) } else { ([0.0; 3], [0.0; 3]) };
+            let vsq = { let v = [self.vel_x[i] + pv[0], self.vel_y[i] + pv[1], self.vel_z[i] + pv[2]]; v[0]*v[0] + v[1]*v[1] + v[2]*v[2] };
+            let wsq = { let w = [self.ang_x[i] + pw[0], self.ang_y[i] + pw[1], self.ang_z[i] + pw[2]]; w[0]*w[0] + w[1]*w[1] + w[2]*w[2] };
             // Only a jointed body can turn in place while staying supported (a wheel on its axle), so only it is judged on spin.
             // A motor can move a body slower than the sleep speed, and sleeping would stop it.
             let spinning = self.jointed.get(i).is_some_and(|&k| k == joints::DRIVEN || (k == joints::JOINTED && wsq >= SLEEP_VEL_SQ));
@@ -451,7 +489,7 @@ impl PhysicsWorld {
             let vn = ((self.vel_x[a] + va.0) - (self.vel_x[b] + vb.0)) * c.nx
                 + ((self.vel_y[a] + va.1) - (self.vel_y[b] + vb.1)) * c.ny
                 + ((self.vel_z[a] + va.2) - (self.vel_z[b] + vb.2)) * c.nz;
-            let bias = (BIAS_FACTOR / dt * (c.depth - SLOP).max(0.0)).min(MAX_BIAS_VEL);
+            let bias = (bias_per_step(BIAS_FACTOR, k) / dt * (c.depth - SLOP).max(0.0)).min(MAX_BIAS_VEL);
             let bounce = if vn < -BOUNCE_THRESHOLD { -self.restitution[a].min(self.restitution[b]) * vn } else { 0.0 };
             self.targets.push(bounce);
             self.pen_targets.push(bias);
@@ -468,7 +506,7 @@ impl PhysicsWorld {
             };
             apply_impulse_pair(&self.contacts[ci], &eff_mass, &mut m, &eff_inertia);
         }
-        self.prepare_joints();
+        self.prepare_joints(k);
         {
             let mut m = Motion {
                 vx: &mut self.vel_x, vy: &mut self.vel_y, vz: &mut self.vel_z,
@@ -508,8 +546,15 @@ impl PhysicsWorld {
         }
         self.pen_lambda.clear();
         self.pen_lambda.resize(self.contacts.len(), 0.0);
-        if self.pen_targets.iter().any(|t| *t > 0.0) {
+        let correct_contacts = self.pen_targets.iter().any(|t| *t > 0.0);
+        if correct_contacts || !self.joints.is_empty() {
             for _ in 0..PENETRATION_ITERS {
+                let mut m = Motion {
+                    vx: &mut self.pv_x, vy: &mut self.pv_y, vz: &mut self.pv_z,
+                    ax: &mut self.pa_x, ay: &mut self.pa_y, az: &mut self.pa_z,
+                };
+                joints::solve_joint_corrections(&mut self.joint_prep, &self.joints, &eff_mass, &eff_inertia, &mut m);
+                if !correct_contacts { continue; }
                 for ci in 0..self.contacts.len() {
                     let target = self.pen_targets[ci];
                     if target <= 0.0 { continue; }
@@ -601,6 +646,10 @@ impl PhysicsWorld {
 
     fn generate_contacts(&mut self) {
         let cap = self.capacity;
+        if self.cache_broadphase && self.candidates_hold() {
+            self.contacts_from_candidates();
+            return;
+        }
         // Cells must be at least as wide as the widest gridded body so overlapping bodies sit in adjacent cells.
         // Bodies wider than the cell (any static, or a dynamic one past MAX_CELL_SIZE) are kept in lists instead.
         let mut wide = 0usize;
@@ -617,8 +666,11 @@ impl PhysicsWorld {
             }
         }
         self.max_dynamic_diameter = widest;
-        self.cell_size = widest.max(MIN_CELL_SIZE);
+        // Candidate pairs reach 2 * CANDIDATE_SLACK past touching, so a neighbouring cell must still cover them.
+        let margin = if self.cache_broadphase { 2.0 * CANDIDATE_SLACK + BROAD_EPS } else { 0.0 };
+        self.cell_size = (widest + margin).max(MIN_CELL_SIZE);
 
+        self.grid_builds += 1;
         self.cell_heads.fill(-1);
         self.bucket_counts.fill(0);
         self.big_statics.clear();
@@ -636,6 +688,7 @@ impl PhysicsWorld {
         }
 
         self.contacts.clear();
+        self.cand.clear();
         self.narrow_calls = 0;
         for i in 0..cap {
             if !self.active[i] || self.inv_mass[i] == 0.0 || self.sleeping[i] { continue; }
@@ -667,6 +720,40 @@ impl PhysicsWorld {
                 }
             }
         }
+        if self.cache_broadphase {
+            self.cand_x.clone_from(&self.pos_x);
+            self.cand_y.clone_from(&self.pos_y);
+            self.cand_z.clone_from(&self.pos_z);
+            self.cand_sleeping.clone_from(&self.sleeping);
+            self.cand_live = true;
+            self.contacts_from_candidates();
+        }
+    }
+
+    /// The candidate pairs found for this tick still cover every touching pair while no body has moved more than `CANDIDATE_SLACK` from where
+    /// they were found and none has fallen asleep or woken since.
+    fn candidates_hold(&self) -> bool {
+        if !self.cand_live || self.cand_sleeping != self.sleeping { return false; }
+        let limit = CANDIDATE_SLACK * CANDIDATE_SLACK;
+        (0..self.capacity).all(|i| {
+            if !self.active[i] { return true; }
+            let (dx, dy, dz) = (self.pos_x[i] - self.cand_x[i], self.pos_y[i] - self.cand_y[i], self.pos_z[i] - self.cand_z[i]);
+            dx * dx + dy * dy + dz * dz <= limit
+        })
+    }
+
+    /// The narrow phase over the candidate pairs, in the order they were found, as the full broad phase would run it.
+    fn contacts_from_candidates(&mut self) {
+        self.contacts.clear();
+        self.narrow_calls = 0;
+        for n in 0..self.cand.len() {
+            let (i, j) = (self.cand[n].0 as usize, self.cand[n].1 as usize);
+            if self.sleeping[i] { continue; }
+            let (dx, dy, dz) = (self.pos_x[i] - self.pos_x[j], self.pos_y[i] - self.pos_y[j], self.pos_z[i] - self.pos_z[j]);
+            let reach = self.reach[i] + self.reach[j] + BROAD_EPS;
+            if dx * dx + dy * dy + dz * dz > reach * reach { continue; }
+            self.try_contact(i, j);
+        }
     }
 
     /// Narrow phase for `i` (awake, dynamic) against `j`, unless an awake dynamic `j` with a lower index will find the pair
@@ -680,6 +767,11 @@ impl PhysicsWorld {
     fn try_pair_near(&mut self, i: usize, j: usize) {
         let (dx, dy, dz) = (self.pos_x[i] - self.pos_x[j], self.pos_y[i] - self.pos_y[j], self.pos_z[i] - self.pos_z[j]);
         let reach = self.reach[i] + self.reach[j] + BROAD_EPS;
+        if self.cache_broadphase {
+            let found = reach + 2.0 * CANDIDATE_SLACK;
+            if dx * dx + dy * dy + dz * dz <= found * found { self.cand.push((i as u32, j as u32)); }
+            return;
+        }
         if dx * dx + dy * dy + dz * dz > reach * reach { return; }
         self.try_contact(i, j);
     }
@@ -887,6 +979,10 @@ impl PhysicsWorld {
     }
 
     fn try_contact(&mut self, i: usize, j: usize) {
+        // Two bodies a joint holds together overlap by design near the anchor, and a contact there only fights the joint.
+        if !self.joint_pairs.is_empty() && self.joint_pairs.binary_search(&(i.min(j) as u32, i.max(j) as u32)).is_ok() {
+            return;
+        }
         self.narrow_calls += 1;
         let Some(m) = collide(i, j, self) else { return };
         let pa = [self.pos_x[i], self.pos_y[i], self.pos_z[i]];
@@ -944,6 +1040,12 @@ fn damp_per_step(factor: f32, k: u32) -> f32 {
         n /= 2;
     }
     f
+}
+
+/// The Baumgarte fraction one of `k` steps should remove so that `k` of them remove `beta` of an error per tick, as one full step would.
+pub(crate) fn bias_per_step(beta: f32, k: u32) -> f32 {
+    // Exact for one step, so a world without joints keeps the bits it always had.
+    if k == 1 { beta } else { 1.0 - damp_per_step(1.0 - beta, k) }
 }
 
 /// `w` is the angular velocity in the world frame, so the step is `w * q`; `q * w` would read it in the body frame and turn a spinning, yawed
