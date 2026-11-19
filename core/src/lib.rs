@@ -16,6 +16,7 @@ pub mod recorder;
 pub mod determinism;
 
 pub mod runtime;
+pub mod batch;
 pub use runtime::Runtime;
 
 #[wasm_bindgen(start)]

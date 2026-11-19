@@ -223,7 +223,7 @@ impl PhysicsWorld {
             uf_parent: vec![0; capacity],
             island_ok: Vec::new(),
             island_of: vec![0; capacity],
-            contacts: Vec::with_capacity(MIN_MAX_CONTACTS),
+            contacts: Vec::new(),
             warm_cache: Vec::new(),
             joints: Vec::new(),
             kin: Vec::new(),

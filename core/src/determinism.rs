@@ -8,7 +8,8 @@ use crate::runtime::Runtime;
 
 pub const TICKS: u32 = 700;
 pub const MIDDLE: u32 = 350;
-const CAPACITY: u32 = 640;
+pub(crate) const CAPACITY: u32 = 640;
+pub(crate) const JOINTS_CAPACITY: u32 = 128;
 const PROJECTILE: u32 = 400;
 const WALL: u32 = 401;
 
@@ -38,7 +39,7 @@ fn upload_cube_hull(rt: &mut Runtime, hull: u32, h: f32) {
     rt.ring.push(&Command::HullCommit { hull, count: pts.len() as u8 });
 }
 
-fn build(rt: &mut Runtime) {
+pub(crate) fn build(rt: &mut Runtime) {
     upload_cube_hull(rt, 0, 0.4);
     rt.ring.push(&spawn(0, 0, BodyDesc::box_at([0.0, -0.5, 0.0], [30.0, 0.5, 30.0], 0.0, 0.1)));
     rt.ring.push(&spawn(1, 0, BodyDesc::box_at([0.0, 2.0, -12.0], [14.0, 2.0, 0.5], 0.0, 0.1)));
@@ -62,7 +63,7 @@ fn build(rt: &mut Runtime) {
 }
 
 /// Commands issued before the step that produces tick `t + 1`.
-fn script(rt: &mut Runtime, t: u32) {
+pub(crate) fn script(rt: &mut Runtime, t: u32) {
     match t {
         50 => { rt.ring.push(&Command::Force { id: PROJECTILE, generation: 0, x: 0.0, y: 1.0, z: -95.0 }); }
         100 => { rt.ring.push(&Command::Force { id: 5, generation: 0, x: 40.0, y: 90.0, z: 10.0 }); }
@@ -128,7 +129,7 @@ fn joint(id: u32, kind: u8, a: u32, b: u32, anchor: [f32; 3], axis: [f32; 3]) ->
 
 /// A floor, a pendulum chain, a door with limits, a motor-driven wheel, a motor-driven slider and a welded pair, so every joint
 /// kind, limits and both motor rows run in one world.
-fn build_joints(rt: &mut Runtime) {
+pub(crate) fn build_joints(rt: &mut Runtime) {
     rt.ring.push(&spawn(0, 0, BodyDesc::box_at([0.0, -0.5, 0.0], [30.0, 0.5, 30.0], 0.0, 0.1)));
     rt.ring.push(&spawn(1, 0, BodyDesc::box_at([0.0, 10.0, 0.0], [0.25; 3], 0.0, 0.0)));
     for i in 1..=CHAIN_LINKS {
@@ -155,7 +156,7 @@ fn build_joints(rt: &mut Runtime) {
 /// Commands issued before the step that produces tick `t + 1`. Keyframes fall every 60 ticks, so the commands at 610, 625 and 640 lie
 /// between the keyframe at tick 600 and the seek target (`JOINT_MIDDLE`), and the one at 1210 between the last keyframe and the end:
 /// both seeks must replay joint and force commands, not just restore a keyframe.
-fn joint_script(rt: &mut Runtime, t: u32) {
+pub(crate) fn joint_script(rt: &mut Runtime, t: u32) {
     match t {
         30 => { rt.ring.push(&Command::Force { id: DOOR, generation: 0, x: 0.0, y: 0.0, z: 8.0 }); }
         100 => { rt.ring.push(&Command::JointMotor { id: 40, vel: 1.5, max: 30.0 }); }
@@ -172,7 +173,7 @@ fn joint_script(rt: &mut Runtime, t: u32) {
 
 /// Same four values as `run_scene`, for the joint world.
 pub fn run_joint_scene() -> [u64; 4] {
-    run_recorded(128, build_joints, joint_script, JOINT_TICKS, JOINT_MIDDLE)
+    run_recorded(JOINTS_CAPACITY, build_joints, joint_script, JOINT_TICKS, JOINT_MIDDLE)
 }
 
 pub const KIN_TICKS: u32 = 700;
@@ -251,7 +252,7 @@ pub fn run_sensor_scene() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -440,6 +441,6 @@ mod tests {
 
     const JOINT_PINNED_END: u64 = 13978249971055882505;
     const JOINT_PINNED_MIDDLE: u64 = 309544726468439355;
-    const PINNED_END: u64 = 13348242057567185977;
+    pub(crate) const PINNED_END: u64 = 13348242057567185977;
     const PINNED_MIDDLE: u64 = 8317036014868065234;
 }

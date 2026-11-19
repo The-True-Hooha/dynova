@@ -69,7 +69,7 @@ describe('World basics', () => {
     });
 
     it('step() throws in worker mode', () => {
-        expect(() => makeWorld(config).world.step()).toThrow('fallback mode');
+        expect(() => makeWorld(config).world.step()).toThrow('not available here');
     });
 
     it('dispose() runs the disposer once and blocks further commands', () => {

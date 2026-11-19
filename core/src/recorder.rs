@@ -33,6 +33,11 @@ impl Recorder {
         Self { keyframes: Vec::new(), log: Vec::new(), end: 0, since_keyframe: 0, bytes: 0, budget }
     }
 
+    #[cfg(test)]
+    pub(crate) fn budget_for_test(&self) -> usize {
+        self.budget
+    }
+
     pub fn is_armed(&self) -> bool {
         self.keyframes.is_empty()
     }

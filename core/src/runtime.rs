@@ -6,7 +6,7 @@ use crate::command_ring::KinSample;
 use crate::joint_state::JointStates;
 use crate::query_results::{self as qr, QueryResults};
 use crate::physics::{BodyDesc, Fnv, JointDesc, PhysicsSnapshot, PhysicsWorld, SHAPE_HULL};
-use crate::recorder::Recorder;
+use crate::recorder::{Recorder, MAX_KEYFRAME_BYTES};
 use crate::transform_buffers::{Transform, TransformBuffers, INITIAL_STATE};
 use std::sync::atomic::{AtomicU32, Ordering};
 use wasm_bindgen::prelude::*;
@@ -91,6 +91,10 @@ pub struct Runtime {
     head: u32,
     paused: bool,
     seeks: u32,
+    /// Largest capacity a Grow command may reach; a batch lowers it so its worlds cannot outgrow the memory the batch was sized for.
+    capacity_limit: u32,
+    /// Keyframe and log memory a recording may hold; a batch divides one budget among its worlds.
+    keyframe_budget: usize,
 }
 
 #[wasm_bindgen]
@@ -119,6 +123,8 @@ impl Runtime {
             head: 0,
             paused: false,
             seeks: 0,
+            capacity_limit: MAX_CAPACITY,
+            keyframe_budget: MAX_KEYFRAME_BYTES,
         };
         let mut rt = rt;
         rt.bucket_view = (0..rt.physics.bucket_counts.len()).map(|_| AtomicU32::new(0)).collect();
@@ -395,6 +401,14 @@ impl Runtime {
 
 impl Runtime {
     /// Direct (non-ring) setup API for Rust tests and benches. Not exported to JS: the ring is the only JS write path.
+    pub fn set_capacity_limit(&mut self, limit: u32) {
+        self.capacity_limit = limit.min(MAX_CAPACITY);
+    }
+
+    pub fn set_keyframe_budget(&mut self, bytes: usize) {
+        self.keyframe_budget = bytes.min(MAX_KEYFRAME_BYTES);
+    }
+
     pub fn set_gravity(&mut self, x: f32, y: f32, z: f32) {
         self.physics.gx = x;
         self.physics.gy = y;
@@ -444,6 +458,11 @@ impl Runtime {
         restitution: f32,
     ) -> bool {
         self.spawn_direct(id, &BodyDesc::capsule_at([x, y, z], radius, half_len, inv_mass, restitution))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keyframe_budget_for_test(&self) -> usize {
+        self.recorder.as_ref().map_or(0, |r| r.budget_for_test())
     }
 
     #[cfg(test)]
@@ -688,7 +707,7 @@ impl Runtime {
         } else if !self.physics_enabled {
             self.ring.note_malformed();
         } else if self.recorder.is_none() {
-            self.recorder = Some(Recorder::new());
+            self.recorder = Some(Recorder::with_budget(self.keyframe_budget));
         }
     }
 
@@ -801,7 +820,7 @@ impl Runtime {
     }
 
     fn grow_to(&mut self, capacity: u32) -> bool {
-        if capacity <= self.transforms.capacity() {
+        if capacity <= self.transforms.capacity() || capacity > self.capacity_limit {
             return false;
         }
         // Seqlock: odd epoch means the layout is being rewritten; readers retry until it is even and unchanged.

@@ -286,10 +286,15 @@ export class World {
     reacquireIfGrown(): boolean { return this.syncLayout(); }
 
     step(): void {
-        if (!this.driver) throw new Error('step() is only available in fallback mode; the worker steps the runtime');
+        if (!this.driver) throw new Error('step() is not available here: this world is stepped elsewhere (its worker, or the WorldBatch it belongs to)');
         const t0 = performance.now();
         this.driver.step();
-        this.transforms.recordStep((performance.now() - t0) * 1000);
+        this.finishStep((performance.now() - t0) * 1000);
+    }
+
+    /** @internal what follows a step: whoever stepped the runtime (a `WorldBatch` steps many at once) reports the time it took. */
+    finishStep(micros: number): void {
+        this.transforms.recordStep(micros);
         this.syncLayout();
         this.flush();
     }
