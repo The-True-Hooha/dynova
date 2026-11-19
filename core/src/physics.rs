@@ -38,6 +38,9 @@ const BROAD_EPS: f32 = 1e-3;
 /// How far a body may move from where the candidate pairs were found before they are found again.
 const CANDIDATE_SLACK: f32 = 0.05;
 const SOLVER_ITERS: u32   = 12;
+/// A jointed world solves contacts and joints together in closed chains (a legged robot on the ground), which 12 sweeps leave creeping: a quadruped sagged and tipped
+/// within 10k ticks at 12 and 20, and stood at 28.
+const JOINT_ITERS: u32 = 32;
 /// Steps a tick is split into while any joint exists; a power of two, so `dt / k` and the damping roots below are exact.
 pub const JOINT_SUBSTEPS: u32 = 4;
 const CONTACT_SUBSTEPS: u32 = 2;
@@ -547,7 +550,8 @@ impl PhysicsWorld {
         let mut order: Vec<usize> = (0..self.contacts.len()).collect();
         order.sort_by(|&i, &j| height(&self.contacts[i]).total_cmp(&height(&self.contacts[j])).then(i.cmp(&j)));
         self.solver_iters_used = 0;
-        for iter in 0..SOLVER_ITERS as usize {
+        let iters = if self.joints.is_empty() { SOLVER_ITERS } else { JOINT_ITERS };
+        for iter in 0..iters as usize {
             self.solver_iters_used += 1;
             let count = self.contacts.len();
             let mut largest = {

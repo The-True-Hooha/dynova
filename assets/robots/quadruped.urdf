@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!-- Dynova quadruped. Authored for this repository; released under CC0 1.0. Z up, X forward, Y left.
+     The zero pose is the standing pose: each thigh is swung back 0.6 rad and each knee bent forward 1.2 rad, so a foot is under its hip. -->
+<robot name="quadruped">
+  <link name="trunk"><inertial><mass value="3"/></inertial><collision><geometry><box size="0.5 0.25 0.12"/></geometry></collision></link>
+  <link name="fl_hip"><inertial><mass value="0.5"/></inertial><collision><geometry><box size="0.06 0.06 0.06"/></geometry></collision></link>
+  <link name="fl_thigh"><inertial><mass value="0.8"/></inertial><collision><origin xyz="0 0 -0.125"/><geometry><capsule radius="0.03" length="0.25"/></geometry></collision></link>
+  <link name="fl_shank"><inertial><mass value="0.6"/></inertial><collision><origin xyz="0 0 -0.125"/><geometry><capsule radius="0.025" length="0.25"/></geometry></collision></link>
+  <joint name="fl_abduct" type="revolute"><parent link="trunk"/><child link="fl_hip"/><origin xyz="0.2 0.15 -0.06"/><axis xyz="1 0 0"/><limit lower="-0.5" upper="0.5" effort="40" velocity="10"/></joint>
+  <joint name="fl_hip_pitch" type="revolute"><parent link="fl_hip"/><child link="fl_thigh"/><origin xyz="0 0 -0.03" rpy="0 0.6 0"/><axis xyz="0 1 0"/><limit lower="-1.0" upper="1.0" effort="40" velocity="10"/></joint>
+  <joint name="fl_knee" type="revolute"><parent link="fl_thigh"/><child link="fl_shank"/><origin xyz="0 0 -0.25" rpy="0 -1.2 0"/><axis xyz="0 1 0"/><limit lower="-1.0" upper="1.2" effort="40" velocity="10"/></joint>
+  <link name="fr_hip"><inertial><mass value="0.5"/></inertial><collision><geometry><box size="0.06 0.06 0.06"/></geometry></collision></link>
+  <link name="fr_thigh"><inertial><mass value="0.8"/></inertial><collision><origin xyz="0 0 -0.125"/><geometry><capsule radius="0.03" length="0.25"/></geometry></collision></link>
+  <link name="fr_shank"><inertial><mass value="0.6"/></inertial><collision><origin xyz="0 0 -0.125"/><geometry><capsule radius="0.025" length="0.25"/></geometry></collision></link>
+  <joint name="fr_abduct" type="revolute"><parent link="trunk"/><child link="fr_hip"/><origin xyz="0.2 -0.15 -0.06"/><axis xyz="1 0 0"/><limit lower="-0.5" upper="0.5" effort="40" velocity="10"/></joint>
+  <joint name="fr_hip_pitch" type="revolute"><parent link="fr_hip"/><child link="fr_thigh"/><origin xyz="0 0 -0.03" rpy="0 0.6 0"/><axis xyz="0 1 0"/><limit lower="-1.0" upper="1.0" effort="40" velocity="10"/></joint>
+  <joint name="fr_knee" type="revolute"><parent link="fr_thigh"/><child link="fr_shank"/><origin xyz="0 0 -0.25" rpy="0 -1.2 0"/><axis xyz="0 1 0"/><limit lower="-1.0" upper="1.2" effort="40" velocity="10"/></joint>
+  <link name="hl_hip"><inertial><mass value="0.5"/></inertial><collision><geometry><box size="0.06 0.06 0.06"/></geometry></collision></link>
+  <link name="hl_thigh"><inertial><mass value="0.8"/></inertial><collision><origin xyz="0 0 -0.125"/><geometry><capsule radius="0.03" length="0.25"/></geometry></collision></link>
+  <link name="hl_shank"><inertial><mass value="0.6"/></inertial><collision><origin xyz="0 0 -0.125"/><geometry><capsule radius="0.025" length="0.25"/></geometry></collision></link>
+  <joint name="hl_abduct" type="revolute"><parent link="trunk"/><child link="hl_hip"/><origin xyz="-0.2 0.15 -0.06"/><axis xyz="1 0 0"/><limit lower="-0.5" upper="0.5" effort="40" velocity="10"/></joint>
+  <joint name="hl_hip_pitch" type="revolute"><parent link="hl_hip"/><child link="hl_thigh"/><origin xyz="0 0 -0.03" rpy="0 0.6 0"/><axis xyz="0 1 0"/><limit lower="-1.0" upper="1.0" effort="40" velocity="10"/></joint>
+  <joint name="hl_knee" type="revolute"><parent link="hl_thigh"/><child link="hl_shank"/><origin xyz="0 0 -0.25" rpy="0 -1.2 0"/><axis xyz="0 1 0"/><limit lower="-1.0" upper="1.2" effort="40" velocity="10"/></joint>
+  <link name="hr_hip"><inertial><mass value="0.5"/></inertial><collision><geometry><box size="0.06 0.06 0.06"/></geometry></collision></link>
+  <link name="hr_thigh"><inertial><mass value="0.8"/></inertial><collision><origin xyz="0 0 -0.125"/><geometry><capsule radius="0.03" length="0.25"/></geometry></collision></link>
+  <link name="hr_shank"><inertial><mass value="0.6"/></inertial><collision><origin xyz="0 0 -0.125"/><geometry><capsule radius="0.025" length="0.25"/></geometry></collision></link>
+  <joint name="hr_abduct" type="revolute"><parent link="trunk"/><child link="hr_hip"/><origin xyz="-0.2 -0.15 -0.06"/><axis xyz="1 0 0"/><limit lower="-0.5" upper="0.5" effort="40" velocity="10"/></joint>
+  <joint name="hr_hip_pitch" type="revolute"><parent link="hr_hip"/><child link="hr_thigh"/><origin xyz="0 0 -0.03" rpy="0 0.6 0"/><axis xyz="0 1 0"/><limit lower="-1.0" upper="1.0" effort="40" velocity="10"/></joint>
+  <joint name="hr_knee" type="revolute"><parent link="hr_thigh"/><child link="hr_shank"/><origin xyz="0 0 -0.25" rpy="0 -1.2 0"/><axis xyz="0 1 0"/><limit lower="-1.0" upper="1.2" effort="40" velocity="10"/></joint>
+</robot>

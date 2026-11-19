@@ -35,3 +35,5 @@ export type { RobotDesc, LinkDesc, RobotJointDesc, ShapeDesc, JointType, Frame, 
 export { parseXml, XmlError } from './xml.js';
 export type { XmlElement } from './xml.js';
 export { parseMjcf } from './mjcf.js';
+export { trot, standing, LEGS, DEFAULT_TROT } from './legged.js';
+export type { TrotOptions, Leg } from './legged.js';

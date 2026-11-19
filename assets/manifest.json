@@ -1,0 +1,21 @@
+{
+  "licence_note": "Every asset was authored for the Dynova repository and is released under CC0-1.0.",
+  "assets": [
+    {
+      "file": "robots/arm.urdf",
+      "name": "arm",
+      "description": "a bolted three-joint arm",
+      "licence": "CC0-1.0",
+      "source": "authored for Dynova",
+      "sha256": "629d30948a0c25db69a7b52ca2e0e36afbf8b89d2bea2bd4067c0bfb8fdd3e44"
+    },
+    {
+      "file": "robots/quadruped.urdf",
+      "name": "quadruped",
+      "description": "a 12-joint four-legged robot",
+      "licence": "CC0-1.0",
+      "source": "authored for Dynova",
+      "sha256": "b507b34f952a24134113494fb4a99e9a2bec754bd07c66a79587a64493a97b2b"
+    }
+  ]
+}

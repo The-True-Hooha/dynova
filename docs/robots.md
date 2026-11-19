@@ -24,7 +24,7 @@ Driven to joint values with position control and gravity off, an imported arm's 
 
 ## Limits
 
-URDF and an MJCF subset so far (the asset set, legged controllers and the browser and Python loaders are the rest of phase 15). The XML reader refuses DTDs and custom entities, caps the document at 16 MiB, nesting at 64 and elements at 200,000. Joint limits are measured from the spawn pose, which is the zero pose.
+URDF and an MJCF subset, an asset set and a quadruped gait so far (a humanoid and the browser and Python loaders are the rest of phase 15). The XML reader refuses DTDs and custom entities, caps the document at 16 MiB, nesting at 64 and elements at 200,000. Joint limits are measured from the spawn pose, which is the zero pose.
 
 ## MJCF subset
 
@@ -35,3 +35,11 @@ URDF and an MJCF subset so far (the asset set, legged controllers and the browse
 - A top-level body with no joint is welded to the world; with a `freejoint` it is free.
 - A hinge or slide whose parent has no body (the world, or an empty body) hangs on a tiny static anchor made at the joint (`SpawnedRobot.anchors`), with a warning.
 - Not supported, as errors: several joints on one body, ball and free-nested joints, meshes (dropped with a warning), tendons, equality constraints and actuators (ignored with a warning). `class` and `childclass` are ignored with a warning, so `<default>` values are not applied.
+
+## Legged robots
+
+`assets/robots/quadruped.urdf` is a 10.6 kg robot with four legs of three joints (`<leg>_abduct`, `<leg>_hip_pitch`, `<leg>_knee`, legs `fl fr hl hr`). Its zero pose is the standing pose, so a controller that holds every joint at 0 stands. `legged.ts` has `standing` and `trot(joints, time, options)`, pure functions from time to joint targets, used with `driveJoints`.
+
+Measured on the real wasm (`legged.test.ts`): holding all joints at 0 it stands 10,000 ticks within 5 cm of where it landed, at its standing height and less than 3 degrees from upright; trotting at 1.5 Hz with a 0.3 rad stride it covers more than 4 m in 25 s with the trunk never more than about 17 degrees from upright. Gains: `kp` 10, `kd` 0.3 (`kd` was seen to chatter between the motor limits at 2, because the derivative term acts on a one-tick-old velocity; keep it under 1), `maxSpeed` 6, `maxForce` 40.
+
+Getting here needed a solver change. With 12 sweeps per sub-step the legs crept under load and the robot sagged and tipped within 10,000 ticks (20 sweeps was not enough either; 28 held). A world with joints now uses up to 32 sweeps (`JOINT_ITERS`, the sweep still stops early when converged); a world without joints is unchanged. The switch is per world, not per island: one joint anywhere gives every contact up to 32 sweeps. A measured worst case, a 2,000-box pile settling in a world with one distant joint, cost about 45 ms per tick against 36 ms; once the pile sleeps the cost is the same. Every determinism hash of a jointed scene moved and was re-pinned.
