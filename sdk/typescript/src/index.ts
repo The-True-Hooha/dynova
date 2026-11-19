@@ -30,3 +30,7 @@ export type { EntityHandle } from './EntityIdAllocator.js';
 export type { MemoryMode, MemoryResult } from './memory.js';
 export { decodeTransforms, assertIdOffset } from './adapter.js';
 export type { AdapterOptions, InstanceSink, TransformSource, UpdateResult } from './adapter.js';
+export { parseUrdf, forwardKinematics, spawnRobot, RobotError, MAX_LINKS } from './robot.js';
+export type { RobotDesc, LinkDesc, RobotJointDesc, ShapeDesc, JointType, Frame, SpawnRobotOptions, SpawnedRobot } from './robot.js';
+export { parseXml, XmlError } from './xml.js';
+export type { XmlElement } from './xml.js';
