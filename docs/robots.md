@@ -22,9 +22,13 @@
 
 Driven to joint values with position control and gravity off, an imported arm's link frames match `forwardKinematics` within 1 cm and its joint angles within 0.005 rad (`robot.test.ts`, on the real wasm).
 
+## Python
+
+`from dynova import parse_urdf, forward_kinematics, spawn_robot` give the same results as the TypeScript functions for URDF (forward-kinematics frames of the shipped assets are pinned from both languages in `golden_robot_ts.json`; the Python tests also stand the quadruped and the humanoid and drive the arm to forward kinematics). MJCF is not ported.
+
 ## Limits
 
-URDF and an MJCF subset, an asset set and a quadruped gait so far (the browser and Python loaders are the rest of phase 15). The XML reader refuses DTDs and custom entities, caps the document at 16 MiB, nesting at 64 and elements at 200,000. Joint limits are measured from the spawn pose, which is the zero pose.
+URDF and an MJCF subset, an asset set and a quadruped gait so far (Python and browser loaders for URDF are done; MJCF is TypeScript only). The XML readers (TypeScript's own, Python's ElementTree plus the same limits) refuse DTDs and custom entities and cap the document at 16 MiB, nesting at 64 and elements at 200,000. Python refuses XML namespaces; its warning texts format numbers the Python way (`1e-07`), so compare warnings by meaning, not text; its `up_axis` refuses anything but `'y'` and `'z'`. Joint limits are measured from the spawn pose, which is the zero pose.
 
 ## MJCF subset
 

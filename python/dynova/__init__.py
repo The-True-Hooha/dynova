@@ -7,9 +7,10 @@ from ._wire import (
 from .batch import Batch, Images, partition
 from .camera import NO_BODY, Camera, id_colors, look_at
 from .env import BatchEnv, EnvError, EnvResult, EnvSpec, Rng, episode_seed, mulberry32
+from .robot import RobotDesc, RobotError, SpawnedRobot, forward_kinematics, parse_urdf, spawn_robot
 from .world import Handle, JointHandle, RingFull, StaleHandle, World, WorldFailed
 
 __all__ = [
-    "Batch", "Images", "Camera", "look_at", "id_colors", "NO_BODY", "BatchEnv", "EnvSpec", "EnvResult", "EnvError", "Rng", "mulberry32", "episode_seed", "World", "Handle", "JointHandle", "WorldFailed", "StaleHandle", "RingFull", "WasmError", "WasmTrap", "partition", "find_wasm",
+    "parse_urdf", "forward_kinematics", "spawn_robot", "RobotDesc", "RobotError", "SpawnedRobot", "Batch", "Images", "Camera", "look_at", "id_colors", "NO_BODY", "BatchEnv", "EnvSpec", "EnvResult", "EnvError", "Rng", "mulberry32", "episode_seed", "World", "Handle", "JointHandle", "WorldFailed", "StaleHandle", "RingFull", "WasmError", "WasmTrap", "partition", "find_wasm",
     "SHAPE_BOX", "SHAPE_SPHERE", "SHAPE_CAPSULE", "JOINT_BALL", "JOINT_HINGE", "JOINT_FIXED", "JOINT_SLIDER", "JOINT_DISTANCE",
 ]

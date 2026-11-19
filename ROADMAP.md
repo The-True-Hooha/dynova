@@ -182,7 +182,7 @@ Goal: close the gap with robot-learning engines such as Alloy (many parallel wor
 - **Phase 14 — Camera sensors** (done)
   - Depth, colour-id and segmentation images per world from CPU raycasting on the existing grid, batched through a result buffer; a lens model; images for all worlds in one call.
   - **Exit:** a depth image of a known scene matches analytic distances within 1 mm; segmentation ids match entity ids; 64 worlds at 64x64 are rendered in a measured time.
-- **Phase 15 — Assets, robot descriptions and legged robots**
+- **Phase 15 — Assets, robot descriptions and legged robots** (done: URDF in TypeScript and Python, an MJCF subset in TypeScript, a humanoid that stands but does not walk)
   - URDF and MJCF import (links, joints, collision shapes) into the joint table, an asset set with licences recorded, a quadruped and a humanoid, standing and walking controllers.
   - **Exit:** an imported arm matches its description's pose by forward kinematics; a quadruped stands for 10k ticks and takes steps without tipping; the assets load in the browser and from Python.
 - **Phase 16 — Particles, cloth, cables and soft bodies**
