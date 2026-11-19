@@ -22,6 +22,8 @@ export interface LinkDesc {
     /** Kilograms, or `null` when the description gives none. */
     mass: number | null;
     shape: ShapeDesc | null;
+    /** A body that never moves, whatever `fixedBase` says (MJCF scenery). */
+    static?: boolean;
 }
 
 export type JointType = 'revolute' | 'continuous' | 'prismatic' | 'fixed';
@@ -237,6 +239,8 @@ export interface SpawnedRobot {
     desc: RobotDesc;
     links: Map<string, EntityHandle>;
     joints: Map<string, JointHandle>;
+    /** Static bodies made to hold a joint whose parent has no body. */
+    anchors: EntityHandle[];
     /** Link frames at spawn, in the world. */
     frames: Map<string, Frame>;
     warnings: string[];
@@ -246,6 +250,7 @@ const MIN_HALF = 1e-3;
 const MAX_HALF = 1e4;
 const MIN_MASS = 1e-6;
 const MAX_MASS = 1e30;
+const ANCHOR_RADIUS = 0.002;
 
 /**
  * Puts the robot into `world` at zero joint values: one body per link that has a collision shape, one joint per description joint.
@@ -261,6 +266,7 @@ export function spawnRobot(world: World, desc: RobotDesc, opts: SpawnRobotOption
     for (const [name, f] of forwardKinematics(desc)) frames.set(name, compose(base, f));
     const links = new Map<string, EntityHandle>();
     const joints = new Map<string, JointHandle>();
+    const anchors: EntityHandle[] = [];
     const defaultMass = opts.defaultMass ?? 1;
     const parentJoint = new Map(desc.joints.map((j) => [j.child, j]));
     const carrier = (name: string): string | null => {
@@ -281,7 +287,9 @@ export function spawnRobot(world: World, desc: RobotDesc, opts: SpawnRobotOption
             const s = l.shape;
             const f = compose(frames.get(l.name) as Frame, s.frame);
             const isBase = !parentJoint.has(l.name) || carrier(parentJoint.get(l.name)!.parent) === null;
-            const isStatic = opts.fixedBase === true && isBase;
+            const pj = parentJoint.get(l.name);
+            // A body hinged or slid on a frame is not the bolted base: it moves on an anchor made for it below.
+            const isStatic = l.static === true || (opts.fixedBase === true && isBase && (!pj || pj.type === 'fixed'));
             let mass = l.mass;
             if (mass === null && !isStatic) { warnings.push(`link ${l.name}: no mass given, using ${defaultMass} kg`); mass = defaultMass; }
             const what = `link ${l.name}`;
@@ -299,8 +307,17 @@ export function spawnRobot(world: World, desc: RobotDesc, opts: SpawnRobotOption
                 continue;
             }
             const a = carrier(j.parent);
-            if (a === null) continue;
             const jf = compose(frames.get(j.parent) as Frame, j.origin);
+            let carrierHandle: EntityHandle;
+            if (a === null) {
+                if (j.type === 'fixed') continue;
+                // Nothing above has a body to hinge on: a tiny static sphere at the joint stands in for the world.
+                carrierHandle = world.spawn({ x: jf.p[0], y: jf.p[1], z: jf.p[2], shape: SHAPE_SPHERE, hx: ANCHOR_RADIUS, hy: ANCHOR_RADIUS, hz: ANCHOR_RADIUS, invMass: 0 });
+                anchors.push(carrierHandle);
+                warnings.push(`joint ${j.name}: nothing above it has a body, so a ${ANCHOR_RADIUS * 2} m static anchor was made at the joint`);
+            } else {
+                carrierHandle = links.get(a) as EntityHandle;
+            }
             const kind = j.type === 'fixed' ? JOINT_FIXED : j.type === 'prismatic' ? JOINT_SLIDER : JOINT_HINGE;
             let limits: [number, number] | undefined;
             if (j.limit) {
@@ -311,13 +328,13 @@ export function spawnRobot(world: World, desc: RobotDesc, opts: SpawnRobotOption
                 if (lo !== j.limit.lower || hi !== j.limit.upper) warnings.push(`joint ${j.name}: limits [${j.limit.lower}, ${j.limit.upper}] were clamped to [${lo}, ${hi}] (zero must lie inside, and the engine's bound is ${bound})`);
                 limits = [lo, hi];
             }
-            joints.set(j.name, world.createJoint({ kind, a: links.get(a) as EntityHandle, b: links.get(j.child) as EntityHandle, anchor: jf.p, axis: kind === JOINT_FIXED ? undefined : qrot(jf.q, j.axis), limits }));
+            joints.set(j.name, world.createJoint({ kind, a: carrierHandle, b: links.get(j.child) as EntityHandle, anchor: jf.p, axis: kind === JOINT_FIXED ? undefined : qrot(jf.q, j.axis), limits }));
         }
     } catch (err) {
-        for (const h of links.values()) {
+        for (const h of [...links.values(), ...anchors]) {
             try { world.destroy(h); } catch { /* the ring is full: nothing more can be undone from here */ }
         }
         throw err;
     }
-    return { desc, links, joints, frames, warnings };
+    return { desc, links, joints, anchors, frames, warnings };
 }

@@ -34,3 +34,4 @@ export { parseUrdf, forwardKinematics, spawnRobot, RobotError, MAX_LINKS } from 
 export type { RobotDesc, LinkDesc, RobotJointDesc, ShapeDesc, JointType, Frame, SpawnRobotOptions, SpawnedRobot } from './robot.js';
 export { parseXml, XmlError } from './xml.js';
 export type { XmlElement } from './xml.js';
+export { parseMjcf } from './mjcf.js';

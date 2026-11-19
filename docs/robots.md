@@ -24,4 +24,14 @@ Driven to joint values with position control and gravity off, an imported arm's 
 
 ## Limits
 
-URDF only so far (MJCF, the asset set, legged controllers, the browser and Python loaders are the rest of phase 15). The XML reader refuses DTDs and custom entities, caps the document at 16 MiB, nesting at 64 and elements at 200,000. Joint limits are measured from the spawn pose, which is the zero pose.
+URDF and an MJCF subset so far (the asset set, legged controllers and the browser and Python loaders are the rest of phase 15). The XML reader refuses DTDs and custom entities, caps the document at 16 MiB, nesting at 64 and elements at 200,000. Joint limits are measured from the spawn pose, which is the zero pose.
+
+## MJCF subset
+
+`parseMjcf(text)` gives the same `RobotDesc`. Read: `compiler` (angle, eulerseq xyz, autolimits), nested `body` with `pos` and `quat`, `axisangle` or `euler`, one `joint` per body (`hinge` and `slide`, with `axis`, `pos`, `range`, `limited`; `freejoint` on a top-level body), `geom` of `sphere`, `box`, `capsule` (size or `fromto`), `cylinder` (a capsule with rounded ends, with the cylinder's own mass) and `plane` (a finite slab: MuJoCo's plane is infinite), `inertial mass`, and worldbody geoms as static scenery.
+
+- Angles are degrees unless `compiler angle="radian"`; slide ranges are metres and are never converted.
+- Mass is the `inertial` mass, else the sum of the geoms' masses (`mass`, or `density` x volume, default 1000). Inertia tensors and inertial positions are ignored with a warning.
+- A top-level body with no joint is welded to the world; with a `freejoint` it is free.
+- A hinge or slide whose parent has no body (the world, or an empty body) hangs on a tiny static anchor made at the joint (`SpawnedRobot.anchors`), with a warning.
+- Not supported, as errors: several joints on one body, ball and free-nested joints, meshes (dropped with a warning), tendons, equality constraints and actuators (ignored with a warning). `class` and `childclass` are ignored with a warning, so `<default>` values are not applied.
