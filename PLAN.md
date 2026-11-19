@@ -91,6 +91,9 @@ Out-of-plan observations. Do not act on these without approval.
 
 - (Phase 12B, parked) A `reset` hook cannot spawn, destroy or create joints (the SDK's entity tables re-sync after the step that applies the reset). `restore` builds a fresh `PhysicsWorld` per reset, so a reset costs about a world's allocation, not just a copy; not measured at large capacities. No observation or action space description, no Python API (12C). Reset leaves the tick counter, a grown capacity and the counters alone.
 
+- (Phase 12C, parked) The Python package has no hull bodies, kinematic batches, raycasts, overlaps, inspector or recording reads yet; wasmtime memory is assumed not to move (the base is re-checked on every access, but a view must not be used after a call that grows memory); worlds of one instance are not thread-safe against a second user thread while `step()` runs (the call raises instead of racing); a PyO3 backend is parked (docs/decisions/python.md). Tested with Python 3.12 only; the code parses under 3.9.
+- (wasmtime-py) Host callbacks that hold a reference to their instance keep its store and memory alive forever (wasmtime keeps them in a global registry); the host object the callbacks use must not point back at the instance.
+
 ## Plan changes
 
 Approved changes to the plan and to the wire and header layouts. Delivery notes for each step are in the commit messages.

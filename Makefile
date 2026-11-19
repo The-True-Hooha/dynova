@@ -1,4 +1,4 @@
-.PHONY: build build-release build-st e2e dev test install clean check all package consumer-test consumer-test-pnpm
+.PHONY: build build-release build-st e2e dev test install clean check all package consumer-test consumer-test-pnpm test-python
 
 # Build WASM (dev, faster compile)
 build:
@@ -63,3 +63,7 @@ consumer-test: package
 consumer-test-pnpm: package
 	CONSUMER_PM=pnpm node scripts/consumer-setup.mjs
 	pnpm exec playwright test -c playwright.consumer.config.ts
+
+# Python package tests against the single-threaded wasm build. Needs `pip install -e "python[test]"` in the interpreter that `python3` names.
+test-python: build-st
+	cd python && python3 -m pytest -q
