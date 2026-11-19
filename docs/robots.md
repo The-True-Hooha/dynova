@@ -24,7 +24,7 @@ Driven to joint values with position control and gravity off, an imported arm's 
 
 ## Limits
 
-URDF and an MJCF subset, an asset set and a quadruped gait so far (a humanoid and the browser and Python loaders are the rest of phase 15). The XML reader refuses DTDs and custom entities, caps the document at 16 MiB, nesting at 64 and elements at 200,000. Joint limits are measured from the spawn pose, which is the zero pose.
+URDF and an MJCF subset, an asset set and a quadruped gait so far (the browser and Python loaders are the rest of phase 15). The XML reader refuses DTDs and custom entities, caps the document at 16 MiB, nesting at 64 and elements at 200,000. Joint limits are measured from the spawn pose, which is the zero pose.
 
 ## MJCF subset
 
@@ -43,3 +43,5 @@ URDF and an MJCF subset, an asset set and a quadruped gait so far (a humanoid an
 Measured on the real wasm (`legged.test.ts`): holding all joints at 0 it stands 10,000 ticks within 5 cm of where it landed, at its standing height and less than 3 degrees from upright; trotting at 1.5 Hz with a 0.3 rad stride it covers more than 4 m in 25 s with the trunk never more than about 17 degrees from upright. Gains: `kp` 10, `kd` 0.3 (`kd` was seen to chatter between the motor limits at 2, because the derivative term acts on a one-tick-old velocity; keep it under 1), `maxSpeed` 6, `maxForce` 40.
 
 Getting here needed a solver change. With 12 sweeps per sub-step the legs crept under load and the robot sagged and tipped within 10,000 ticks (20 sweeps was not enough either; 28 held). A world with joints now uses up to 32 sweeps (`JOINT_ITERS`, the sweep still stops early when converged); a world without joints is unchanged. The switch is per world, not per island: one joint anywhere gives every contact up to 32 sweeps. A measured worst case, a 2,000-box pile settling in a world with one distant joint, cost about 45 ms per tick against 36 ms; once the pile sleeps the cost is the same. Every determinism hash of a jointed scene moved and was re-pinned.
+
+`assets/robots/humanoid.urdf` is a 37 kg biped: pelvis, torso and head, and per side a hip roll, hip pitch, knee, ankle pitch, shoulder and elbow (12 driven joints), with flat box feet. Holding every joint at 0 it stands 10,000 ticks with the pelvis within 8.6 degrees of upright, at 0.9 to 0.97 m, within 10 cm of where it landed (measured: 0.94 m, about 4 degrees and 4 cm). There is no humanoid walking gait: a biped needs balance feedback, which is not built (parked in PLAN.md).

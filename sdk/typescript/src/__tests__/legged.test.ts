@@ -68,6 +68,35 @@ describe('the quadruped asset', () => {
     }, 60_000);
 });
 
+describe('the humanoid asset', () => {
+    it('stands for 10,000 ticks on its feet: upright, at its standing height, near where it landed', () => {
+        const rt = new glue.Runtime(64, 1024);
+        rt.enable_physics();
+        const w = World.attachSync({ capacity: 64, ringCapacity: 1024 }, wasm.memory, 'fallback', layoutFromRuntime(rt), rt);
+        w.spawn({ y: -1, hx: 100, hy: 1, hz: 50, invMass: 0, friction: 1 });
+        const desc = parseUrdf(readFileSync(new URL('../../../../assets/robots/humanoid.urdf', import.meta.url), 'utf8'));
+        const bot = spawnRobot(w, desc, { position: [0, 0.94, 0], friction: 1 });
+        const driven = desc.joints.filter((j) => j.type !== 'fixed');
+        expect(driven).toHaveLength(12);
+        const pelvis = bot.links.get('pelvis')!;
+        let maxTilt = 0;
+        for (let t = 0; t < 10_000; t++) {
+            w.driveJoints(driven.map((j) => ({ joint: bot.joints.get(j.name)!, target: 0, gains: { kp: 10, kd: 0.3, maxSpeed: 6, maxForce: 150 } })));
+            w.step();
+            const tr = w.readTransforms();
+            const up = qrot(Array.from(tr.slice(pelvis.id * 7 + 3, pelvis.id * 7 + 7)) as [number, number, number, number], [0, 0, 1]);
+            maxTilt = Math.max(maxTilt, Math.acos(Math.max(-1, Math.min(1, up[1]))));
+        }
+        const tr = w.readTransforms();
+        expect(maxTilt).toBeLessThan(0.15);
+        expect(tr[pelvis.id * 7 + 1]).toBeGreaterThan(0.9);
+        expect(tr[pelvis.id * 7 + 1]).toBeLessThan(0.97);
+        expect(Math.hypot(tr[pelvis.id * 7], tr[pelvis.id * 7 + 2])).toBeLessThan(0.1);
+        // The head stays above the pelvis: it did not fold.
+        expect(tr[bot.links.get('head')!.id * 7 + 1] - tr[pelvis.id * 7 + 1]).toBeGreaterThan(0.5);
+    }, 60_000);
+});
+
 describe('trot', () => {
     const names = ['fl_abduct', 'fl_hip_pitch', 'fl_knee', 'hr_knee', 'tail'];
     it('starts at standing and eases in', () => {
