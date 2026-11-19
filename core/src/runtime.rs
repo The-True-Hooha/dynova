@@ -560,6 +560,14 @@ impl Runtime {
                 return found;
             }
             Command::JointMotor { id, vel, max } => return self.apply_joint_motor(id, vel, max),
+            Command::ParticleChain { id, desc } => {
+                // Particle columns and links are about 64 bytes a particle; the probe is the same one Grow and Checkpoint ask.
+                let ok = self.physics_enabled && (self.can_reserve)(desc.count as usize * 64) && self.physics.particles.create_chain(id, &desc);
+                if !ok {
+                    self.ring.note_malformed();
+                }
+                return ok;
+            }
             Command::KinematicBatch { count, samples } => return self.apply_kinematic_batch(&samples[..count as usize]),
             Command::Raycast { id, origin, dir, max_dist, ignore } => {
                 self.apply_raycast(id, origin, dir, max_dist, ignore);
@@ -2199,6 +2207,49 @@ mod tests {
             assert_eq!((rt.stale_dropped(), rt.malformed_dropped()), (stale, malformed), "replay re-counted diagnostics at {t}");
             assert_eq!((header(&rt, H_REC_START), header(&rt, H_REC_END)), (1, RUN), "seeking keeps the recorded range");
         }
+    }
+
+    fn chain(id: u32, from: [f32; 3]) -> Command {
+        let to = [from[0] + 2.0, from[1], from[2]];
+        Command::ParticleChain { id, desc: crate::physics::ChainDesc { from, to, count: 9, pin_first: true, pin_last: false, radius: 0.03, inv_mass: 1.0, stiffness: 1.0 } }
+    }
+
+    fn rope_script(rt: &mut Runtime, t: u32) {
+        match t {
+            0 => {
+                rt.ring.push(&Command::Record { on: true });
+                rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.1)));
+                rt.ring.push(&spawn_cmd(1, 0, BodyDesc::sphere_at([1.0, 0.2, 0.3], 0.3, 1.0, 0.2)));
+            }
+            // After the first keyframe, so a seek past it must replay the command to rebuild the rope.
+            70 => { rt.ring.push(&chain(5, [0.0, 3.0, 0.0])); }
+            75 => { rt.ring.push(&chain(5, [0.0, 4.0, 0.0])); }
+            80 => { rt.ring.push(&Command::ParticleChain { id: 6, desc: crate::physics::ChainDesc { count: 1, ..match chain(6, [0.0; 3]) { Command::ParticleChain { desc, .. } => desc, _ => unreachable!() } } }); }
+            90 => { rt.ring.push(&chain(7, [0.5, 2.0, 0.5])); }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn a_rope_made_by_command_is_recorded_replayed_and_reproduced_bit_for_bit_by_a_seek() {
+        let mut rt = Runtime::new(16, 256);
+        rt.enable_physics();
+        let mut hashes = vec![0u64];
+        for t in 0..200 {
+            rope_script(&mut rt, t);
+            rt.step();
+            hashes.push(rt.state_hash().unwrap());
+        }
+        assert_eq!(rt.physics.particles.groups.iter().map(|g| g.id).collect::<Vec<_>>(), vec![5, 7], "a taken id and a one-particle chain were refused");
+        assert_eq!(rt.malformed_dropped(), 2);
+        assert_ne!(hashes[71], hashes[70], "the rope appears in the hash");
+        for t in [200, 150, 100, 71, 70, 69, 120, 91, 90, 200] {
+            seek_to(&mut rt, t);
+            assert_eq!(rt.state_hash(), Some(hashes[t as usize]), "hash at {t}");
+        }
+        assert_eq!(rt.physics.particles.groups.len(), 2);
+        seek_to(&mut rt, 69);
+        assert!(rt.physics.particles.is_empty(), "before the command there is no rope");
     }
 
     #[test]

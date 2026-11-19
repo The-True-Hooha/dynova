@@ -7,12 +7,14 @@ mod accuracy;
 mod contact_accuracy;
 mod joints;
 mod kinematic;
+mod particles;
 mod query;
 mod snapshot;
 pub(crate) use snapshot::Fnv;
 pub use kinematic::{Kin, MAX_KIN_TICKS};
 pub use query::{OverlapHit, RayHit, MAX_OVERLAP_HITS, MAX_QUERY_RANGE, NO_BODY};
 pub use joints::{Joint, JointDesc, MAX_JOINTS, JOINT_BALL, JOINT_DISTANCE, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER, MAX_JOINT_ID, MIN_ROD_LENGTH};
+pub use particles::{ChainDesc, Group, Link, Particles, MAX_CHAIN, MAX_GROUP_ID, MAX_PARTICLES, MAX_PARTICLE_GROUPS, MAX_PARTICLE_RADIUS, MIN_PARTICLE_RADIUS};
 pub use snapshot::PhysicsSnapshot;
 
 const MIN_BUCKETS: usize = 4096;
@@ -105,6 +107,7 @@ pub struct PhysicsWorld {
     warm_cache: Vec<WarmEntry>,
     pub joints: Vec<Joint>,
     pub kin: Vec<Kin>,
+    pub particles: Particles,
     joint_prep: Vec<joints::Prepared>,
     jointed: Vec<u8>,
     joint_pairs: Vec<(u32, u32)>,
@@ -246,6 +249,7 @@ impl PhysicsWorld {
             warm_cache: Vec::new(),
             joints: Vec::new(),
             kin: Vec::new(),
+            particles: Particles::default(),
             joint_prep: Vec::new(),
             jointed: Vec::new(),
             joint_pairs: Vec::new(),
@@ -401,10 +405,16 @@ impl PhysicsWorld {
         self.vel_z[id] += iz * im;
     }
 
+    /// One tick: the rigid bodies, then the particles against the bodies they left.
+    pub fn step(&mut self) {
+        self.step_rigid();
+        self.step_particles();
+    }
+
     /// One tick. A world with joints runs `JOINT_SUBSTEPS` smaller steps inside it: a joint corrects position and velocity once per step, so
     /// a light link carrying a heavy swinging mass drifts by the square of the rotation it turns in one step, and quartering the step
     /// removes almost all of that. A world without joints takes one full step, exactly as before.
-    pub fn step(&mut self) {
+    fn step_rigid(&mut self) {
         let k = if self.joints.is_empty() { CONTACT_SUBSTEPS } else { JOINT_SUBSTEPS };
         if k == 1 {
             self.step_once(self.dt, 1, true, true);

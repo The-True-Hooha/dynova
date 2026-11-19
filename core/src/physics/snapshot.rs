@@ -17,6 +17,7 @@ pub struct PhysicsSnapshot {
     warm_cache: Vec<WarmEntry>,
     joints: Vec<Joint>,
     kin: Vec<Kin>,
+    particles: Particles,
     gravity: [f32; 3],
 }
 
@@ -51,6 +52,7 @@ impl PhysicsWorld {
             warm_cache: self.warm_cache.clone(),
             joints: self.joints.clone(),
             kin: self.kin.clone(),
+            particles: self.particles.clone(),
             gravity: [self.gx, self.gy, self.gz],
         }
     }
@@ -88,6 +90,7 @@ impl PhysicsWorld {
         self.warm_cache.clone_from(&s.warm_cache);
         self.joints.clone_from(&s.joints);
         self.kin.clone_from(&s.kin);
+        self.particles.clone_from(&s.particles);
         [self.gx, self.gy, self.gz] = s.gravity;
         true
     }
@@ -101,7 +104,7 @@ impl PhysicsSnapshot {
     pub fn hash(&self) -> u64 {
         let cols: Vec<&[f32]> = self.f32_cols.iter().map(|c| c.as_slice()).collect();
         hash_state(self.capacity, &cols, &self.hull_of, &self.island_of, &self.shape,
-            [&self.flags[0], &self.flags[1], &self.flags[2], &self.flags[3]], &self.contacts, &self.warm_cache, &self.joints, &self.kin, self.gravity)
+            [&self.flags[0], &self.flags[1], &self.flags[2], &self.flags[3]], &self.contacts, &self.warm_cache, &self.joints, &self.kin, &self.particles, self.gravity)
     }
 
     /// Heap bytes held, so a keyframe store can bound its memory.
@@ -111,6 +114,7 @@ impl PhysicsSnapshot {
             + self.warm_cache.len() * std::mem::size_of::<WarmEntry>()
             + self.joints.len() * std::mem::size_of::<Joint>()
             + self.kin.len() * std::mem::size_of::<Kin>()
+            + self.particles.approx_bytes()
     }
 }
 
@@ -119,7 +123,7 @@ impl PhysicsWorld {
     pub fn state_hash(&self) -> u64 {
         let cols: Vec<&[f32]> = self.f32_cols().iter().map(|c| c.as_slice()).collect();
         hash_state(self.capacity, &cols, &self.hull_of, &self.island_of, &self.shape,
-            [&self.active, &self.sleeping, &self.touching, &self.penetrating], &self.contacts, &self.warm_cache, &self.joints, &self.kin, [self.gx, self.gy, self.gz])
+            [&self.active, &self.sleeping, &self.touching, &self.penetrating], &self.contacts, &self.warm_cache, &self.joints, &self.kin, &self.particles, [self.gx, self.gy, self.gz])
     }
 }
 
@@ -158,6 +162,7 @@ fn hash_state(
     warm_cache: &[WarmEntry],
     joints: &[Joint],
     kin: &[Kin],
+    particles: &Particles,
     gravity: [f32; 3],
 ) -> u64 {
     let d = slot_defaults();
@@ -203,6 +208,8 @@ fn hash_state(
         for v in k.step.iter().chain(&k.to) { h.word(v.to_bits() as u64); }
         slots = slots.wrapping_add(h.finish());
     }
+    // Only a world that has particles hashes them, so every world without any hashes as it did before they existed.
+    if !particles.is_empty() { slots = slots.wrapping_add(particles.hash()); }
     let mut h = Fnv::new();
     h.word(slots);
     h.word(contacts.len() as u64);
