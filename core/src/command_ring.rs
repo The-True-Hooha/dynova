@@ -1,6 +1,6 @@
 use crate::collision::V3;
 use crate::hull::MAX_HULL_COORD;
-use crate::physics::{BodyDesc, ChainDesc, ClothDesc, JointDesc, MAX_COORD};
+use crate::physics::{BodyDesc, ChainDesc, ClothDesc, SoftDesc, JointDesc, MAX_COORD};
 use std::sync::atomic::{AtomicU32, Ordering};
 use wasm_bindgen::prelude::*;
 
@@ -29,6 +29,7 @@ pub const TAG_PARTICLE_CHAIN: u8 = 20;
 pub const TAG_PARTICLE_CLOTH: u8 = 21;
 pub const TAG_PARTICLE_ATTACH: u8 = 22;
 pub const TAG_PARTICLE_DETACH: u8 = 23;
+pub const TAG_PARTICLE_SOFT: u8 = 24;
 pub const HULL_VERTS_PER_SLOT: usize = 4;
 pub const KIN_SAMPLES_PER_SLOT: usize = 3;
 /// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
@@ -65,6 +66,12 @@ const OFF_CHAIN_INV_MASS: usize = 40;
 const OFF_CHAIN_STIFFNESS: usize = 44;
 
 const OFF_ATTACH_BODY: usize = 18;
+
+const OFF_SOFT_SIZE: usize = 18;
+const OFF_SOFT_N: usize = 30;
+const OFF_SOFT_RADIUS: usize = 36;
+const OFF_SOFT_INV_MASS: usize = 40;
+const OFF_SOFT_STIFFNESS: usize = 44;
 
 const OFF_CLOTH_U: usize = 18;
 const OFF_CLOTH_V: usize = 30;
@@ -131,6 +138,8 @@ pub enum Command {
     /// Particle number `particle` (counted from the first particle of the world's first group) rides on body `body` at `local` in its frame.
     ParticleAttach { particle: u32, body: u32, generation: u8, local: V3 },
     ParticleDetach { particle: u32 },
+    /// A soft block: a lattice of particles filling an axis-aligned box; `id` names the group.
+    ParticleSoft { id: u32, desc: SoftDesc },
 }
 
 impl Command {
@@ -142,7 +151,7 @@ impl Command {
             | Command::Teleport { id, generation, .. } => Some((*id, *generation)),
             Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } | Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. }
             | Command::JointCreate { .. } | Command::JointDestroy { .. } | Command::JointMotor { .. } | Command::KinematicBatch { .. }
-            | Command::Raycast { .. } | Command::OverlapSphere { .. } | Command::Checkpoint | Command::Reset | Command::ParticleChain { .. } | Command::ParticleCloth { .. } | Command::ParticleAttach { .. } | Command::ParticleDetach { .. } => None,
+            | Command::Raycast { .. } | Command::OverlapSphere { .. } | Command::Checkpoint | Command::Reset | Command::ParticleChain { .. } | Command::ParticleCloth { .. } | Command::ParticleAttach { .. } | Command::ParticleDetach { .. } | Command::ParticleSoft { .. } => None,
         }
     }
 }
@@ -319,6 +328,16 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             wr_f32x(b, OFF_POS, local);
             b[OFF_ATTACH_BODY..OFF_ATTACH_BODY + 4].copy_from_slice(&body.to_le_bytes());
         }
+        Command::ParticleSoft { id, desc } => {
+            b[0] = TAG_PARTICLE_SOFT;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&id.to_le_bytes());
+            wr_f32x(b, OFF_POS, &desc.origin);
+            wr_f32x(b, OFF_SOFT_SIZE, &desc.size);
+            for (k, n) in desc.n.iter().enumerate() { b[OFF_SOFT_N + k] = (*n).min(255) as u8; }
+            wr_f32(b, OFF_SOFT_RADIUS, desc.radius);
+            wr_f32(b, OFF_SOFT_INV_MASS, desc.inv_mass);
+            wr_f32(b, OFF_SOFT_STIFFNESS, desc.stiffness);
+        }
         Command::ParticleDetach { particle } => {
             b[0] = TAG_PARTICLE_DETACH;
             b[OFF_ID..OFF_ID + 4].copy_from_slice(&particle.to_le_bytes());
@@ -484,6 +503,17 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
             let local: V3 = rd_f32x(b, OFF_POS);
             let body = u32::from_le_bytes([b[OFF_ATTACH_BODY], b[OFF_ATTACH_BODY + 1], b[OFF_ATTACH_BODY + 2], b[OFF_ATTACH_BODY + 3]]);
             (all_finite(&local) && local.iter().all(|f| f.abs() <= MAX_COORD)).then_some(Command::ParticleAttach { particle: id, body, generation, local })
+        }
+        TAG_PARTICLE_SOFT => {
+            let desc = SoftDesc {
+                origin: rd_f32x(b, OFF_POS),
+                size: rd_f32x(b, OFF_SOFT_SIZE),
+                n: [b[OFF_SOFT_N] as u32, b[OFF_SOFT_N + 1] as u32, b[OFF_SOFT_N + 2] as u32],
+                radius: rd_f32(b, OFF_SOFT_RADIUS),
+                inv_mass: rd_f32(b, OFF_SOFT_INV_MASS),
+                stiffness: rd_f32(b, OFF_SOFT_STIFFNESS),
+            };
+            desc.is_valid().then_some(Command::ParticleSoft { id, desc })
         }
         TAG_PARTICLE_DETACH => Some(Command::ParticleDetach { particle: id }),
         TAG_PARTICLE_CLOTH => {
@@ -907,15 +937,15 @@ mod tests {
 
     #[test]
     fn wire_tags_are_pinned_to_the_values_the_typescript_ring_writes() {
-        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, TAG_CHECKPOINT, TAG_RESET, TAG_PARTICLE_CHAIN, TAG_PARTICLE_CLOTH, TAG_PARTICLE_ATTACH, TAG_PARTICLE_DETACH],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
+        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, TAG_CHECKPOINT, TAG_RESET, TAG_PARTICLE_CHAIN, TAG_PARTICLE_CLOTH, TAG_PARTICLE_ATTACH, TAG_PARTICLE_DETACH, TAG_PARTICLE_SOFT],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
         let mut ring = CommandRing::new(8);
         raw_slot(&mut ring, |b| { b[0] = 8; b[OFF_ID] = 3; b[OFF_GEN] = 2; b[OFF_POS..OFF_POS + 4].copy_from_slice(&1.5f32.to_le_bytes()); });
         raw_slot(&mut ring, |b| { b[0] = 9; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 10; b[OFF_ID] = 7; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 2; });
-        raw_slot(&mut ring, |b| { b[0] = 24; });
+        raw_slot(&mut ring, |b| { b[0] = 25; });
         let mut out = Vec::new();
         ring.drain_commands(8, &mut out);
         assert_eq!(out, vec![
@@ -924,7 +954,7 @@ mod tests {
             Command::Seek { tick: 7 },
             Command::Pause { on: true },
         ]);
-        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 24 (unassigned) are malformed");
+        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 25 (unassigned) are malformed");
     }
 
     #[test]
@@ -1240,6 +1270,33 @@ mod tests {
         raw_slot(&mut ring, |b| { encode_slot(&attach, b); wr_f32x(b, OFF_POS, &[2.0 * MAX_COORD, 0.0, 0.0]); });
         assert!(drain(&mut ring, &[]).is_empty());
         assert_eq!(ring.malformed_dropped(), 2);
+    }
+
+    fn soft_cmd() -> Command {
+        Command::ParticleSoft { id: 70_000, desc: SoftDesc { origin: [1.0, 2.0, 3.0], size: [0.5, 1.0, 2.0], n: [4, 12, 2], radius: 0.1, inv_mass: 2.0, stiffness: 0.75 } }
+    }
+
+    #[test]
+    fn a_soft_block_round_trips_and_a_malformed_one_is_dropped_whole() {
+        let mut ring = CommandRing::new(32);
+        assert!(ring.push(&soft_cmd()));
+        assert_eq!(drain(&mut ring, &[]), vec![soft_cmd()]);
+        assert_eq!(soft_cmd().target(), None);
+        let edits: [fn(&mut [u8; SLOT_BYTES]); 8] = [
+            |b| b[OFF_SOFT_N] = 1,
+            |b| b[OFF_SOFT_N + 2] = 13,
+            |b| wr_f32(b, OFF_SOFT_RADIUS, 0.0),
+            |b| wr_f32(b, OFF_SOFT_INV_MASS, f32::NAN),
+            |b| wr_f32(b, OFF_SOFT_STIFFNESS, 0.0),
+            |b| wr_f32x(b, OFF_SOFT_SIZE, &[0.0, 1.0, 1.0]),
+            |b| wr_f32x(b, OFF_SOFT_SIZE, &[f32::INFINITY, 1.0, 1.0]),
+            |b| wr_f32x(b, OFF_POS, &[2.0 * MAX_COORD, 0.0, 0.0]),
+        ];
+        for edit in &edits {
+            raw_slot(&mut ring, |b| { encode_slot(&soft_cmd(), b); edit(b); });
+        }
+        assert!(drain(&mut ring, &[]).is_empty());
+        assert_eq!(ring.malformed_dropped(), edits.len() as u32);
     }
 
     fn ray_cmd() -> Command {

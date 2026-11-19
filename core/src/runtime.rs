@@ -571,6 +571,14 @@ impl Runtime {
                 }
                 return ok;
             }
+            Command::ParticleSoft { id, desc } => {
+                let count = (desc.n[0] * desc.n[1] * desc.n[2]) as usize;
+                let ok = self.physics_enabled && (self.can_reserve)(count * crate::physics::PARTICLE_BYTES) && self.physics.particles.create_soft(id, &desc);
+                if !ok {
+                    self.ring.note_malformed();
+                }
+                return ok;
+            }
             Command::ParticleDetach { particle } => {
                 let found = self.physics_enabled && self.physics.particles.detach(particle);
                 if !found {
@@ -2335,6 +2343,32 @@ mod tests {
         assert!(rt.physics.particles.attachments.is_empty(), "the destroyed body's row and the detached one are gone");
         assert_eq!((rt.malformed_dropped(), rt.stale_dropped()), (1, 2), "a second attachment of one particle, a stale body, a second detach");
         for t in [160, 90, 76, 75, 74, 120, 101, 99, 160] {
+            seek_to(&mut rt, t);
+            assert_eq!(rt.state_hash(), Some(hashes[t as usize]), "hash at {t}");
+        }
+    }
+
+    #[test]
+    fn a_soft_block_made_by_command_is_replayed_and_reproduced_bit_for_bit_by_a_seek() {
+        let soft = |id| Command::ParticleSoft { id, desc: crate::physics::SoftDesc { origin: [-0.3, 2.0, -0.3], size: [0.6, 0.6, 0.6], n: [3, 3, 3], radius: 0.12, inv_mass: 1.0, stiffness: 0.9 } };
+        let mut rt = Runtime::new(16, 256);
+        rt.enable_physics();
+        let mut hashes = vec![0u64];
+        for t in 0..150 {
+            match t {
+                0 => {
+                    rt.ring.push(&Command::Record { on: true });
+                    rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, -0.5, 0.0], [10.0, 0.5, 10.0], 0.0, 0.1)));
+                }
+                70 => { rt.ring.push(&soft(2)); }
+                75 => { rt.ring.push(&soft(2)); }
+                _ => {}
+            }
+            rt.step();
+            hashes.push(rt.state_hash().unwrap());
+        }
+        assert_eq!((rt.physics.particles.groups.len(), rt.malformed_dropped()), (1, 1));
+        for t in [150, 100, 71, 70, 69, 120, 150] {
             seek_to(&mut rt, t);
             assert_eq!(rt.state_hash(), Some(hashes[t as usize]), "hash at {t}");
         }

@@ -14,8 +14,11 @@ pub const MAX_PARTICLE_GROUPS: usize = 1 << 12;
 pub const MAX_GROUP_ID: u32 = 1 << 24;
 pub const MAX_CHAIN: usize = 1024;
 pub const MAX_CLOTH_SIDE: u32 = 64;
+pub const MAX_SOFT_SIDE: u32 = 12;
+/// Links in one world. A tick costs about links x 8 iterations x 4 substeps, so this bounds the particle step (about 18 ms in a native release build) whatever the shapes.
+pub const MAX_LINKS: usize = 32768;
 /// What a particle costs in memory with its links, for the allocation probe.
-pub const PARTICLE_BYTES: usize = 160;
+pub const PARTICLE_BYTES: usize = 240;
 pub const MIN_PARTICLE_RADIUS: f32 = 1.0e-3;
 pub const MAX_PARTICLE_RADIUS: f32 = 100.0;
 pub const PARTICLE_SUBSTEPS: u32 = 4;
@@ -125,7 +128,74 @@ impl ClothDesc {
     }
 }
 
+/// An axis-aligned lattice of `n[0] * n[1] * n[2]` particles filling the box from `origin` to `origin + size`. Every particle is linked to its neighbours along the
+/// axes, across the faces and through the cell corners (13 of the 26 directions), so the lattice resists stretch and shear and, through the corner links, much of a collapse. There is no volume term and no collision between particles, so a hard enough impact can squash it flat and a block can be pushed slightly into a thin body.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoftDesc {
+    pub origin: V3,
+    pub size: V3,
+    pub n: [u32; 3],
+    pub radius: f32,
+    pub inv_mass: f32,
+    pub stiffness: f32,
+}
+
+impl SoftDesc {
+    pub fn is_valid(&self) -> bool {
+        self.origin.iter().chain(&self.size).all(|c| c.is_finite() && c.abs() <= MAX_COORD)
+            && self.size.iter().all(|s| *s > 1.0e-3)
+            && self.n.iter().all(|n| (2..=MAX_SOFT_SIDE).contains(n))
+            && (MIN_PARTICLE_RADIUS..=MAX_PARTICLE_RADIUS).contains(&self.radius)
+            && (0.0..=MAX_INV_MASS).contains(&self.inv_mass)
+            && self.stiffness > 0.0 && self.stiffness <= 1.0
+    }
+}
+
 impl Particles {
+    /// Fails, changing nothing, for a bad description, a taken id or a full table.
+    pub fn create_soft(&mut self, id: u32, d: &SoftDesc) -> bool {
+        let [nx, ny, nz] = d.n.map(|n| n as usize);
+        if id >= MAX_GROUP_ID || !d.is_valid() || self.groups.len() >= MAX_PARTICLE_GROUPS || self.groups.iter().any(|g| g.id == id) || self.len() + nx * ny * nz > MAX_PARTICLES {
+            return false;
+        }
+        let first = self.len() as u32;
+        let first_link = self.links.len();
+        let at = |i: usize, j: usize, k: usize| first + ((k * ny + j) * nx + i) as u32;
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    self.x.push(d.origin[0] + d.size[0] * i as f32 / (nx - 1) as f32);
+                    self.y.push(d.origin[1] + d.size[1] * j as f32 / (ny - 1) as f32);
+                    self.z.push(d.origin[2] + d.size[2] * k as f32 / (nz - 1) as f32);
+                    self.vx.push(0.0);
+                    self.vy.push(0.0);
+                    self.vz.push(0.0);
+                    self.inv_mass.push(d.inv_mass);
+                    self.radius.push(d.radius);
+                }
+            }
+        }
+        // The 13 directions that point "forward": the first nonzero component is positive.
+        let mut dirs = Vec::new();
+        for dk in -1i32..=1 { for dj in -1i32..=1 { for di in -1i32..=1 {
+            if (dk, dj, di) > (0, 0, 0) { dirs.push((di, dj, dk)); }
+        } } }
+        for k in 0..nz as i32 {
+            for j in 0..ny as i32 {
+                for i in 0..nx as i32 {
+                    for &(di, dj, dk) in &dirs {
+                        let (a, b, c) = (i + di, j + dj, k + dk);
+                        if a < 0 || b < 0 || c < 0 || a >= nx as i32 || b >= ny as i32 || c >= nz as i32 { continue; }
+                        self.push_link(at(i as usize, j as usize, k as usize), at(a as usize, b as usize, c as usize), d.stiffness);
+                    }
+                }
+            }
+        }
+        if !self.within_link_budget(first as usize, first_link) { return false; }
+        self.groups.push(Group { id, first, count: (nx * ny * nz) as u32 });
+        true
+    }
+
     fn push_link(&mut self, a: u32, b: u32, stiffness: f32) {
         let (a_, b_) = (a as usize, b as usize);
         let d = [self.x[b_] - self.x[a_], self.y[b_] - self.y[a_], self.z[b_] - self.z[a_]];
@@ -133,6 +203,14 @@ impl Particles {
     }
 
     /// Fails, changing nothing, for a bad description, a taken id or a full table.
+    /// Undoes a creation that would leave more than `MAX_LINKS` links.
+    fn within_link_budget(&mut self, first_particle: usize, first_link: usize) -> bool {
+        if self.links.len() <= MAX_LINKS { return true; }
+        for c in [&mut self.x, &mut self.y, &mut self.z, &mut self.vx, &mut self.vy, &mut self.vz, &mut self.inv_mass, &mut self.radius] { c.truncate(first_particle); }
+        self.links.truncate(first_link);
+        false
+    }
+
     pub fn create_cloth(&mut self, id: u32, d: &ClothDesc) -> bool {
         if id >= MAX_GROUP_ID || !d.is_valid() || self.groups.len() >= MAX_PARTICLE_GROUPS || self.groups.iter().any(|g| g.id == id) {
             return false;
@@ -142,6 +220,7 @@ impl Particles {
             return false;
         }
         let first = self.len() as u32;
+        let first_link = self.links.len();
         let at = |i: usize, j: usize| first + (j * nu + i) as u32;
         for j in 0..nv {
             for i in 0..nu {
@@ -173,6 +252,7 @@ impl Particles {
                 }
             }
         }
+        if !self.within_link_budget(first as usize, first_link) { return false; }
         self.groups.push(Group { id, first, count: (nu * nv) as u32 });
         true
     }
@@ -209,6 +289,7 @@ impl Particles {
         for k in 0..n - 1 {
             self.links.push(Link { a: first + k as u32, b: first + k as u32 + 1, rest, stiffness: d.stiffness });
         }
+        if !self.within_link_budget(first as usize, self.links.len() - (n - 1)) { return false; }
         self.groups.push(Group { id, first, count: d.count });
         true
     }
@@ -688,8 +769,13 @@ mod tests {
             assert_eq!(p, before);
         }
         let mut full = Particles::default();
-        for id in 0..(MAX_PARTICLES as u32 / (MAX_CLOTH_SIDE * MAX_CLOTH_SIDE)) { assert!(full.create_cloth(id, &sheet(0.0, MAX_CLOTH_SIDE))); }
-        assert!(!full.create_cloth(99, &sheet(0.0, 2)), "the particle table is full");
+        assert!(full.create_cloth(0, &sheet(0.0, MAX_CLOTH_SIDE)), "one 64 by 64 cloth fits the link budget");
+        assert!(!full.create_cloth(1, &sheet(0.0, MAX_CLOTH_SIDE)), "a second would pass it");
+        let mut crowded = Particles::default();
+        for id in 0..(MAX_PARTICLES / (MAX_CLOTH_SIDE as usize * 2)) as u32 {
+            if !crowded.create_cloth(id, &ClothDesc { nu: MAX_CLOTH_SIDE, nv: 2, bend_stiffness: 0.0, ..sheet(0.0, 2) }) { break; }
+        }
+        assert!(crowded.len() <= MAX_PARTICLES);
     }
 
     #[test]
@@ -997,5 +1083,106 @@ mod tests {
         assert!(w.sleeping[0], "a zero impulse woke it");
         w.apply_impulse_at(0, [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]);
         assert!(!w.sleeping[0], "a real one wakes it");
+    }
+
+    fn block(height: f32, stiffness: f32) -> SoftDesc {
+        SoftDesc { origin: [-0.4, height, -0.4], size: [0.8, 0.8, 0.8], n: [4, 4, 4], radius: 0.13, inv_mass: 1.0, stiffness }
+    }
+
+    #[test]
+    fn a_soft_block_has_the_particles_and_the_thirteen_direction_links_its_lattice_implies() {
+        let mut p = Particles::default();
+        assert!(p.create_soft(1, &block(0.0, 1.0)));
+        assert_eq!(p.len(), 64);
+        // Per direction (di, dj, dk) in {-1,0,1}: (4 - |di|) * (4 - |dj|) * (4 - |dk|) links, over the 13 forward directions.
+        let mut want = 0;
+        for dk in -1i32..=1 { for dj in -1i32..=1 { for di in -1i32..=1 {
+            if (dk, dj, di) > (0, 0, 0) { want += (4 - di.abs()) * (4 - dj.abs()) * (4 - dk.abs()); }
+        } } }
+        assert_eq!(p.links.len(), want as usize);
+        let spacing = 0.8 / 3.0;
+        assert!(p.links.iter().all(|l| [1.0, 2f32.sqrt(), 3f32.sqrt()].iter().any(|k| (l.rest - spacing * k).abs() < 1e-5)));
+        let mut bad = Particles::default();
+        for d in [SoftDesc { n: [1, 4, 4], ..block(0.0, 1.0) }, SoftDesc { n: [4, 17, 4], ..block(0.0, 1.0) }, SoftDesc { size: [0.0, 1.0, 1.0], ..block(0.0, 1.0) }, SoftDesc { stiffness: 2.0, ..block(0.0, 1.0) }, SoftDesc { radius: 0.0, ..block(0.0, 1.0) }] {
+            assert!(!bad.create_soft(1, &d), "{d:?}");
+        }
+        assert!(bad.is_empty());
+    }
+
+    fn settle(stiffness: f32, height: f32) -> PhysicsWorld {
+        let mut w = world();
+        w.spawn(0, &BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.0));
+        assert!(w.particles.create_soft(0, &block(height, stiffness)));
+        for _ in 0..420 { w.step(); }
+        w
+    }
+
+    #[test]
+    fn a_soft_block_dropped_on_the_floor_rests_on_it_keeping_its_shape() {
+        let w = settle(1.0, 1.0);
+        let p = &w.particles;
+        let (lo, hi) = (p.y.iter().cloned().fold(f32::MAX, f32::min), p.y.iter().cloned().fold(f32::MIN, f32::max));
+        assert!((lo - 0.13).abs() < 0.03, "the bottom particles rest a radius above the floor: {lo}");
+        assert!(hi - lo > 0.8 * 0.8, "the block kept at least 80 percent of its height: {}", hi - lo);
+        assert!(hi - lo < 0.8 * 1.1, "and did not grow: {}", hi - lo);
+        let width = p.x.iter().cloned().fold(f32::MIN, f32::max) - p.x.iter().cloned().fold(f32::MAX, f32::min);
+        assert!((width - 0.8).abs() < 0.15, "width {width}");
+        assert!(p.vx.iter().chain(&p.vy).chain(&p.vz).all(|v| v.abs() < 0.2), "still moving");
+    }
+
+    #[test]
+    fn a_softer_block_squashes_more_in_the_impact() {
+        let squash = |stiffness: f32| {
+            let mut w = world();
+            w.spawn(0, &BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.0));
+            assert!(w.particles.create_soft(0, &block(6.0, stiffness)));
+            let mut least = f32::MAX;
+            for _ in 0..240 {
+                w.step();
+                let y = &w.particles.y;
+                least = least.min(y.iter().cloned().fold(f32::MIN, f32::max) - y.iter().cloned().fold(f32::MAX, f32::min));
+            }
+            least
+        };
+        assert!(squash(0.05) < squash(1.0) - 0.02, "{} vs {}", squash(0.05), squash(1.0));
+    }
+
+    #[test]
+    fn a_soft_block_lands_on_a_box_and_the_box_is_pushed_down() {
+        let mut w = world();
+        w.spawn(0, &BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.0));
+        w.spawn(1, &BodyDesc::box_at([0.0, 0.3, 0.0], [0.6, 0.3, 0.6], 1.0, 0.0));
+        assert!(w.particles.create_soft(0, &SoftDesc { inv_mass: 0.2, ..block(1.5, 1.0) }));
+        let mut lowest = f32::MAX;
+        for _ in 0..50 { w.step(); lowest = lowest.min(w.vel_y[1]); }
+        assert!(lowest < -0.05, "the box felt the block land: {lowest}");
+    }
+
+    #[test]
+    fn a_soft_block_snapshot_round_trips_bit_for_bit() {
+        let mut w = world();
+        w.spawn(0, &BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.0));
+        assert!(w.particles.create_soft(0, &block(0.6, 0.8)));
+        for _ in 0..30 { w.step(); }
+        let snap = w.capture();
+        for _ in 0..60 { w.step(); }
+        let later = w.state_hash();
+        assert!(w.restore(&snap));
+        for _ in 0..60 { w.step(); }
+        assert_eq!(w.state_hash(), later);
+    }
+
+    #[test]
+    fn the_link_budget_refuses_what_would_exceed_it_and_leaves_nothing_behind() {
+        let mut p = Particles::default();
+        let big = SoftDesc { n: [12, 12, 12], ..block(0.0, 1.0) };
+        let mut made = 0;
+        while p.create_soft(made, &big) { made += 1; }
+        assert!(made >= 1 && p.links.len() <= MAX_LINKS);
+        let (len, links, groups) = (p.len(), p.links.len(), p.groups.len());
+        assert!(!p.create_soft(99, &big));
+        assert_eq!((p.len(), p.links.len(), p.groups.len()), (len, links, groups));
+        for c in [&p.x, &p.y, &p.z, &p.vx, &p.vy, &p.vz, &p.inv_mass, &p.radius] { assert_eq!(c.len(), len); }
+        assert!(p.groups.iter().all(|g| (g.first + g.count) as usize <= len));
     }
 }

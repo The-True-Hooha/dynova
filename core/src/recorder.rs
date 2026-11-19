@@ -65,7 +65,7 @@ impl Recorder {
         matches!(
             cmd,
             Command::Spawn { .. } | Command::Destroy { .. } | Command::Force { .. } | Command::Teleport { .. } | Command::Gravity { .. }
-                | Command::JointCreate { .. } | Command::JointDestroy { .. } | Command::JointMotor { .. } | Command::KinematicBatch { .. } | Command::ParticleChain { .. } | Command::ParticleCloth { .. } | Command::ParticleAttach { .. } | Command::ParticleDetach { .. }
+                | Command::JointCreate { .. } | Command::JointDestroy { .. } | Command::JointMotor { .. } | Command::KinematicBatch { .. } | Command::ParticleChain { .. } | Command::ParticleCloth { .. } | Command::ParticleAttach { .. } | Command::ParticleDetach { .. } | Command::ParticleSoft { .. }
         )
     }
 

@@ -27,6 +27,15 @@ The ring command `ParticleCloth` (tag 21, logged and replayed): a `nu` by `nv` s
 - A body smaller than the gap between particles (spacing minus two radii) can pass between them; choose a radius of at least half the spacing.
 - Per tick, each group finds the bodies near it once (a box of its extent plus 100 m/s of travel), so bodies far away cost nothing. A 64 by 64 cloth is 4,096 particles and about 25,000 links.
 
+## Soft blocks
+
+The ring command `ParticleSoft` (tag 24, logged and replayed): an axis-aligned lattice of 2 to 12 particles a side filling a box (`origin`, `size`), with radius, inverse mass and link stiffness. Each particle is linked to its neighbours along the axes, across the faces and through the cell corners (13 of the 26 directions), so the block resists stretch and shear and much of a collapse. A block dropped on the floor rests on it keeping at least 80 percent of its height, a softer one squashes more in the impact, and one landing on a box pushes it down (tests).
+
+- There is no volume term and no collision between particles (or between groups), so a hard enough impact can squash a block flat and a block can be pushed slightly into a thin body. A 60 m drop with radius 0.03 put particle centres 2 cm into the floor.
+- Blocks are axis-aligned when made; to tilt one, make it and attach it to a rotating body.
+
+Cost is bounded for the whole world by `MAX_LINKS` (32,768 links, about 18 ms a tick in a native release build for the particle step at the limit): a command that would pass it is refused, and a 64 by 64 cloth is about 24,000 links.
+
 ## Attachments and coupling
 
 Ring commands `ParticleAttach` (tag 22: particle, body id and generation, offset in the body's frame) and `ParticleDetach` (tag 23), logged and replayed. The particle number is its index in the world's particle columns (the first particle of a group is the group's `first`, which is the sum of the counts of the groups made before it). A particle has at most one attachment; a particle with no row is free. A destroyed body releases its attachments in the same step, even if a new body takes its slot.
