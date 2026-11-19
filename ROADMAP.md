@@ -168,6 +168,33 @@ Goal: remove the solver limits found while building Phases 6 to 9 (heavy end mas
 - **11D (not needed)** joint-aware friction ordering; then a direct solve for joint chains (articulated bodies), which is a separate large project.
 - **Exit:** a 10-link chain with a 50x end mass stays within 5 cm, a 2 m hinged door sags under 1 cm, the demo robot follows a path needing a 50 percent wheel-speed split without tipping, and the 5000-entity frame budget and every determinism pin hold.
 
+## Phases 12 to 18 — Robot learning and materials (added 2026-11-19 with the user's approval)
+Goal: close the gap with robot-learning engines such as Alloy (many parallel worlds, camera sensors, an RL environment API, an asset library, legged robots, deformables, fluids and an optional GPU backend) while the CPU path stays the deterministic reference. Targets everyone: browser users first, Python users who want to push throughput second. Each phase starts with tests that fail today and ends with every determinism pin re-derived on native aarch64, native x86_64, Chromium and WebKit. Order is fixed; a later phase does not start before the earlier one's exit passes.
+
+- **Phase 12 — Parallel worlds and the RL environment API**
+  - **12A** A batch of N independent worlds with their own state, stepped together (workers or WASM threads in the browser, native threads headless). Each world stays bit-identical to the same world run alone.
+  - **12B** TypeScript environment API: `reset`, `step`, observation and reward buffers, per-world done flags, seeds. No per-entity calls on the read path.
+  - **12C** Python bindings over the same core. Spike first: native wheels (PyO3) against the WASM build under a Python runtime; pick by measured step rate and by whether the results stay bit-identical to the browser. Gym-style `reset`/`step` on batched numpy arrays.
+  - **Exit:** 256 worlds of the arm scene step in parallel in Node and from Python; each world's state hash equals the single-world run; step rate is measured and recorded in `docs/`.
+- **Phase 13 — Contact accuracy** (largest risk: moves every pinned hash again)
+  - Goal: contact-rich manipulation and legged contact that holds up against MuJoCo on a fixed scene set. Candidates, chosen by measurement: friction cone and torsional friction, soft or compliant contacts, a stronger solver for contacts (block or Newton-style), grasp stability, contact friction tangents that no longer switch basis. A scene suite compares against recorded reference numbers; no MuJoCo dependency in the build.
+  - **Exit:** a two-finger grasp holds a box under gravity and a lift; a box on an incline slides at the analytic rate; a stack of 20 is stable; step cost at 1k and 5k bodies is re-measured and the 5000-entity frame budget holds.
+- **Phase 14 — Camera sensors**
+  - Depth, colour-id and segmentation images per world from CPU raycasting on the existing grid, batched through a result buffer; a lens model; images for all worlds in one call.
+  - **Exit:** a depth image of a known scene matches analytic distances within 1 mm; segmentation ids match entity ids; 64 worlds at 64x64 are rendered in a measured time.
+- **Phase 15 — Assets, robot descriptions and legged robots**
+  - URDF and MJCF import (links, joints, collision shapes) into the joint table, an asset set with licences recorded, a quadruped and a humanoid, standing and walking controllers.
+  - **Exit:** an imported arm matches its description's pose by forward kinematics; a quadruped stands for 10k ticks and takes steps without tipping; the assets load in the browser and from Python.
+- **Phase 16 — Particles, cloth, cables and soft bodies**
+  - A position-based particle solver with distance and bending constraints, collisions with rigid bodies, attachment to rigid bodies and joints, in the snapshot, replay and state hash.
+  - **Exit:** a cloth drapes over a box and settles; a cable swings from a hinge; a soft block is dropped and rests; a robot pushes a cable; seek round trip is bit-identical.
+- **Phase 17 — Fluids and granular materials**
+  - Particle fluids and sand (position-based density constraints and friction), coupled to rigid bodies, with a particle budget measured in the browser frame budget.
+  - **Exit:** a column of fluid collapses into a basin and the level settles to the analytic volume within 5 percent; a heap of sand holds an angle of repose; a rigid body floats at its analytic depth.
+- **Phase 18 — Optional GPU backend**
+  - A separate WebGPU compute path for batched worlds, opt-in only. Results are not bit-identical across GPUs; the CPU path stays the deterministic reference and its pins do not move. The GPU path is checked against the CPU by a tolerance suite, not by hash.
+  - **Exit:** the arm scene at 4096 worlds runs faster than the CPU batch on a measured GPU and stays within the stated tolerance of the CPU state; the CPU hashes are untouched.
+
 ---
 
 ## Cross-phase invariants (never regress)
