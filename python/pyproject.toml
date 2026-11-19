@@ -14,7 +14,7 @@ dependencies = ["numpy>=1.24", "wasmtime>=25"]
 test = ["pytest>=8"]
 
 [tool.setuptools]
-packages = ["dynova"]
+packages = ["dynova", "dynova.envs"]
 
 [tool.setuptools.package-data]
 dynova = ["_data/*.wasm"]

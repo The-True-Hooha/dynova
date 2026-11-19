@@ -1,4 +1,4 @@
-.PHONY: build build-release build-st e2e dev test install clean check all package consumer-test consumer-test-pnpm test-python
+.PHONY: build build-release build-st e2e dev test install clean check all package consumer-test consumer-test-pnpm test-python package-python consumer-test-python
 
 # Build WASM (dev, faster compile)
 build:
@@ -67,3 +67,14 @@ consumer-test-pnpm: package
 # Python package tests against the single-threaded wasm build. Needs `pip install -e "python[test]"` in the interpreter that `python3` names.
 test-python: build-st
 	cd python && python3 -m pytest -q
+
+# A wheel that carries the single-threaded wasm. Needs uv.
+package-python: build-st
+	mkdir -p python/dynova/_data
+	cp sdk/typescript/wasm-st/dynova_core_bg.wasm python/dynova/_data/
+	rm -rf python/dist
+	uv build --quiet --wheel python --out-dir python/dist
+
+# Installs that wheel into a clean virtualenv away from the checkout and runs a world from it.
+consumer-test-python: package-python
+	sh scripts/python-wheel-test.sh

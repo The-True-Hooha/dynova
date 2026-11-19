@@ -313,7 +313,7 @@ def test_a_world_refuses_to_be_touched_while_its_batch_steps():
         real = b._groups[0].batch.step_all
 
         def step_and_poke():
-            for call in (lambda: b.worlds[0].spawn(), lambda: b.worlds[1].read_transforms()):
+            for call in (lambda: b.worlds[0].spawn(), lambda: b.worlds[1].read_transforms(), lambda: b.worlds[1].ticks, lambda: b.worlds[1].malformed_dropped, lambda: b.worlds[1].pending_commands):
                 try:
                     call()
                 except RuntimeError as err:
@@ -322,5 +322,33 @@ def test_a_world_refuses_to_be_touched_while_its_batch_steps():
 
         b._groups[0].batch.step_all = step_and_poke
         assert b.step() == []
-        assert len(seen) == 2 and all("stepping" in m for m in seen)
+        assert len(seen) == 5 and all("stepping" in m for m in seen)
         b.worlds[0].spawn()
+
+
+def test_a_dropped_batch_is_freed_by_reference_counting_not_left_to_the_cycle_collector():
+    import gc
+    import weakref
+    gc.collect()
+    gc.disable()
+    try:
+        b = one()
+        drop_scene(b.worlds[0])
+        run(b, 2)
+        b.worlds[0].read_transforms()
+        ref = weakref.ref(b.worlds[0]._inst)
+        del b
+        assert ref() is None
+    finally:
+        gc.enable()
+
+
+def test_the_memory_view_is_rebuilt_after_a_call_into_the_module_and_reused_between_calls():
+    with one() as b:
+        inst = b.worlds[0]._inst
+        first = inst.mem()
+        assert inst.mem() is first
+        run(b, 1)
+        second = inst.mem()
+        assert second is not first
+        assert inst.mem() is second

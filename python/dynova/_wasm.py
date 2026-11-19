@@ -1,7 +1,7 @@
 """Hosts `dynova_core_bg.wasm` with wasmtime: the six imports wasm-bindgen asks for, the exports a batch needs, and views onto linear memory.
 
 Linear memory moves whenever the module grows, which any step can do, so a view is only good until the next call into the module;
-`Instance.mem()` rebuilds it when the base or length changed.
+`Instance.mem()` builds a fresh one after every call.
 """
 from __future__ import annotations
 
@@ -80,7 +80,6 @@ class Instance:
         self.busy = False
         self._host = _Host()
         self._view: Optional[np.ndarray] = None
-        self._view_key = (0, 0)
         imports = []
         for imp in module.imports:
             params, results = list(imp.type.params), list(imp.type.results)
@@ -118,8 +117,9 @@ class Instance:
     def call(self, name: str, *args: int):
         if self.failed is not None:
             raise WasmTrap(f"the wasm instance already failed: {self.failed}")
-        # Only what the module says during this call can explain it.
+        # Only what the module says during this call can explain it. Memory can only move inside a call into the module, so the view is rebuilt after one.
         self._host.message = None
+        self._view = None
         try:
             return self._exports[name](self._store, *args)
         except (Trap, WasmtimeError) as err:
@@ -127,16 +127,26 @@ class Instance:
             raise WasmTrap(self.failed) from err
 
     def mem(self) -> np.ndarray:
-        """Writable bytes of all of linear memory, valid until the next call into the module."""
-        memory = self._exports["memory"]
-        base = ctypes.cast(memory.data_ptr(self._store), ctypes.c_void_p).value or 0
-        length = memory.data_len(self._store)
-        if self._view is None or self._view_key != (base, length):
-            raw = np.ctypeslib.as_array(ctypes.cast(base, ctypes.POINTER(ctypes.c_ubyte)), shape=(length,))
-            self._view = raw.view(_Linked)
-            self._view._owner = self
-            self._view_key = (base, length)
-        return self._view
+        """Writable bytes of all of linear memory for use inside the package, valid until the next call into the module.
+
+        Not safe while another thread steps this instance, so it refuses then. The cached view has no reference back to the instance (that would
+        make a cycle that only the cyclic collector frees); `owned` makes one that has.
+        """
+        if self.busy:
+            raise RuntimeError("the batch is stepping; its memory cannot be read from another thread until step() returns")
+        view = self._view
+        if view is None:
+            memory = self._exports["memory"]
+            base = ctypes.cast(memory.data_ptr(self._store), ctypes.c_void_p).value or 0
+            length = memory.data_len(self._store)
+            view = self._view = np.ctypeslib.as_array(ctypes.cast(base, ctypes.POINTER(ctypes.c_ubyte)), shape=(length,))
+        return view
+
+    def owned(self, view: np.ndarray) -> np.ndarray:
+        """`view` (a slice of `mem()`), made to keep this instance and its memory alive for as long as it or any slice of it exists."""
+        linked = view.view(_Linked)
+        linked._owner = self
+        return linked
 
     def words(self, address: int, count: int) -> np.ndarray:
         """`count` u32 words at `address` (a multiple of 4), as a view."""

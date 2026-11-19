@@ -355,7 +355,7 @@ class World:
         capacity = int(header[w.H_CAPACITY])
         at = int(header[w.H_BUF0 + index])
         view = self._inst.mem()[at : at + capacity * w.FLOATS_PER_TRANSFORM * 4].view(np.float32).reshape(capacity, w.FLOATS_PER_TRANSFORM)
-        return view.copy() if copy else view
+        return view.copy() if copy else self._inst.owned(view)
 
     def read_joint_states(self) -> np.ndarray:
         """Structured rows `(joint, kind, position, velocity)` of every hinge, slider and distance joint at the last published tick (a copy)."""
