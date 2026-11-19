@@ -176,7 +176,7 @@ Goal: close the gap with robot-learning engines such as Alloy (many parallel wor
   - **12B (done, docs/env.md; `Checkpoint` and `Reset` ring commands)** TypeScript environment API: `reset`, `step`, observation and reward buffers, per-world done flags, seeds. No per-entity calls on the read path.
   - **12C (done, docs/python.md, docs/decisions/python.md)** Python bindings over the same core. Spike first: native wheels (PyO3) against the WASM build under a Python runtime; pick by measured step rate and by whether the results stay bit-identical to the browser. Gym-style `reset`/`step` on batched numpy arrays.
   - **Exit:** 256 worlds of the arm scene step in parallel in Node and from Python; each world's state hash equals the single-world run; step rate is measured and recorded in `docs/`.
-- **Phase 13 — Contact accuracy** (largest risk: moves every pinned hash again)
+- **Phase 13 — Contact accuracy (done, docs/contacts.md: the exit scenes pass; no MuJoCo comparison)** (largest risk: moves every pinned hash again)
   - Goal: contact-rich manipulation and legged contact that holds up against MuJoCo on a fixed scene set. Candidates, chosen by measurement: friction cone and torsional friction, soft or compliant contacts, a stronger solver for contacts (block or Newton-style), grasp stability, contact friction tangents that no longer switch basis. A scene suite compares against recorded reference numbers; no MuJoCo dependency in the build.
   - **Exit:** a two-finger grasp holds a box under gravity and a lift; a box on an incline slides at the analytic rate; a stack of 20 is stable; step cost at 1k and 5k bodies is re-measured and the 5000-entity frame budget holds.
 - **Phase 14 — Camera sensors**

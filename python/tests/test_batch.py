@@ -7,8 +7,8 @@ from dynova._wasm import Instance
 from helpers import bits, drop_scene, run
 
 # Pinned in core/src/determinism.rs and docs/decisions/determinism.md: native, Chromium and WebKit produce these.
-SCENE = [13348242057567185977, 8317036014868065234, 8317036014868065234, 13348242057567185977]
-JOINT_SCENE = [13978249971055882505, 309544726468439355, 309544726468439355, 13978249971055882505]
+SCENE = [17533006936851158103, 7396268202019089366, 7396268202019089366, 17533006936851158103]
+JOINT_SCENE = [15465293547640079592, 15165457805995745632, 15165457805995745632, 15465293547640079592]
 
 
 def scene_of(instance: Instance, export: str):
@@ -240,3 +240,12 @@ def test_a_constructor_that_fails_part_way_frees_every_wasm_batch_it_made(monkey
     with pytest.raises(RuntimeError, match="third world"):
         Batch(4, capacity=8, ring_capacity=16, workers=2)
     assert len(made) == 2 and [m.freed_count for m in made] == [1, 1]
+
+
+def test_a_source_checkouts_build_is_preferred_to_the_copy_a_package_build_left_behind(monkeypatch):
+    from dynova import _wasm
+    monkeypatch.delenv("DYNOVA_WASM", raising=False)
+    order = [p.parent.name if p.parent.name != "_data" else "package" for p in _wasm._candidates()]
+    assert order == ["wasm-st", "package"]
+    monkeypatch.setenv("DYNOVA_WASM", "/nonexistent/x.wasm")
+    assert str(_wasm._candidates()[0]) == "/nonexistent/x.wasm" and len(_wasm._candidates()) == 3

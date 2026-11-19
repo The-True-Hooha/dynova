@@ -103,7 +103,7 @@ async function run() {
         origin = [-4, -3];
         add(world.spawn({ x: 0, y: 0, z: -0.5, hx: 40, hy: 40, hz: 0.5, invMass: 0, friction: 1 }), [0, 0]);
         // The chassis slides on the floor (no friction) and the two capsule wheels, axes along y, carry all the traction.
-        const chassis = add(world.spawn({ x: 0, y: 0, z: 0.08, hx: 0.6, hy: 0.35, hz: 0.08, invMass: 1, friction: 0 }), [1.2, 0.7], '#44aaff');
+        const chassis = add(world.spawn({ x: 0, y: 0, z: 0.09, hx: 0.6, hy: 0.35, hz: 0.08, invMass: 1, friction: 0 }), [1.2, 0.7], '#44aaff');
         const wheels: JointHandle[] = [];
         for (const side of [1, -1]) {
             const wheel = add(world.spawn({ x: 0, y: side * WHEEL_OFFSET, z: 0.3, shape: SHAPE_CAPSULE, hx: 0.3, hy: 0.1, invMass: 1, friction: 0.6 }), [0.6, 0.2], '#ffaa44');

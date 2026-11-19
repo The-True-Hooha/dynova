@@ -274,7 +274,7 @@ fn the_first_joint_scales_cached_warm_start_impulses_to_the_sub_step_and_the_las
     w.spawn(7, &BodyDesc::sphere_at([501.0, 500.0, 500.0], 0.2, 1.0, 0.0));
     assert!(w.create_joint(0, &ball(6, 7, [500.5, 500.0, 500.0])));
     for (e, b) in w.warm_cache.iter().zip(&before) {
-        assert!((e.lambda * JOINT_SUBSTEPS as f32 - b).abs() < 1e-4 * b.abs().max(1.0), "{} against {b}", e.lambda);
+        assert!((e.lambda * (JOINT_SUBSTEPS as f32 / CONTACT_SUBSTEPS as f32) - b).abs() < 1e-4 * b.abs().max(1.0), "{} against {b}", e.lambda);
     }
     assert!(w.destroy_joint(0));
     for (e, b) in w.warm_cache.iter().zip(&before) {

@@ -1835,7 +1835,7 @@ mod tests {
             assert!(c.iter().all(|v| v.is_finite()), "entity {id}: {c:?}");
             assert!(id == 0 || (c[1] > -4.6 && c[1] < 6.0), "entity {id} left the scene: y={}", c[1]);
         }
-        assert_eq!(h, 2762124975456161600);
+        assert_eq!(h, 14598608199652572339);
         for (id, c) in buf.chunks(7).enumerate().take(30) {
             let len_sq: f32 = c[3..7].iter().map(|q| q * q).sum();
             assert!((len_sq - 1.0).abs() < 1e-4, "entity {id} quaternion not unit: {c:?}");

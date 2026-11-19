@@ -15,7 +15,7 @@ async function run() {
     world.spawn({ y: -0.5, hx: 30, hy: 0.5, hz: 30, invMass: 0, restitution: 0 });
     for (let r = 0; r < ROWS; r++) {
         for (let c = 0; c < COLS; c++) {
-            const x = (c - (COLS - 1) / 2) * 1.02 + (r % 2 ? 0.5 : 0);
+            const x = (c - (COLS - 1) / 2) * 1.02 + (r % 2 ? 0.25 : 0);
             world.spawn({ x, y: 0.5 + r * 1.02, hx: 0.5, hy: 0.5, hz: 0.5, invMass: 1, restitution: 0 });
         }
     }

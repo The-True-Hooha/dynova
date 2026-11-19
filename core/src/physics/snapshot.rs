@@ -219,7 +219,8 @@ fn hash_state(
         h.word(e.a as u64);
         h.word(e.b as u64);
         h.word(e.k as u64);
-        for v in [e.lambda, e.lt1, e.lt2] { h.word(v.to_bits() as u64); }
+        for v in [e.lambda, e.lt1, e.lt2, e.pt[0], e.pt[1], e.pt[2], e.n[0], e.n[1], e.n[2]] { h.word(v.to_bits() as u64); }
+        h.word(e.first as u64);
     }
     for v in gravity { h.word(v.to_bits() as u64); }
     h.finish()
@@ -278,7 +279,7 @@ mod tests {
             ("touching", Box::new(|w| w.touching[2] = true)),
             ("penetrating", Box::new(|w| w.penetrating[2] = true)),
             ("gravity", Box::new(|w| w.gy = -1.0)),
-            ("warm", Box::new(|w| w.warm_cache.push(WarmEntry { a: 0, b: 1, k: 9, lambda: 1.0, lt1: 0.0, lt2: 0.0 }))),
+            ("warm", Box::new(|w| w.warm_cache.push(WarmEntry::bare(0, 1, 9, 1.0)))),
             ("contact", Box::new(|w| w.contacts[0].lt2 += 1.0)),
             ("contact count", Box::new(|w| { let c = w.contacts[0]; w.contacts.push(c); })),
         ];
@@ -354,7 +355,7 @@ mod tests {
     fn every_contact_warm_and_gravity_field_reaches_the_hash() {
         type Mutation = Box<dyn Fn(&mut PhysicsWorld)>;
         macro_rules! contact { ($f:ident, $v:expr) => { Box::new(|w: &mut PhysicsWorld| w.contacts[0].$f = $v) as Mutation } }
-        macro_rules! warm { ($f:ident, $v:expr) => { Box::new(|w: &mut PhysicsWorld| { w.warm_cache.push(WarmEntry { a: 0, b: 1, k: 0, lambda: 0.0, lt1: 0.0, lt2: 0.0 }); w.warm_cache[0].$f = $v }) as Mutation } }
+        macro_rules! warm { ($f:ident, $v:expr) => { Box::new(|w: &mut PhysicsWorld| { w.warm_cache.push(WarmEntry::bare(0, 1, 0, 0.0)); w.warm_cache[0].$f = $v }) as Mutation } }
         let mutations: Vec<(&str, Mutation)> = vec![
             ("a", contact!(a, 5)), ("b", contact!(b, 5)), ("key", contact!(key, 9)),
             ("nx", contact!(nx, 9.0)), ("ny", contact!(ny, 9.0)), ("nz", contact!(nz, 9.0)),
@@ -405,7 +406,7 @@ mod tests {
         let contacts = w.contacts.len();
         assert!(contacts > 0);
         assert_eq!(base, 8 * per_slot + contacts * std::mem::size_of::<Contact>() + w.warm_cache.len() * std::mem::size_of::<WarmEntry>());
-        w.warm_cache.push(WarmEntry { a: 0, b: 1, k: 0, lambda: 1.0, lt1: 0.0, lt2: 0.0 });
+        w.warm_cache.push(WarmEntry::bare(0, 1, 0, 1.0));
         assert_eq!(w.capture().approx_bytes(), base + std::mem::size_of::<WarmEntry>());
     }
 }

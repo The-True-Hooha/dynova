@@ -283,9 +283,9 @@ impl PhysicsWorld {
     /// the snapshot.
     fn rescale_warm_impulses(&mut self, was_empty: bool) {
         let now_empty = self.joints.is_empty();
-        let k = |empty: bool| if empty { 1.0 } else { JOINT_SUBSTEPS as f32 };
+        let k = |empty: bool| if empty { super::CONTACT_SUBSTEPS as f32 } else { JOINT_SUBSTEPS as f32 };
         // `was_empty` is only meaningful for the insert path; removals pass false and are compared against a world that had joints.
-        let before = if was_empty { 1.0 } else { JOINT_SUBSTEPS as f32 };
+        let before = k(was_empty);
         let scale = before / k(now_empty);
         if scale != 1.0 {
             for e in &mut self.warm_cache {

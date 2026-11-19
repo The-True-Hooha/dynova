@@ -26,14 +26,20 @@ class WasmTrap(WasmError):
     """The module trapped (a panic or an allocation failure). The instance cannot be used again."""
 
 
-def find_wasm() -> Path:
-    """`$DYNOVA_WASM`, else the wasm shipped in the package, else the single-threaded build of a source checkout."""
-    candidates = []
-    if os.environ.get("DYNOVA_WASM"):
-        candidates.append(Path(os.environ["DYNOVA_WASM"]))
+def _candidates() -> list:
     here = Path(__file__).resolve().parent
-    candidates.append(here / "_data" / "dynova_core_bg.wasm")
-    candidates.append(here.parents[1] / "sdk" / "typescript" / "wasm-st" / "dynova_core_bg.wasm")
+    found = []
+    if os.environ.get("DYNOVA_WASM"):
+        found.append(Path(os.environ["DYNOVA_WASM"]))
+    # A source checkout's own build comes before the copy the package carries: that copy is whatever the last `make package-python` left behind and can be stale.
+    found.append(here.parents[1] / "sdk" / "typescript" / "wasm-st" / "dynova_core_bg.wasm")
+    found.append(here / "_data" / "dynova_core_bg.wasm")
+    return found
+
+
+def find_wasm() -> Path:
+    """`$DYNOVA_WASM`, else the single-threaded build of a source checkout, else the wasm shipped in the package."""
+    candidates = _candidates()
     for path in candidates:
         if path.is_file():
             return path
