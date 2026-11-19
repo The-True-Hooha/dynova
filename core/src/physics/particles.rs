@@ -3,6 +3,8 @@
 //! its state hash is unchanged. Only + - * / and sqrt are used, so every target agrees to the bit.
 //!
 //! One-way coupling: particles collide with rigid bodies and are pushed out of them; they do not push back (that is attachment, a later step).
+//! Limits: no collision between particles, so a folded cloth passes through itself; a particle is a sphere, so a body smaller than the gap between
+//! particles (spacing minus two radii) can pass between them; collision is tested once per substep, so a body thinner than a substep's travel can be crossed.
 
 use super::*;
 use crate::collision::V3;
@@ -11,6 +13,9 @@ pub const MAX_PARTICLES: usize = 1 << 14;
 pub const MAX_PARTICLE_GROUPS: usize = 1 << 12;
 pub const MAX_GROUP_ID: u32 = 1 << 24;
 pub const MAX_CHAIN: usize = 1024;
+pub const MAX_CLOTH_SIDE: u32 = 64;
+/// What a particle costs in memory with its links, for the allocation probe.
+pub const PARTICLE_BYTES: usize = 160;
 pub const MIN_PARTICLE_RADIUS: f32 = 1.0e-3;
 pub const MAX_PARTICLE_RADIUS: f32 = 100.0;
 pub const PARTICLE_SUBSTEPS: u32 = 4;
@@ -77,7 +82,90 @@ impl ChainDesc {
     }
 }
 
+/// A `nu` by `nv` sheet: corner `origin`, the edge vectors `u` and `v` spanning it. Links join each particle to its neighbours (structural), to its
+/// diagonal neighbours (shear) and, when `bend_stiffness` > 0, to the particle two along a row or column (bending: a fold shortens that distance).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClothDesc {
+    pub origin: V3,
+    pub u: V3,
+    pub v: V3,
+    pub nu: u32,
+    pub nv: u32,
+    /// Bit 0..3 pin the corners (0,0), (nu-1,0), (0,nv-1), (nu-1,nv-1); bit 4 pins the whole first row.
+    pub pins: u8,
+    pub radius: f32,
+    pub inv_mass: f32,
+    pub stiffness: f32,
+    pub bend_stiffness: f32,
+}
+
+impl ClothDesc {
+    pub fn is_valid(&self) -> bool {
+        let c = [self.u[1] * self.v[2] - self.u[2] * self.v[1], self.u[2] * self.v[0] - self.u[0] * self.v[2], self.u[0] * self.v[1] - self.u[1] * self.v[0]];
+        let area_sq = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
+        self.origin.iter().chain(&self.u).chain(&self.v).all(|x| x.is_finite() && x.abs() <= MAX_COORD)
+            && (2..=MAX_CLOTH_SIDE).contains(&self.nu) && (2..=MAX_CLOTH_SIDE).contains(&self.nv)
+            && area_sq.is_finite() && area_sq > 1.0e-8
+            && self.pins < 32
+            && (MIN_PARTICLE_RADIUS..=MAX_PARTICLE_RADIUS).contains(&self.radius)
+            && (0.0..=MAX_INV_MASS).contains(&self.inv_mass)
+            && self.stiffness > 0.0 && self.stiffness <= 1.0
+            && (0.0..=1.0).contains(&self.bend_stiffness)
+    }
+}
+
 impl Particles {
+    fn push_link(&mut self, a: u32, b: u32, stiffness: f32) {
+        let (a_, b_) = (a as usize, b as usize);
+        let d = [self.x[b_] - self.x[a_], self.y[b_] - self.y[a_], self.z[b_] - self.z[a_]];
+        self.links.push(Link { a, b, rest: (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt(), stiffness });
+    }
+
+    /// Fails, changing nothing, for a bad description, a taken id or a full table.
+    pub fn create_cloth(&mut self, id: u32, d: &ClothDesc) -> bool {
+        if id >= MAX_GROUP_ID || !d.is_valid() || self.groups.len() >= MAX_PARTICLE_GROUPS || self.groups.iter().any(|g| g.id == id) {
+            return false;
+        }
+        let (nu, nv) = (d.nu as usize, d.nv as usize);
+        if self.len() + nu * nv > MAX_PARTICLES {
+            return false;
+        }
+        let first = self.len() as u32;
+        let at = |i: usize, j: usize| first + (j * nu + i) as u32;
+        for j in 0..nv {
+            for i in 0..nu {
+                let (s, t) = (i as f32 / (nu - 1) as f32, j as f32 / (nv - 1) as f32);
+                self.x.push(d.origin[0] + d.u[0] * s + d.v[0] * t);
+                self.y.push(d.origin[1] + d.u[1] * s + d.v[1] * t);
+                self.z.push(d.origin[2] + d.u[2] * s + d.v[2] * t);
+                self.vx.push(0.0);
+                self.vy.push(0.0);
+                self.vz.push(0.0);
+                let corner = (i == 0 && j == 0 && d.pins & 1 != 0) || (i == nu - 1 && j == 0 && d.pins & 2 != 0)
+                    || (i == 0 && j == nv - 1 && d.pins & 4 != 0) || (i == nu - 1 && j == nv - 1 && d.pins & 8 != 0);
+                let row = j == 0 && d.pins & 16 != 0;
+                self.inv_mass.push(if corner || row { 0.0 } else { d.inv_mass });
+                self.radius.push(d.radius);
+            }
+        }
+        for j in 0..nv {
+            for i in 0..nu {
+                if i + 1 < nu { self.push_link(at(i, j), at(i + 1, j), d.stiffness); }
+                if j + 1 < nv { self.push_link(at(i, j), at(i, j + 1), d.stiffness); }
+                if i + 1 < nu && j + 1 < nv {
+                    self.push_link(at(i, j), at(i + 1, j + 1), d.stiffness);
+                    self.push_link(at(i + 1, j), at(i, j + 1), d.stiffness);
+                }
+                if d.bend_stiffness > 0.0 {
+                    if i + 2 < nu { self.push_link(at(i, j), at(i + 2, j), d.bend_stiffness); }
+                    if j + 2 < nv { self.push_link(at(i, j), at(i, j + 2), d.bend_stiffness); }
+                }
+            }
+        }
+        self.groups.push(Group { id, first, count: (nu * nv) as u32 });
+        true
+    }
+
     pub fn is_empty(&self) -> bool {
         self.x.is_empty()
     }
@@ -151,6 +239,17 @@ impl PhysicsWorld {
         let n = p.len();
         let mut prev = vec![[0.0f32; 3]; n];
         let mut hits = Vec::new();
+        // Per group, the bodies that could touch it this tick: a particle moves at most `MAX_PARTICLE_SPEED * dt` a tick, so a box that
+        // size around the group (plus the radius) holds every place it can reach. Ids stay ascending, so ties resolve as before.
+        let candidates: Vec<Vec<u32>> = p.groups.iter().map(|g| {
+            let r = g.first as usize..(g.first + g.count) as usize;
+            let reach = MAX_PARTICLE_SPEED * self.dt + r.clone().map(|i| p.radius[i]).fold(0.0, f32::max);
+            let lo = [r.clone().map(|i| p.x[i]).fold(f32::MAX, f32::min) - reach, r.clone().map(|i| p.y[i]).fold(f32::MAX, f32::min) - reach, r.clone().map(|i| p.z[i]).fold(f32::MAX, f32::min) - reach];
+            let hi = [r.clone().map(|i| p.x[i]).fold(f32::MIN, f32::max) + reach, r.clone().map(|i| p.y[i]).fold(f32::MIN, f32::max) + reach, r.map(|i| p.z[i]).fold(f32::MIN, f32::max) + reach];
+            self.bodies_where(|c, e| (0..3).all(|k| c[k] + e >= lo[k] && c[k] - e <= hi[k]))
+        }).collect();
+        let mut group_of = vec![0usize; n];
+        for (k, g) in p.groups.iter().enumerate() { group_of[g.first as usize..(g.first + g.count) as usize].fill(k); }
         let mut out = vec![[0.0f32; 3]; n];
         for _ in 0..PARTICLE_SUBSTEPS {
             for i in 0..n {
@@ -181,7 +280,7 @@ impl PhysicsWorld {
                 out[i] = [0.0; 3];
                 if p.inv_mass[i] == 0.0 { continue; }
                 let before = [p.x[i], p.y[i], p.z[i]];
-                self.overlap_sphere(before, p.radius[i], NO_BODY, &mut hits);
+                self.overlap_sphere_among(candidates[group_of[i]].iter().copied(), before, p.radius[i], NO_BODY, &mut hits);
                 // At most 64 bodies are tested per particle (`overlap_sphere` keeps the lowest ids). The push is at most one radius a substep, so a particle that starts inside a
                 // body leaves it over several substeps instead of being thrown out at depth / h.
                 for hit in &hits {
@@ -445,5 +544,159 @@ mod tests {
         let by_particles = p.len() + 2 > MAX_PARTICLES;
         assert!(by_groups || by_particles);
         assert!(!p.create_chain(MAX_GROUP_ID - 1, &rope(false, [0.0; 3], [1.0, 0.0, 0.0], 2)));
+    }
+
+    fn sheet(height: f32, nu: u32) -> ClothDesc {
+        ClothDesc { origin: [-1.0, height, -1.0], u: [2.0, 0.0, 0.0], v: [0.0, 0.0, 2.0], nu, nv: nu, pins: 0, radius: 0.06, inv_mass: 1.0, stiffness: 1.0, bend_stiffness: 0.3 }
+    }
+
+    #[test]
+    fn a_cloth_has_the_particles_and_links_its_grid_implies() {
+        let mut p = Particles::default();
+        assert!(p.create_cloth(1, &ClothDesc { pins: 0b10001, ..sheet(0.0, 5) }));
+        assert_eq!(p.len(), 25);
+        // 2 * 5 * 4 structural, 2 * 4 * 4 shear, 2 * 5 * 3 bending.
+        assert_eq!(p.links.len(), 40 + 32 + 30);
+        assert_eq!(p.groups, vec![Group { id: 1, first: 0, count: 25 }]);
+        assert_eq!(p.inv_mass.iter().filter(|m| **m == 0.0).count(), 5, "bit 4 pins the first row, which already holds corner (0,0)");
+        let mut corners = Particles::default();
+        assert!(corners.create_cloth(1, &ClothDesc { pins: 0b1010, ..sheet(0.0, 5) }));
+        assert_eq!(corners.inv_mass.iter().enumerate().filter(|(_, m)| **m == 0.0).map(|(i, _)| i).collect::<Vec<_>>(), vec![4, 24]);
+        let mut q = Particles::default();
+        assert!(q.create_cloth(1, &ClothDesc { pins: 16, bend_stiffness: 0.0, ..sheet(0.0, 5) }));
+        assert_eq!(q.inv_mass[..5], [0.0; 5]);
+        assert!(q.inv_mass[5..].iter().all(|m| *m == 1.0));
+        assert_eq!(q.links.len(), 40 + 32);
+        assert!(q.links.iter().all(|l| (l.rest - 0.5).abs() < 1e-6 || (l.rest - 0.5 * 2f32.sqrt()).abs() < 1e-6));
+    }
+
+    #[test]
+    fn a_bad_cloth_is_refused_and_changes_nothing() {
+        let mut p = Particles::default();
+        assert!(p.create_cloth(1, &sheet(0.0, 4)));
+        let before = p.clone();
+        let good = sheet(0.0, 4);
+        for (id, d) in [
+            (1, good),
+            (2, ClothDesc { nu: 1, ..good }),
+            (2, ClothDesc { nv: MAX_CLOTH_SIDE + 1, ..good }),
+            (2, ClothDesc { v: good.u, ..good }),
+            (2, ClothDesc { v: [0.0; 3], ..good }),
+            (2, ClothDesc { pins: 32, ..good }),
+            (2, ClothDesc { u: [f32::NAN, 0.0, 0.0], ..good }),
+            (2, ClothDesc { radius: 0.0, ..good }),
+            (2, ClothDesc { inv_mass: -1.0, ..good }),
+            (2, ClothDesc { stiffness: 0.0, ..good }),
+            (2, ClothDesc { bend_stiffness: 1.5, ..good }),
+            (2, ClothDesc { bend_stiffness: -0.1, ..good }),
+        ] {
+            assert!(!p.create_cloth(id, &d), "{d:?}");
+            assert_eq!(p, before);
+        }
+        let mut full = Particles::default();
+        for id in 0..(MAX_PARTICLES as u32 / (MAX_CLOTH_SIDE * MAX_CLOTH_SIDE)) { assert!(full.create_cloth(id, &sheet(0.0, MAX_CLOTH_SIDE))); }
+        assert!(!full.create_cloth(99, &sheet(0.0, 2)), "the particle table is full");
+    }
+
+    #[test]
+    fn a_cloth_dropped_on_a_box_drapes_over_it_and_settles() {
+        let mut w = world();
+        w.spawn(0, &BodyDesc::box_at([0.0, 0.0, 0.0], [0.4, 0.5, 0.4], 0.0, 0.0));
+        w.spawn(1, &BodyDesc::box_at([0.0, -3.0, 0.0], [20.0, 0.5, 20.0], 0.0, 0.0));
+        assert!(w.particles.create_cloth(0, &sheet(1.2, 21)));
+        let rest: Vec<f32> = w.particles.links.iter().map(|l| l.rest).collect();
+        for _ in 0..600 { w.step(); }
+        let p = &w.particles;
+        let centre = 10 * 21 + 10;
+        assert!((p.y[centre] - 0.56).abs() < 0.04, "the middle rests on the top at {}", p.y[centre]);
+        assert!(p.y[0] < 0.2 && p.y[20] < 0.2 && p.y[420] < 0.2 && p.y[440] < 0.2, "the corners hang down the sides");
+        let inside = (0..p.len()).filter(|&i| p.x[i].abs() < 0.4 - 0.02 && p.z[i].abs() < 0.4 - 0.02 && p.y[i] > -0.5 && p.y[i] < 0.5 + 0.06 - 0.03).count();
+        assert_eq!(inside, 0, "particles inside the box");
+        let speed = p.vx.iter().chain(&p.vy).chain(&p.vz).map(|v| v.abs()).fold(0.0, f32::max);
+        assert!(speed < 0.3, "still moving at {speed}");
+        let stretch = p.links.iter().zip(&rest).map(|(l, r)| {
+            let (a, b) = (l.a as usize, l.b as usize);
+            (((p.x[a] - p.x[b]).powi(2) + (p.y[a] - p.y[b]).powi(2) + (p.z[a] - p.z[b]).powi(2)).sqrt() - r).abs() / r
+        }).fold(0.0, f32::max);
+        assert!(stretch < 0.25, "a link stretched by {stretch}");
+    }
+
+    #[test]
+    fn bending_stiffness_keeps_a_cantilever_flatter() {
+        let sag = |bend: f32| {
+            let mut w = world();
+            assert!(w.particles.create_cloth(0, &ClothDesc { pins: 16, bend_stiffness: bend, v: [0.0, 0.0, 1.0], ..sheet(5.0, 11) }));
+            for _ in 0..300 { w.step(); }
+            let p = &w.particles;
+            (0..11).map(|i| 5.0 - p.y[10 * 11 + i]).sum::<f32>() / 11.0
+        };
+        assert!(sag(1.0) < sag(0.0) - 0.02, "{} vs {}", sag(1.0), sag(0.0));
+    }
+
+    #[test]
+    fn a_cloth_snapshot_round_trips_bit_for_bit() {
+        let mut w = world();
+        w.spawn(0, &BodyDesc::box_at([0.0, 0.0, 0.0], [0.4, 0.5, 0.4], 0.0, 0.0));
+        assert!(w.particles.create_cloth(0, &sheet(1.0, 9)));
+        for _ in 0..30 { w.step(); }
+        let snap = w.capture();
+        for _ in 0..60 { w.step(); }
+        let later = w.state_hash();
+        assert!(w.restore(&snap));
+        for _ in 0..60 { w.step(); }
+        assert_eq!(w.state_hash(), later);
+    }
+
+    #[test]
+    fn a_rectangular_skewed_cloth_has_the_links_and_rest_lengths_its_shape_implies() {
+        let mut p = Particles::default();
+        let d = ClothDesc { u: [3.0, 0.0, 0.0], v: [1.0, 0.0, 6.0], nu: 3, nv: 6, ..sheet(0.0, 3) };
+        assert!(p.create_cloth(0, &d));
+        let (nu, nv) = (3usize, 6usize);
+        assert_eq!(p.len(), 18);
+        assert_eq!(p.links.len(), (nu - 1) * nv + nu * (nv - 1) + 2 * (nu - 1) * (nv - 1) + (nu - 2) * nv + nu * (nv - 2));
+        for l in &p.links {
+            let (a, b) = (l.a as usize, l.b as usize);
+            let (di, dj) = ((b % nu) as i32 - (a % nu) as i32, (b / nu) as i32 - (a / nu) as i32);
+            let want = ((di as f32 * 1.5 + dj as f32 * 0.2).powi(2) + (dj as f32 * 1.2).powi(2)).sqrt();
+            assert!((l.rest - want).abs() < 1e-5, "link {a}-{b}: {} vs {want}", l.rest);
+        }
+        let two_wide = ClothDesc { nu: 2, nv: 5, ..d };
+        let mut q = Particles::default();
+        assert!(q.create_cloth(0, &two_wide));
+        assert_eq!(q.links.len(), 5 + 2 * 4 + 2 * 4 + 2 * 3, "no bending links across a width of 2");
+    }
+
+    #[test]
+    fn shear_links_keep_a_pinned_sheet_from_collapsing_into_a_rhombus() {
+        let skew = |shear: bool| {
+            let mut w = world();
+            w.gy = 0.0;
+            assert!(w.particles.create_cloth(0, &ClothDesc { pins: 0b0011, bend_stiffness: 0.0, ..sheet(5.0, 9) }));
+            if !shear {
+                let nu = 9;
+                w.particles.links.retain(|l| (l.b as i32 - l.a as i32).abs() == 1 || (l.b as i32 - l.a as i32).abs() == nu);
+            }
+            // Push the free edge sideways: only the diagonals resist a shear.
+            for j in 1..9 { for i in 0..9 { w.particles.vx[j * 9 + i] = 2.0 * j as f32 / 8.0; } }
+            for _ in 0..60 { w.step(); }
+            let p = &w.particles;
+            (p.x[72] - p.x[0]).abs()
+        };
+        assert!(skew(true) < skew(false) - 0.2, "{} vs {}", skew(true), skew(false));
+    }
+
+    #[test]
+    fn a_far_body_costs_a_cloth_nothing_and_a_near_one_still_collides() {
+        let mut w = PhysicsWorld::new(2100);
+        w.gy = -9.81;
+        for k in 0..2000 { w.spawn(k, &BodyDesc::box_at([1000.0 + k as f32 * 3.0, 0.0, 0.0], [0.5; 3], 0.0, 0.0)); }
+        w.spawn(2000, &BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.0));
+        assert!(w.particles.create_cloth(0, &sheet(0.5, 21)));
+        let t = std::time::Instant::now();
+        for _ in 0..120 { w.step(); }
+        let lowest = w.particles.y.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(lowest > 0.0, "the near floor still holds the cloth: {lowest}");
+        assert!(t.elapsed().as_secs_f32() < 30.0);
     }
 }

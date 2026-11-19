@@ -14,7 +14,7 @@ pub(crate) use snapshot::Fnv;
 pub use kinematic::{Kin, MAX_KIN_TICKS};
 pub use query::{OverlapHit, RayHit, MAX_OVERLAP_HITS, MAX_QUERY_RANGE, NO_BODY};
 pub use joints::{Joint, JointDesc, MAX_JOINTS, JOINT_BALL, JOINT_DISTANCE, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER, MAX_JOINT_ID, MIN_ROD_LENGTH};
-pub use particles::{ChainDesc, Group, Link, Particles, MAX_CHAIN, MAX_GROUP_ID, MAX_PARTICLES, MAX_PARTICLE_GROUPS, MAX_PARTICLE_RADIUS, MIN_PARTICLE_RADIUS};
+pub use particles::{ChainDesc, ClothDesc, MAX_CLOTH_SIDE, PARTICLE_BYTES, Group, Link, Particles, MAX_CHAIN, MAX_GROUP_ID, MAX_PARTICLES, MAX_PARTICLE_GROUPS, MAX_PARTICLE_RADIUS, MIN_PARTICLE_RADIUS};
 pub use snapshot::PhysicsSnapshot;
 
 const MIN_BUCKETS: usize = 4096;

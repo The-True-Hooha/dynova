@@ -560,9 +560,16 @@ impl Runtime {
                 return found;
             }
             Command::JointMotor { id, vel, max } => return self.apply_joint_motor(id, vel, max),
+            Command::ParticleCloth { id, desc } => {
+                let ok = self.physics_enabled && (self.can_reserve)((desc.nu * desc.nv) as usize * crate::physics::PARTICLE_BYTES) && self.physics.particles.create_cloth(id, &desc);
+                if !ok {
+                    self.ring.note_malformed();
+                }
+                return ok;
+            }
             Command::ParticleChain { id, desc } => {
-                // Particle columns and links are about 64 bytes a particle; the probe is the same one Grow and Checkpoint ask.
-                let ok = self.physics_enabled && (self.can_reserve)(desc.count as usize * 64) && self.physics.particles.create_chain(id, &desc);
+                // The probe is the one Grow and Checkpoint ask.
+                let ok = self.physics_enabled && (self.can_reserve)(desc.count as usize * crate::physics::PARTICLE_BYTES) && self.physics.particles.create_chain(id, &desc);
                 if !ok {
                     self.ring.note_malformed();
                 }
@@ -2250,6 +2257,33 @@ mod tests {
         assert_eq!(rt.physics.particles.groups.len(), 2);
         seek_to(&mut rt, 69);
         assert!(rt.physics.particles.is_empty(), "before the command there is no rope");
+    }
+
+    #[test]
+    fn a_cloth_made_by_command_is_replayed_and_reproduced_bit_for_bit_by_a_seek() {
+        let cloth = |id| Command::ParticleCloth { id, desc: crate::physics::ClothDesc { origin: [-0.5, 2.0, -0.5], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, 1.0], nu: 7, nv: 7, pins: 0b11, radius: 0.05, inv_mass: 1.0, stiffness: 1.0, bend_stiffness: 0.3 } };
+        let mut rt = Runtime::new(16, 256);
+        rt.enable_physics();
+        let mut hashes = vec![0u64];
+        for t in 0..160 {
+            match t {
+                0 => {
+                    rt.ring.push(&Command::Record { on: true });
+                    rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, 0.0, 0.0], [0.3, 0.3, 0.3], 0.0, 0.1)));
+                }
+                70 => { rt.ring.push(&cloth(3)); }
+                75 => { rt.ring.push(&cloth(3)); }
+                _ => {}
+            }
+            rt.step();
+            hashes.push(rt.state_hash().unwrap());
+        }
+        assert_eq!(rt.physics.particles.groups.len(), 1);
+        assert_eq!(rt.malformed_dropped(), 1, "the second cloth reused a taken id");
+        for t in [160, 120, 71, 70, 69, 100, 160] {
+            seek_to(&mut rt, t);
+            assert_eq!(rt.state_hash(), Some(hashes[t as usize]), "hash at {t}");
+        }
     }
 
     #[test]

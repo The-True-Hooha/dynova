@@ -168,9 +168,15 @@ impl PhysicsWorld {
 
     /// Fills `out` with the bodies a sphere overlaps (lowest ids first, at most `MAX_OVERLAP_HITS`) and returns whether more existed.
     pub fn overlap_sphere(&self, center: V3, radius: f32, ignore: u32, out: &mut Vec<OverlapHit>) -> bool {
+        self.overlap_sphere_among(0..self.capacity as u32, center, radius, ignore, out)
+    }
+
+    /// `overlap_sphere` restricted to `bodies`, which must be ascending so the lowest ids still come first.
+    pub fn overlap_sphere_among(&self, bodies: impl IntoIterator<Item = u32>, center: V3, radius: f32, ignore: u32, out: &mut Vec<OverlapHit>) -> bool {
         out.clear();
-        for i in 0..self.capacity {
-            if !self.active[i] || i as u32 == ignore { continue; }
+        for body in bodies {
+            let i = body as usize;
+            if i >= self.capacity || !self.active[i] || body == ignore { continue; }
             let pos = [self.pos_x[i], self.pos_y[i], self.pos_z[i]];
             let reach = extent(self, i) + radius;
             if len_sq(sub(pos, center)) > reach * reach { continue; }
@@ -186,7 +192,7 @@ impl PhysicsWorld {
             let Some(m) = manifold else { continue };
             let (point, depth) = m.points().iter().copied().fold(([0.0; 3], f32::MIN), |best, p| if p.1 > best.1 { p } else { best });
             if out.len() == MAX_OVERLAP_HITS { return true; }
-            out.push(OverlapHit { body: i as u32, depth, point, normal: m.n });
+            out.push(OverlapHit { body, depth, point, normal: m.n });
         }
         false
     }
