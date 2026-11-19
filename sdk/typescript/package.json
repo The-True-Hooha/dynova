@@ -40,6 +40,10 @@
         "import": "./dist/sim.worker.js",
         "default": "./dist/sim.worker.js"
       },
+      "./batch-worker": {
+        "import": "./dist/batch.worker.js",
+        "default": "./dist/batch.worker.js"
+      },
       "./package.json": "./package.json"
     }
   }

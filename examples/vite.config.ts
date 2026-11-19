@@ -21,8 +21,21 @@ const dracoDecoder: Plugin = {
   configurePreviewServer: (server) => void server.middlewares.use("/draco/", serveDraco),
 };
 
+// `server.headers` is not sent on a 304 Not Modified, and WebKit refuses a module worker whose revalidated script lacks the
+// cross-origin-embedder-policy header, so a page that starts several workers from one script (a ParallelBatch) fails there.
+const isolationOnEveryResponse: Plugin = {
+  name: "dynova-isolation-headers",
+  configureServer: (server) => {
+    server.middlewares.use((_req, res, next) => {
+      res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+      res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+      next();
+    });
+  },
+};
+
 export default defineConfig({
-  plugins: [dracoDecoder],
+  plugins: [isolationOnEveryResponse, dracoDecoder],
   resolve: {
     alias: {
       "@dynova/sdk": resolve(__dirname, "../sdk/typescript/src/index.ts"),

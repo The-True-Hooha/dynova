@@ -61,6 +61,17 @@ const H_JSTATE_N: usize = 40;
 const H_LIVE: usize = 32;
 pub const HEADER_WORDS: usize = 41;
 
+/// Bytes a Grow of a world to `capacity` slots may need per slot of the new capacity: three new transform buffers, the two older
+/// generations still kept, and the physics and inspector columns while a resize copies (see the `MAX_CAPACITY` budget test), rounded up.
+pub(crate) const GROW_BYTES_PER_SLOT: usize = 500;
+
+/// Asks the allocator for `bytes` in one block and gives them straight back. The pages stay mapped, so a later allocation of that
+/// size succeeds; a refusal is an `Err` here, where the same request through `vec!` would abort. It is a check that memory exists
+/// now, not a reservation: other allocations between the probe and the real use can still exhaust it.
+pub(crate) fn can_reserve(bytes: usize) -> bool {
+    Vec::<u8>::new().try_reserve_exact(bytes).is_ok()
+}
+
 /// What a step did to the tick counter.
 #[derive(Clone, Copy, PartialEq)]
 enum Tick {
@@ -95,6 +106,8 @@ pub struct Runtime {
     capacity_limit: u32,
     /// Keyframe and log memory a recording may hold; a batch divides one budget among its worlds.
     keyframe_budget: usize,
+    /// Whether `bytes` more memory can be had right now; a Grow asks before it reallocates, because failing to allocate on wasm traps the whole module.
+    can_reserve: fn(usize) -> bool,
 }
 
 #[wasm_bindgen]
@@ -125,6 +138,7 @@ impl Runtime {
             seeks: 0,
             capacity_limit: MAX_CAPACITY,
             keyframe_budget: MAX_KEYFRAME_BYTES,
+            can_reserve,
         };
         let mut rt = rt;
         rt.bucket_view = (0..rt.physics.bucket_counts.len()).map(|_| AtomicU32::new(0)).collect();
@@ -403,6 +417,10 @@ impl Runtime {
     /// Direct (non-ring) setup API for Rust tests and benches. Not exported to JS: the ring is the only JS write path.
     pub fn set_capacity_limit(&mut self, limit: u32) {
         self.capacity_limit = limit.min(MAX_CAPACITY);
+    }
+
+    pub fn set_memory_probe(&mut self, probe: fn(usize) -> bool) {
+        self.can_reserve = probe;
     }
 
     pub fn set_keyframe_budget(&mut self, bytes: usize) {
@@ -821,6 +839,9 @@ impl Runtime {
 
     fn grow_to(&mut self, capacity: u32) -> bool {
         if capacity <= self.transforms.capacity() || capacity > self.capacity_limit {
+            return false;
+        }
+        if !(self.can_reserve)(capacity as usize * GROW_BYTES_PER_SLOT) {
             return false;
         }
         // Seqlock: odd epoch means the layout is being rewritten; readers retry until it is even and unchanged.
@@ -3218,6 +3239,24 @@ mod tests {
         seek_to(&mut rt, 3);
         assert!(rt.physics.joints.is_empty());
         assert_eq!(rt.state_hash(), want);
+    }
+
+    #[test]
+    fn a_grow_the_allocator_would_refuse_is_rejected_and_counted_and_changes_nothing() {
+        let mut rt = Runtime::new(4, 16);
+        rt.set_memory_probe(|bytes| bytes <= 12 * GROW_BYTES_PER_SLOT);
+        rt.ring.push(&Command::Grow { capacity: 100 });
+        rt.step();
+        assert_eq!(rt.transforms_capacity(), 4);
+        assert_eq!(rt.malformed_dropped(), 1);
+        rt.ring.push(&Command::Grow { capacity: 13 });
+        rt.step();
+        assert_eq!(rt.transforms_capacity(), 4, "13 slots is one over what the probe allows, though only 9 are added");
+        assert_eq!(rt.malformed_dropped(), 2);
+        rt.ring.push(&Command::Grow { capacity: 12 });
+        rt.step();
+        assert_eq!(rt.transforms_capacity(), 12, "the whole new capacity of 12 slots is exactly what the probe allows");
+        assert_eq!(rt.malformed_dropped(), 2);
     }
 
     #[test]

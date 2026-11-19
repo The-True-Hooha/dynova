@@ -1,5 +1,6 @@
 import { launchWorld, type FallbackLoad, type LaunchOptions } from './launch.js';
 import type { World, WorldConfig } from './World.js';
+import { ParallelBatch, type BatchWorker, type ParallelBatchOptions } from './parallelBatch.js';
 
 export type WebLaunchOptions = Omit<LaunchOptions, 'config' | 'createWorker' | 'loadFallback'>;
 
@@ -22,5 +23,19 @@ export function launch(config: WorldConfig, options: WebLaunchOptions = {}): Pro
         config,
         createWorker: () => new Worker(new URL('./sim.worker.js', import.meta.url), { type: 'module' }),
         loadFallback,
+    });
+}
+
+export type WebBatchOptions = Omit<ParallelBatchOptions, 'createWorker'>;
+
+/**
+ * `ParallelBatch.launch` with the package's own batch worker wired, under the same bundler requirements as `launch`. Needs a cross-origin
+ * isolated page: each worker steps its share of the worlds over its own shared memory.
+ */
+export function launchBatch(options: WebBatchOptions): Promise<ParallelBatch> {
+    return ParallelBatch.launch({
+        ...options,
+        // A DOM Worker's handlers receive a whole MessageEvent or ErrorEvent, a superset of the fields `BatchWorker` reads.
+        createWorker: () => new Worker(new URL('./batch.worker.js', import.meta.url), { type: 'module' }) as unknown as BatchWorker,
     });
 }

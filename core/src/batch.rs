@@ -1,14 +1,14 @@
 //! N independent worlds stepped together (Phase 12A). Each world is a whole `Runtime` (its own ring, buffers, physics,
 //! recorder and hull table), so no simulation state is shared between worlds (only the allocator, and the budget below
 //! keeps that from coupling them) and a world's state after any number of steps equals the same world run alone. The
-//! native threaded step gives the same result for any thread count; the wasm export is single-threaded.
+//! native threaded step gives the same result for any thread count; one wasm instance steps its worlds on one thread, and a page that wants more runs one instance per worker (`ParallelBatch`).
 
 use crate::command_ring::MAX_CAPACITY;
-use crate::runtime::Runtime;
+use crate::runtime::{can_reserve, Runtime};
 use wasm_bindgen::prelude::*;
 
 /// Memory a batch is sized for, as an estimate rather than a hard allocator limit: the rest of the one GiB wasm memory is
-/// headroom for transform buffers retired by growth, per-tick scratch and the host. Measured on the single-threaded build:
+/// headroom for transform buffers retired by growth, per-tick scratch and the host. Measured on the single-threaded build (the threaded build was not re-measured):
 /// about 52 KiB of fixed tables per world and 250 bytes of columns per body slot; the per-body figure also covers the contacts a
 /// densely packed world adds (a contact is 68 bytes, up to 16 per body).
 pub const BATCH_BYTE_BUDGET: u64 = 512 << 20;
@@ -26,6 +26,7 @@ pub enum BatchError {
     RingNotPowerOfTwo,
     TooBig,
     TooManyRingSlots,
+    OutOfMemory,
 }
 
 impl std::fmt::Display for BatchError {
@@ -36,6 +37,7 @@ impl std::fmt::Display for BatchError {
             Self::RingNotPowerOfTwo => write!(f, "ring capacity must be a power of two"),
             Self::TooBig => write!(f, "worlds and capacity need more than {} MiB of body and table memory, or one world exceeds {MAX_CAPACITY} bodies", BATCH_BYTE_BUDGET >> 20),
             Self::TooManyRingSlots => write!(f, "worlds * ring capacity exceeds {MAX_BATCH_RING_SLOTS} ring slots"),
+            Self::OutOfMemory => write!(f, "the memory for this batch is not available"),
         }
     }
 }
@@ -47,6 +49,11 @@ pub struct Batch {
 
 impl Batch {
     pub fn try_new(worlds: u32, capacity: u32, ring_capacity: u32) -> Result<Self, BatchError> {
+        Self::try_new_probing(worlds, capacity, ring_capacity, can_reserve)
+    }
+
+    /// `can_reserve` is asked once, for the whole batch, before any world is built: a refusal becomes an error instead of an abort part-way through.
+    pub(crate) fn try_new_probing(worlds: u32, capacity: u32, ring_capacity: u32, can_reserve: fn(usize) -> bool) -> Result<Self, BatchError> {
         if worlds == 0 {
             return Err(BatchError::NoWorlds);
         }
@@ -63,6 +70,10 @@ impl Batch {
         if n * ring_capacity as u64 > MAX_BATCH_RING_SLOTS {
             return Err(BatchError::TooManyRingSlots);
         }
+        let bytes = n * (BYTES_PER_WORLD + capacity as u64 * BYTES_PER_BODY) + n * ring_capacity as u64 * 64;
+        if !can_reserve(usize::try_from(bytes).unwrap_or(usize::MAX)) {
+            return Err(BatchError::OutOfMemory);
+        }
         // What is left of the budget after every world's fixed tables, shared out as the most a Grow command may reach.
         let limit = ((BATCH_BYTE_BUDGET / n).saturating_sub(BYTES_PER_WORLD) / BYTES_PER_BODY).clamp(capacity as u64, MAX_CAPACITY as u64) as u32;
         let keyframes = BATCH_KEYFRAME_BYTES / worlds as usize;
@@ -71,6 +82,7 @@ impl Batch {
                 let mut rt = Runtime::new(capacity, ring_capacity);
                 rt.set_capacity_limit(limit);
                 rt.set_keyframe_budget(keyframes);
+                rt.set_memory_probe(can_reserve);
                 rt
             })
             .collect();
@@ -124,6 +136,17 @@ impl Batch {
     #[wasm_bindgen(constructor)]
     pub fn new(worlds: u32, capacity: u32, ring_capacity: u32) -> Result<Batch, JsError> {
         Self::try_new(worlds, capacity, ring_capacity).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Steps one world; false for an index past the end. Lets the host time each world and step a reset world alone.
+    pub fn step_world(&mut self, i: u32) -> bool {
+        match self.worlds.get_mut(i as usize) {
+            Some(w) => {
+                w.step();
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn world_count(&self) -> u32 {
@@ -354,5 +377,33 @@ mod tests {
         w.ring.push(&Command::Record { on: true });
         w.step();
         assert_eq!(w.keyframe_budget_for_test(), BATCH_KEYFRAME_BYTES / 128);
+    }
+
+    #[test]
+    fn a_refused_allocation_is_an_error_before_any_world_is_built() {
+        thread_local! { static LAST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+        fn refuse(bytes: usize) -> bool {
+            LAST.with(|l| l.set(bytes));
+            false
+        }
+        let err = Batch::try_new_probing(4, 8, 16, refuse).err();
+        assert_eq!(err, Some(BatchError::OutOfMemory));
+        let expected = 4 * (BYTES_PER_WORLD + 8 * BYTES_PER_BODY) + 4 * 16 * 64;
+        assert_eq!(LAST.with(|l| l.get()) as u64, expected, "the whole batch is asked for once, ring slots included");
+        assert!(Batch::try_new_probing(4, 8, 16, |_| true).is_ok());
+    }
+
+    #[test]
+    fn step_world_steps_one_world_and_reports_a_bad_index() {
+        let mut b = Batch::try_new(3, 8, 16).unwrap();
+        for w in b.worlds_mut() {
+            w.enable_physics();
+        }
+        assert!(b.step_world(1));
+        assert!(b.step_world(1));
+        assert!(!b.step_world(3));
+        assert!(!b.step_world(u32::MAX));
+        let ticks: Vec<u32> = (0..3).map(|i| b.world(i).unwrap().tick()).collect();
+        assert_eq!(ticks, [0, 2, 0]);
     }
 }

@@ -59,6 +59,18 @@ test('on an isolated page the packaged world runs in a worker over shared memory
     expect(errors).toEqual([]);
 });
 
+test('on an isolated page the packaged batch worker steps worlds on two workers', async ({ page }) => {
+    await open(page, ISOLATED);
+    const r = await page.evaluate(() => (window as any).__app.runBatch());
+    expect(r.failed).toEqual([]);
+    expect(r.ys).toHaveLength(4);
+    r.ys.forEach((y: number, i: number) => {
+        expect(y, `world ${i} fell from ${4 + i}`).toBeLessThan(4 + i);
+        expect(y).toBeGreaterThan(0);
+    });
+    expect(new Set(r.ys).size, 'each world ran its own scene').toBe(4);
+});
+
 test('without SharedArrayBuffer the same code runs the world on the calling thread', async ({ page }) => {
     await page.addInitScript(() => { delete (window as any).SharedArrayBuffer; });
     const errors = await open(page, ISOLATED);

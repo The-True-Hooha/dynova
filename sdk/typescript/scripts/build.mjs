@@ -30,6 +30,7 @@ for (const dir of WASM) {
 // The sources reach the wasm by `../wasm`; inside dist/ it sits next to the code.
 const rewrites = [
     ['sim.worker.js', [["'../wasm/dynova_core.js'", "'./wasm/dynova_core.js'"], ["'../wasm/dynova_core_bg.wasm'", "'./wasm/dynova_core_bg.wasm'"]]],
+    ['batch.worker.js', [["'../wasm/dynova_core.js'", "'./wasm/dynova_core.js'"], ["'../wasm/dynova_core_bg.wasm'", "'./wasm/dynova_core_bg.wasm'"]]],
     ['web.js', [["'../wasm-st/dynova_core.js'", "'./wasm-st/dynova_core.js'"]]],
 ];
 for (const [file, pairs] of rewrites) {

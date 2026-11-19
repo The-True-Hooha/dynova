@@ -1,6 +1,6 @@
 import { BoxGeometry, InstancedMesh, MeshBasicMaterial } from 'three';
 import { InspectorView, SharedMemoryUnavailableError, SHAPE_SPHERE, positionControl, type World } from '@dynova/sdk';
-import { launch } from '@dynova/sdk/web';
+import { launch, launchBatch } from '@dynova/sdk/web';
 import { canvas2dAdapter } from '@dynova/canvas2d';
 import { threeAdapter, importAssembly, collidersFromScene } from '@dynova/three';
 import { loadModelFiles } from '@dynova/three/loaders';
@@ -48,6 +48,16 @@ async function run() {
         imports: { importAssembly: typeof importAssembly, collidersFromScene: typeof collidersFromScene, loadModelFiles: typeof loadModelFiles },
         pixels: () => { const d = ctx.getImageData(0, 0, canvas.width, canvas.height).data; let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i] !== 0) n++; return n; },
         isolated: crossOriginIsolated,
+        // Two workers, four worlds, each with its own ball dropped from a different height.
+        runBatch: async () => {
+            const batch = await launchBatch({ config: { capacity: 8, ringCapacity: 64 }, worlds: 4, workers: 2, physics: true });
+            batch.worlds.forEach((w, i) => { w.spawn({ y: -1, hx: 10, hy: 1, hz: 10, invMass: 0 }); w.spawn({ y: 4 + i, shape: SHAPE_SPHERE, hx: 0.5, invMass: 1 }); });
+            let failed: number[] = [];
+            for (let t = 0; t < 30; t++) failed = await batch.step();
+            const ys = batch.worlds.map((w) => w.readTransforms()[8]);
+            batch.dispose();
+            return { failed, ys };
+        },
         // True when the Canvas2D view painted something at the screen position of entity `id`.
         drawnAt: (id: number) => { const t = world.readTransforms(); const x = Math.round(view.originX + t[id * 7] * view.pixelsPerUnit), y = Math.round(view.originY - t[id * 7 + 1] * view.pixelsPerUnit); return ctx.getImageData(x, y, 1, 1).data[3] !== 0; },
     };
