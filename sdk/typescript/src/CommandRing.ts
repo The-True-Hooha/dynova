@@ -18,6 +18,8 @@ export const TAG_JOINT_MOTOR = 14;
 export const TAG_KINEMATIC_BATCH = 15;
 export const TAG_RAYCAST = 16;
 export const TAG_OVERLAP_SPHERE = 17;
+export const TAG_CHECKPOINT = 18;
+export const TAG_RESET = 19;
 export const NO_ENTITY = 0xffffffff;
 export const MAX_QUERY_RANGE = 1e6;
 export const KIN_SAMPLES_PER_SLOT = 3;
@@ -368,6 +370,24 @@ export class CommandRing {
         this.view.setUint8(off + 6, on ? 1 : 0);
         Atomics.add(this.tail, 0, 1);
         return true;
+    }
+
+    private tagOnly(tag: number): boolean {
+        if (this.isFull()) return false;
+        const tail = Atomics.load(this.tail, 0);
+        const off = this.slotOffset(tail);
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, tag);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    checkpoint(): boolean {
+        return this.tagOnly(TAG_CHECKPOINT);
+    }
+
+    reset(): boolean {
+        return this.tagOnly(TAG_RESET);
     }
 
     record(on: boolean): boolean {

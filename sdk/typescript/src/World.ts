@@ -140,6 +140,8 @@ type Queued =
     | { k: 'teleport'; d: TeleportDesc }
     | { k: 'record'; on: boolean }
     | { k: 'pause'; on: boolean }
+    | { k: 'checkpoint' }
+    | { k: 'reset' }
     | { k: 'seek'; tick: number }
     | { k: 'jointCreate'; d: JointCreateDesc }
     | { k: 'jointDestroy'; id: number }
@@ -310,6 +312,8 @@ export class World {
             case 'teleport': return this.ring.teleport(c.d);
             case 'record': return this.ring.record(c.on);
             case 'pause': return this.ring.pause(c.on);
+            case 'checkpoint': return this.ring.checkpoint();
+            case 'reset': return this.ring.reset();
             case 'seek': return this.ring.seek(c.tick);
             case 'jointCreate': return this.ring.jointCreate(c.d);
             case 'jointDestroy': return this.ring.jointDestroy(c.id);
@@ -581,6 +585,27 @@ export class World {
     pause(on: boolean): void {
         this.assertAlive();
         if (!this.enqueue({ k: 'pause', on })) throw new Error('CommandRing full');
+    }
+
+    /**
+     * Remember the world as it is when the runtime reaches this command; `reset()` returns to it. Replaces an earlier checkpoint.
+     * Needs the physics module; refused (counted in `runtimeCounters.malformedDropped`) without it.
+     */
+    checkpoint(): void {
+        this.assertAlive();
+        if (!this.enqueue({ k: 'checkpoint' })) throw new Error('CommandRing full');
+    }
+
+    /**
+     * Return the world to its checkpoint without advancing it. Bodies, joints and entity ids go back to the checkpoint; the tick
+     * counter, a larger capacity and the counters do not. Commands queued before this one in the same step have their effect on the
+     * world undone, commands after it act on the restored world. Refused (counted in `runtimeCounters.malformedDropped`) with no checkpoint
+     * or while a recording runs. Entity handles are re-synced as after `seek`: those for entities that did not exist at the
+     * checkpoint go stale.
+     */
+    reset(): void {
+        this.assertAlive();
+        if (!this.enqueue({ k: 'reset' })) throw new Error('CommandRing full');
     }
 
     /**

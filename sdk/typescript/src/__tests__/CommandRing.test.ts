@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, SHAPE_HULL, SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, KIN_SAMPLES_PER_SLOT, JOINT_HINGE } from '../CommandRing.js';
+import { CommandRing, TAG_SPAWN, TAG_DESTROY, TAG_FORCE, SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, SHAPE_HULL, SLOT_BYTES, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, KIN_SAMPLES_PER_SLOT, JOINT_HINGE, TAG_CHECKPOINT, TAG_RESET } from '../CommandRing.js';
 
 function makeRing(capacity = 16) {
     const mem = new WebAssembly.Memory({ initial: 1 });
@@ -13,6 +13,22 @@ describe('CommandRing', () => {
     // The same wire values are asserted in core/src/command_ring.rs (wire_tags_are_pinned_to_the_values_the_typescript_ring_writes).
     it('pins the tag values of the recording commands', () => {
         expect([TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE]).toEqual([8, 9, 10, 11]);
+    });
+
+    it('pins the tag values of the checkpoint and reset commands and writes a slot with nothing but the tag', () => {
+        expect([TAG_CHECKPOINT, TAG_RESET]).toEqual([18, 19]);
+        const { mem, ring } = makeRing();
+        new Uint8Array(mem.buffer, 0, SLOT_BYTES * 2).fill(0xff);
+        expect(ring.checkpoint()).toBe(true);
+        expect(ring.reset()).toBe(true);
+        const bytes = (n: number) => Array.from(new Uint8Array(mem.buffer, n * SLOT_BYTES, SLOT_BYTES));
+        expect(bytes(0)).toEqual([18, ...new Array(SLOT_BYTES - 1).fill(0)]);
+        expect(bytes(1)).toEqual([19, ...new Array(SLOT_BYTES - 1).fill(0)]);
+    });
+
+    it('checkpoint and reset report a full ring instead of overwriting', () => {
+        const { ring } = makeRing(2);
+        expect([ring.checkpoint(), ring.reset(), ring.reset()]).toEqual([true, true, false]);
     });
 
     it('pins the tag values of the joint commands', () => {

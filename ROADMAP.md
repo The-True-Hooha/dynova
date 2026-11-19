@@ -173,7 +173,7 @@ Goal: close the gap with robot-learning engines such as Alloy (many parallel wor
 
 - **Phase 12 — Parallel worlds and the RL environment API**
   - **12A (done, docs/batch.md; wasm worlds step on one thread or spread over workers, native threads)** A batch of N independent worlds with their own state, stepped together (workers or WASM threads in the browser, native threads headless). Each world stays bit-identical to the same world run alone.
-  - **12B** TypeScript environment API: `reset`, `step`, observation and reward buffers, per-world done flags, seeds. No per-entity calls on the read path.
+  - **12B (done, docs/env.md; `Checkpoint` and `Reset` ring commands)** TypeScript environment API: `reset`, `step`, observation and reward buffers, per-world done flags, seeds. No per-entity calls on the read path.
   - **12C** Python bindings over the same core. Spike first: native wheels (PyO3) against the WASM build under a Python runtime; pick by measured step rate and by whether the results stay bit-identical to the browser. Gym-style `reset`/`step` on batched numpy arrays.
   - **Exit:** 256 worlds of the arm scene step in parallel in Node and from Python; each world's state hash equals the single-world run; step rate is measured and recorded in `docs/`.
 - **Phase 13 — Contact accuracy** (largest risk: moves every pinned hash again)

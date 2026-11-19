@@ -23,6 +23,8 @@ pub const TAG_JOINT_MOTOR: u8 = 14;
 pub const TAG_KINEMATIC_BATCH: u8 = 15;
 pub const TAG_RAYCAST: u8 = 16;
 pub const TAG_OVERLAP_SPHERE: u8 = 17;
+pub const TAG_CHECKPOINT: u8 = 18;
+pub const TAG_RESET: u8 = 19;
 pub const HULL_VERTS_PER_SLOT: usize = 4;
 pub const KIN_SAMPLES_PER_SLOT: usize = 3;
 /// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
@@ -95,6 +97,10 @@ pub enum Command {
     /// Read-only: answered with rows in the query result buffer, never logged or replayed. `dir` is any non-zero vector.
     Raycast { id: u32, origin: V3, dir: V3, max_dist: f32, ignore: u32 },
     OverlapSphere { id: u32, center: V3, radius: f32, ignore: u32 },
+    /// Remembers the world as it is when the step reaches this command; a later `Reset` returns to it. Replaces an earlier checkpoint.
+    Checkpoint,
+    /// Returns the world to the checkpoint without advancing it, as a seek does. Refused while a recording runs or with no checkpoint.
+    Reset,
 }
 
 impl Command {
@@ -106,7 +112,7 @@ impl Command {
             | Command::Teleport { id, generation, .. } => Some((*id, *generation)),
             Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } | Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. }
             | Command::JointCreate { .. } | Command::JointDestroy { .. } | Command::JointMotor { .. } | Command::KinematicBatch { .. }
-            | Command::Raycast { .. } | Command::OverlapSphere { .. } => None,
+            | Command::Raycast { .. } | Command::OverlapSphere { .. } | Command::Checkpoint | Command::Reset => None,
         }
     }
 }
@@ -274,6 +280,8 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             b[0] = TAG_PAUSE;
             b[OFF_POS] = *on as u8;
         }
+        Command::Checkpoint => b[0] = TAG_CHECKPOINT,
+        Command::Reset => b[0] = TAG_RESET,
         Command::Seek { tick } => {
             b[0] = TAG_SEEK;
             b[OFF_ID..OFF_ID + 4].copy_from_slice(&tick.to_le_bytes());
@@ -404,6 +412,8 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
             _ => None,
         },
         TAG_SEEK => Some(Command::Seek { tick: id }),
+        TAG_CHECKPOINT => Some(Command::Checkpoint),
+        TAG_RESET => Some(Command::Reset),
         TAG_TELEPORT => {
             let v: [f32; 3] = rd_f32x(b, OFF_POS);
             if !all_finite(&v) || v.iter().any(|f| f.abs() > MAX_COORD) { return None; }
@@ -795,15 +805,15 @@ mod tests {
 
     #[test]
     fn wire_tags_are_pinned_to_the_values_the_typescript_ring_writes() {
-        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, TAG_CHECKPOINT, TAG_RESET],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
         let mut ring = CommandRing::new(8);
         raw_slot(&mut ring, |b| { b[0] = 8; b[OFF_ID] = 3; b[OFF_GEN] = 2; b[OFF_POS..OFF_POS + 4].copy_from_slice(&1.5f32.to_le_bytes()); });
         raw_slot(&mut ring, |b| { b[0] = 9; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 10; b[OFF_ID] = 7; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 2; });
-        raw_slot(&mut ring, |b| { b[0] = 18; });
+        raw_slot(&mut ring, |b| { b[0] = 20; });
         let mut out = Vec::new();
         ring.drain_commands(8, &mut out);
         assert_eq!(out, vec![
@@ -812,7 +822,20 @@ mod tests {
             Command::Seek { tick: 7 },
             Command::Pause { on: true },
         ]);
-        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 18 (unassigned) are malformed");
+        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 20 (unassigned) are malformed");
+    }
+
+    #[test]
+    fn checkpoint_and_reset_round_trip_and_name_no_entity() {
+        let mut ring = CommandRing::new(8);
+        ring.push(&Command::Checkpoint);
+        ring.push(&Command::Reset);
+        let mut out = Vec::new();
+        ring.drain_commands(8, &mut out);
+        assert_eq!(out, vec![Command::Checkpoint, Command::Reset]);
+        assert_eq!(Command::Checkpoint.target(), None);
+        assert_eq!(Command::Reset.target(), None);
+        assert_eq!(ring.malformed_dropped(), 0);
     }
 
     #[test]

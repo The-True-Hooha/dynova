@@ -108,6 +108,8 @@ pub struct Runtime {
     keyframe_budget: usize,
     /// Whether `bytes` more memory can be had right now; a Grow asks before it reallocates, because failing to allocate on wasm traps the whole module.
     can_reserve: fn(usize) -> bool,
+    /// The state `Reset` returns to; taken by a `Checkpoint` command.
+    checkpoint: Option<RuntimeSnapshot>,
 }
 
 #[wasm_bindgen]
@@ -139,6 +141,7 @@ impl Runtime {
             capacity_limit: MAX_CAPACITY,
             keyframe_budget: MAX_KEYFRAME_BYTES,
             can_reserve,
+            checkpoint: None,
         };
         let mut rt = rt;
         rt.bucket_view = (0..rt.physics.bucket_counts.len()).map(|_| AtomicU32::new(0)).collect();
@@ -222,6 +225,31 @@ impl Runtime {
                 }
                 Command::Pause { on } => {
                     self.paused = on;
+                    continue;
+                }
+                Command::Checkpoint => {
+                    // Both capturing and restoring allocate a full copy of the physics columns, which on wasm traps the module if refused.
+                    let room = (self.can_reserve)(self.physics.capacity * GROW_BYTES_PER_SLOT);
+                    match room.then(|| self.capture()).flatten() {
+                        Some(snapshot) => self.checkpoint = Some(snapshot),
+                        None => self.ring.note_malformed(),
+                    }
+                    continue;
+                }
+                Command::Reset => {
+                    // A recording is a history of one run; returning to the checkpoint inside it would break the history it replays.
+                    let room = (self.can_reserve)(self.physics.capacity * GROW_BYTES_PER_SLOT);
+                    let restored = room && self.recorder.is_none() && self.checkpoint.take().is_some_and(|s| {
+                        let ok = self.restore(&s);
+                        self.checkpoint = Some(s);
+                        ok
+                    });
+                    if restored {
+                        seeked = Some(self.head);
+                        self.seeks = self.seeks.wrapping_add(1);
+                    } else {
+                        self.ring.note_malformed();
+                    }
                     continue;
                 }
                 Command::Seek { tick } => {
@@ -517,7 +545,7 @@ impl Runtime {
                 self.physics.gz = z;
                 return true;
             }
-            Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. } => return false,
+            Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. } | Command::Checkpoint | Command::Reset => return false,
             Command::JointCreate { id, gen_a, gen_b, desc } => return self.apply_joint_create(id, gen_a, gen_b, &desc),
             Command::JointDestroy { id } => {
                 let found = self.physics_enabled && self.physics.destroy_joint(id);
@@ -3257,6 +3285,218 @@ mod tests {
         rt.step();
         assert_eq!(rt.transforms_capacity(), 12, "the whole new capacity of 12 slots is exactly what the probe allows");
         assert_eq!(rt.malformed_dropped(), 2);
+    }
+
+    fn reset_scene(rt: &mut Runtime) {
+        rt.enable_physics();
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.1)));
+        for i in 1..6u32 {
+            rt.ring.push(&spawn_cmd(i, 0, unit_box(i as f32 * 0.3, 1.0 + i as f32 * 1.2, 0.0)));
+        }
+    }
+
+    #[test]
+    fn a_reset_returns_to_the_checkpoint_without_advancing_and_the_run_after_it_matches_a_run_that_never_left() {
+        let mut rt = Runtime::new(16, 64);
+        reset_scene(&mut rt);
+        rt.ring.push(&Command::Checkpoint);
+        rt.step();
+        for _ in 0..40 {
+            rt.step();
+        }
+        let tick = rt.tick();
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        assert_eq!(rt.tick(), tick, "a reset does not advance the world");
+        assert_eq!(rt.malformed_dropped(), 0);
+        let mut never_left = Runtime::new(16, 64);
+        reset_scene(&mut never_left);
+        for _ in 0..25 {
+            rt.step();
+            never_left.step();
+        }
+        assert_eq!(rt.state_hash(), never_left.state_hash(), "the checkpoint was taken before the step that carried it advanced");
+        assert_eq!(read_buf(&rt)[..7 * 6], read_buf(&never_left)[..7 * 6]);
+    }
+
+    #[test]
+    fn a_reset_without_a_checkpoint_or_during_a_recording_or_a_checkpoint_without_physics_is_refused_and_counted() {
+        let mut rt = Runtime::new(8, 32);
+        reset_scene(&mut rt);
+        rt.step();
+        let tick = rt.tick();
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        assert_eq!(rt.malformed_dropped(), 1, "no checkpoint yet");
+        assert_eq!(rt.tick(), tick + 1, "a refused reset leaves an ordinary step");
+
+        rt.ring.push(&Command::Checkpoint);
+        rt.ring.push(&Command::Record { on: true });
+        rt.step();
+        for _ in 0..5 {
+            rt.step();
+        }
+        let tick = rt.tick();
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        assert_eq!(rt.malformed_dropped(), 2, "refused while recording");
+        assert_eq!(rt.tick(), tick + 1, "the world kept running");
+
+        let mut no_physics = Runtime::new(8, 32);
+        no_physics.ring.push(&Command::Checkpoint);
+        no_physics.step();
+        assert_eq!(no_physics.malformed_dropped(), 1);
+    }
+
+    #[test]
+    fn commands_before_a_reset_are_discarded_and_commands_after_it_act_on_the_restored_world() {
+        let mut rt = Runtime::new(16, 64);
+        reset_scene(&mut rt);
+        rt.ring.push(&Command::Checkpoint);
+        rt.step();
+        rt.ring.push(&spawn_cmd(9, 0, unit_box(5.0, 5.0, 5.0)));
+        rt.ring.push(&Command::Destroy { id: 2, generation: 0 });
+        rt.ring.push(&Command::Reset);
+        rt.ring.push(&Command::Force { id: 3, generation: 0, x: 500.0, y: 0.0, z: 0.0 });
+        rt.step();
+        assert!(rt.physics_position(9).is_none(), "a body spawned before the reset is gone");
+        assert!(rt.physics_position(2).is_some(), "a body destroyed before the reset is back");
+        let x = rt.physics_position(3).unwrap()[0];
+        assert!(x > 0.9, "the force after the reset moved the restored body: {x}");
+        assert_eq!(entity(&rt, 3)[0], x, "and the published frame shows it");
+    }
+
+    #[test]
+    fn a_reset_bumps_the_seek_counter_so_javascript_resyncs_its_handles() {
+        let mut rt = Runtime::new(8, 32);
+        reset_scene(&mut rt);
+        rt.ring.push(&Command::Checkpoint);
+        rt.step();
+        let seeks = header(&rt, H_SEEKS);
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        assert_eq!(header(&rt, H_SEEKS), seeks + 1);
+    }
+
+    #[test]
+    fn a_reset_restores_joints_and_a_second_checkpoint_replaces_the_first() {
+        let mut rt = Runtime::new(8, 32);
+        rt.enable_physics();
+        rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, 5.0, 0.0], [0.5; 3], 0.0, 0.1)));
+        rt.ring.push(&spawn_cmd(1, 0, unit_box(1.0, 5.0, 0.0)));
+        rt.ring.push(&Command::JointCreate { id: 0, gen_a: 0, gen_b: 0, desc: joint_ball(0, 1, [0.5, 5.0, 0.0]) });
+        rt.ring.push(&Command::Checkpoint);
+        rt.step();
+        rt.ring.push(&Command::JointDestroy { id: 0 });
+        rt.step();
+        assert_eq!(rt.joint_count(), 0);
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        assert_eq!(rt.joint_count(), 1, "the joint destroyed after the checkpoint is back");
+
+        rt.ring.push(&Command::JointDestroy { id: 0 });
+        rt.ring.push(&Command::Checkpoint);
+        rt.step();
+        rt.ring.push(&spawn_cmd(2, 0, unit_box(3.0, 5.0, 0.0)));
+        rt.step();
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        assert_eq!(rt.joint_count(), 0, "the second checkpoint, taken after the joint went, is the one returned to");
+        assert!(rt.physics_position(2).is_none());
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        assert_eq!(rt.malformed_dropped(), 0, "a reset can be repeated");
+    }
+
+    #[test]
+    fn a_checkpoint_or_reset_the_allocator_would_refuse_is_refused_and_counted() {
+        let mut rt = Runtime::new(8, 32);
+        reset_scene(&mut rt);
+        rt.set_memory_probe(|_| false);
+        rt.ring.push(&Command::Checkpoint);
+        rt.step();
+        assert_eq!(rt.malformed_dropped(), 1, "no room to capture");
+        rt.set_memory_probe(|_| true);
+        rt.ring.push(&Command::Checkpoint);
+        rt.step();
+        rt.set_memory_probe(|_| false);
+        let tick = rt.tick();
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        assert_eq!(rt.malformed_dropped(), 2, "no room to restore");
+        assert_eq!(rt.tick(), tick + 1, "a refused reset is an ordinary step");
+    }
+
+    #[test]
+    fn a_reset_after_the_world_grew_keeps_the_capacity_and_empties_the_new_slots() {
+        let mut rt = Runtime::new(8, 32);
+        reset_scene(&mut rt);
+        rt.ring.push(&Command::Checkpoint);
+        rt.step();
+        rt.ring.push(&Command::Grow { capacity: 32 });
+        rt.step();
+        rt.ring.push(&spawn_cmd(20, 0, unit_box(2.0, 3.0, 0.0)));
+        rt.step();
+        assert!(rt.physics_position(20).is_some());
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        assert_eq!(rt.transforms_capacity(), 32, "capacity only grows");
+        assert!(rt.physics_position(20).is_none(), "the body in a slot the checkpoint did not have is gone");
+        assert_eq!(entity(&rt, 20)[6], 0.0, "and its transform is a tombstone");
+        assert!(rt.physics_position(3).is_some());
+        assert_eq!(rt.malformed_dropped(), 0);
+    }
+
+    #[test]
+    fn two_resets_in_one_batch_and_a_reset_then_a_checkpoint_in_one_batch_behave_as_in_order() {
+        let mut rt = Runtime::new(8, 32);
+        reset_scene(&mut rt);
+        rt.ring.push(&Command::Checkpoint);
+        rt.step();
+        for _ in 0..10 {
+            rt.step();
+        }
+        let tick = rt.tick();
+        rt.ring.push(&Command::Reset);
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        assert_eq!((rt.tick(), rt.malformed_dropped()), (tick, 0));
+        let seeks = header(&rt, H_SEEKS);
+        for _ in 0..10 {
+            rt.step();
+        }
+        rt.ring.push(&Command::Reset);
+        rt.ring.push(&Command::Checkpoint);
+        rt.step();
+        let restored = entity(&rt, 3);
+        for _ in 0..10 {
+            rt.step();
+        }
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        assert_eq!(entity(&rt, 3), restored, "the checkpoint taken right after a reset is that reset's state");
+        assert!(header(&rt, H_SEEKS) > seeks);
+    }
+
+    #[test]
+    fn a_reset_on_a_paused_world_restores_it_and_leaves_it_paused() {
+        let mut rt = Runtime::new(8, 32);
+        reset_scene(&mut rt);
+        rt.ring.push(&Command::Checkpoint);
+        rt.step();
+        for _ in 0..10 {
+            rt.step();
+        }
+        let moved = entity(&rt, 3);
+        rt.ring.push(&Command::Pause { on: true });
+        rt.ring.push(&Command::Reset);
+        rt.step();
+        let tick = rt.tick();
+        assert_ne!(entity(&rt, 3), moved);
+        rt.step();
+        assert_eq!(rt.tick(), tick, "still paused");
+        assert_eq!(header(&rt, H_PAUSED), 1);
+        assert_eq!(rt.malformed_dropped(), 0);
     }
 
     #[test]
