@@ -73,7 +73,7 @@ describe('a batch of real wasm worlds', () => {
     });
 
     it('a stale wasm header size fails loudly instead of reading the wrong words', () => {
-        const fake: BatchRuntime = { world_count: () => 1, enable_physics() {}, step_all() {}, world_layout: () => new Uint32Array([0, 999, 0, 0, 0, 0, 64]) };
+        const fake: BatchRuntime = { world_count: () => 1, render_all() {}, depth_ptr: () => 0, id_ptr: () => 0, image_pixels: () => 0, enable_physics() {}, step_all() {}, world_layout: () => new Uint32Array([0, 999, 0, 0, 0, 0, 64]) };
         expect(() => new WorldBatch(config, wasm.memory, 'fallback', fake)).toThrow(/rebuild the wasm package/);
     });
 
@@ -126,6 +126,7 @@ describe('a batch of real wasm worlds', () => {
             enable_physics: () => real.enable_physics(),
             world_layout: (i) => real.world_layout(i),
             step_all: () => { throw new Error('unreachable'); },
+            render_all: () => {}, depth_ptr: () => 0, id_ptr: () => 0, image_pixels: () => 0,
             free: () => { freed++; },
         };
         const set = new WorldBatch(config, wasm.memory, 'fallback', trapping);

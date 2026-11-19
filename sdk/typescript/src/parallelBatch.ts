@@ -2,6 +2,8 @@ import { World, layoutFromRuntime, type WorldConfig } from './World.js';
 import { createMemory, detectMode } from './memory.js';
 import { SharedMemoryUnavailableError } from './launch.js';
 import type { BatchReply, BatchRequest } from './batchHost.js';
+import { lensWords, poseWords, type Camera, type CameraPose, type WorldImage } from './camera.js';
+import { NO_ENTITY } from './CommandRing.js';
 
 /** What a `Worker` provides, so the same code runs over real workers and over test doubles. */
 export interface BatchWorker {
@@ -31,6 +33,7 @@ export function partition(worlds: number, workers: number): number[] {
 
 interface Group {
     worker: BatchWorker;
+    memory: WebAssembly.Memory;
     worlds: World[];
     first: number;
     failed: string | null;
@@ -70,7 +73,7 @@ export class ParallelBatch {
                 // Memory first: if it throws no worker exists yet to be left running.
                 const memory = createMemory(opts.initialPages ?? 256, opts.maximumPages ?? 16384).memory;
                 const worker = opts.createWorker();
-                const group: Group = { worker, worlds: [], first, failed: null, waiting: null };
+                const group: Group = { worker, memory, worlds: [], first, failed: null, waiting: null };
                 groups.push(group);
                 first += count;
                 const ready = await new Promise<Extract<BatchReply, { type: 'ready' }>>((resolve, reject) => {
@@ -78,6 +81,7 @@ export class ParallelBatch {
                     worker.onerror = (e) => reject(new Error(e.message));
                     worker.postMessage({ type: 'init', memory, worlds: count, capacity: opts.config.capacity, ringCapacity: opts.config.ringCapacity, physics: opts.physics ?? false });
                 });
+                group.memory = ready.memory;
                 for (const layout of ready.layouts) {
                     if (layout[6] !== opts.config.ringCapacity) throw new Error(`a world has a ring of ${layout[6]} slots but the config says ${opts.config.ringCapacity}`);
                     group.worlds.push(World.attach(opts.config, ready.memory, mode, layoutFromRuntime({
@@ -142,6 +146,52 @@ export class ParallelBatch {
         }
         if (raised) throw first;
         return this.failedWorlds();
+    }
+
+    /**
+     * One depth and one id image per world, each worker rendering its own worlds at the same time. `poses` has one entry per
+     * world. The entry of a world whose worker has failed, or fails during this call, is `null`. The images are views into
+     * the worker's shared memory and the next render overwrites them, so copy what must outlive it.
+     */
+    async render(camera: Camera, poses: readonly CameraPose[]): Promise<(WorldImage | null)[]> {
+        if (poses.length !== this.worlds.length) throw new RangeError(`render needs one pose per world: ${this.worlds.length} worlds, ${poses.length} poses`);
+        if (this.stepping) throw new Error('a step is already running');
+        const lens = lensWords(camera);
+        const words = poseWords(poses);
+        const live = this.groups.filter((g) => g.failed === null);
+        if (live.length === 0) throw new Error('every worker has failed');
+        this.stepping = true;
+        const out: (WorldImage | null)[] = this.worlds.map(() => null);
+        let refusal: string | null = null;
+        try {
+            await Promise.all(live.map(async (g) => {
+                const reply = await new Promise<BatchReply>((resolve) => {
+                    g.waiting = resolve;
+                    g.worker.postMessage({ type: 'render', width: camera.width, height: camera.height, lens, poses: words.slice(g.first * 7, (g.first + g.worlds.length) * 7), ignore: camera.ignore ?? NO_ENTITY });
+                });
+                g.waiting = null;
+                if (reply.type === 'refused') {
+                    refusal ??= reply.message;
+                    return;
+                }
+                if (reply.type !== 'rendered') {
+                    this.fail(g, reply.type === 'error' ? reply.message : `unexpected ${reply.type}`);
+                    return;
+                }
+                const per = reply.pixels;
+                if (per !== camera.width * camera.height) {
+                    this.fail(g, `a render reply had ${per} pixels for a ${camera.width}x${camera.height} image`);
+                    return;
+                }
+                const depth = new Float32Array(g.memory.buffer, reply.depthPtr, per * g.worlds.length);
+                const id = new Uint32Array(g.memory.buffer, reply.idPtr, per * g.worlds.length);
+                g.worlds.forEach((_, k) => { out[g.first + k] = { depth: depth.subarray(k * per, (k + 1) * per), id: id.subarray(k * per, (k + 1) * per) }; });
+            }));
+        } finally {
+            this.stepping = false;
+        }
+        if (refusal !== null) throw new RangeError(refusal);
+        return out;
     }
 
     private fail(group: Group, message: string): void {

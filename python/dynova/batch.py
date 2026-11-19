@@ -1,13 +1,16 @@
 """Many worlds stepped together, on one wasm instance or spread over several that run on threads (wasmtime releases the GIL)."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
+from typing import List, NamedTuple, Optional, Sequence
+
+import numpy as np
 
 from ._wasm import WasmBatch, WasmError, WasmTrap
+from .camera import NO_BODY, Camera
 from .world import World
 
-__all__ = ["Batch", "partition"]
+__all__ = ["Batch", "Images", "partition"]
 
 
 def partition(worlds: int, workers: int) -> List[int]:
@@ -17,6 +20,13 @@ def partition(worlds: int, workers: int) -> List[int]:
             raise ValueError(f"{name} must be a positive integer, got {value!r}")
     n = min(workers, worlds)
     return [worlds // n + (1 if i < worlds % n else 0) for i in range(n)]
+
+
+class Images(NamedTuple):
+    """`depth` is metres along the view axis (0 where nothing is hit), `id` the body each ray hits (`NO_BODY` for none); both `(worlds, height, width)`, row 0 at the top."""
+
+    depth: np.ndarray
+    id: np.ndarray
 
 
 class _Group:
@@ -106,6 +116,57 @@ class Batch:
             for future in [self._pool.submit(self._step_group, g) for g in live]:
                 future.result()
         return self.failed_worlds()
+
+    def _render_group(self, group: _Group, camera: Camera, poses: bytes, ignore: int) -> Optional[Images]:
+        instance = group.batch.instance
+        instance.busy = True
+        try:
+            group.batch.render_all(camera.width, camera.height, camera.words(), poses, ignore)
+            instance.busy = False
+            depth, ids = group.batch.images()
+            shape = (len(group.worlds), camera.height, camera.width)
+            return Images(depth.reshape(shape), ids.reshape(shape))
+        except WasmTrap as err:
+            self._fail(group, str(err))
+            return None
+        finally:
+            instance.busy = False
+
+    def render(self, camera: Camera, poses, ignore: Optional[int] = None) -> Images:
+        """One depth and one id image per world from the poses the last step left, all instances at once. `poses` is `(worlds, 7)`: `x, y, z, qx, qy, qz, qw` (see `look_at`).
+
+        The arrays are copies. The images of a world whose instance has failed are all misses. Raises `WasmError` when the camera or a pose is declined (nothing is then
+        rendered and no instance is harmed), and when no instance is left.
+        """
+        if self._closed:
+            raise WasmError("the batch is closed")
+        table = np.asarray(poses, dtype=np.float64)
+        if table.shape != (len(self.worlds), 7):
+            raise ValueError(f"render needs one pose of 7 numbers per world: expected shape ({len(self.worlds)}, 7), got {table.shape}")
+        if not np.all(np.isfinite(table)):
+            raise ValueError("a camera pose needs a finite position and rotation")
+        camera.words()
+        live = [g for g in self._groups if g.failed is None]
+        if not live:
+            raise WasmError("every worker has failed")
+        ignore = NO_BODY if ignore is None else ignore
+        if not isinstance(ignore, int) or not 0 <= ignore <= NO_BODY:
+            raise ValueError(f"ignore must be a body id or None, got {ignore!r}")
+        packed = {id(g): table[g.first : g.first + len(g.worlds)].astype("<f4").tobytes() for g in live}
+        if self._pool is None:
+            results = [self._render_group(live[0], camera, packed[id(live[0])], ignore)]
+        else:
+            futures = [self._pool.submit(self._render_group, g, camera, packed[id(g)], ignore) for g in live]
+            wait(futures)  # none may still be running when an error is raised, or a later step would share its instance
+            results = [f.result() for f in futures]
+        shape = (len(self.worlds), camera.height, camera.width)
+        depth = np.zeros(shape, dtype=np.float32)
+        ids = np.full(shape, NO_BODY, dtype=np.uint32)
+        for group, images in zip(live, results):
+            if images is not None:
+                depth[group.first : group.first + len(group.worlds)] = images.depth
+                ids[group.first : group.first + len(group.worlds)] = images.id
+        return Images(depth, ids)
 
     def close(self) -> None:
         self._closed = True

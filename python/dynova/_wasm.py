@@ -140,6 +140,10 @@ class Instance:
         """
         if self.busy:
             raise RuntimeError("the batch is stepping; its memory cannot be read from another thread until step() returns")
+        return self._mem()
+
+    def _mem(self) -> np.ndarray:
+        """`mem()` for the thread that is itself running this instance, which the busy flag is not meant to stop."""
         view = self._view
         if view is None:
             memory = self._exports["memory"]
@@ -154,9 +158,9 @@ class Instance:
         linked._owner = self
         return linked
 
-    def words(self, address: int, count: int) -> np.ndarray:
-        """`count` u32 words at `address` (a multiple of 4), as a view."""
-        return self.mem()[address : address + 4 * count].view(np.uint32)
+    def words(self, address: int, count: int, *, running: bool = False) -> np.ndarray:
+        """`count` u32 words at `address` (a multiple of 4), as a view. `running` is for the thread that is itself running this instance."""
+        return (self._mem() if running else self.mem())[address : address + 4 * count].view(np.uint32)
 
     def take_message(self, fallback: str) -> str:
         message, self._host.message = self._host.message, None
@@ -204,6 +208,30 @@ class WasmBatch:
         layout = [int(v) for v in self.instance.words(pointer, length)]
         self.instance.call("__wbindgen_free", pointer, length * 4, 4)
         return layout
+
+    def render_all(self, width: int, height: int, lens: bytes, poses: bytes, ignore: int) -> None:
+        """Renders one depth and one id image per world. Raises `WasmError` when the core declines the lens or poses; nothing has then run."""
+        pointer = self._live()
+        inst = self.instance
+        # The call takes ownership of both buffers, so they come from the module's own allocator.
+        buffers = []
+        for data in (lens, poses):
+            address = inst.call("__wbindgen_malloc", len(data), 4)
+            inst._mem()[address : address + len(data)] = np.frombuffer(data, dtype=np.uint8)
+            buffers.append((address, len(data) // 4))
+        error, failed = inst.call("batch_render_all", pointer, width, height, buffers[0][0], buffers[0][1], buffers[1][0], buffers[1][1], ignore)
+        if failed:
+            reason = inst.take_message("the render was refused")
+            inst.call("__externref_table_dealloc", error)
+            raise WasmError(reason)
+
+    def images(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Copies of the depth and id buffers of the last render, one image per world end to end."""
+        pointer = self._live()
+        inst = self.instance
+        depth, ids, per = (inst.call(name, pointer) & 0xFFFFFFFF for name in ("batch_depth_ptr", "batch_id_ptr", "batch_image_pixels"))
+        n = per * self.world_count
+        return inst.words(depth, n, running=True).view(np.float32).copy(), inst.words(ids, n, running=True).copy()
 
     def free(self) -> None:
         if not self._freed and self.instance.failed is None:

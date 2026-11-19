@@ -111,7 +111,7 @@ describe('a ParallelBatch over in-process workers running the real wasm', () => 
     });
 
     it('rejects once every worker has failed', async () => {
-        const broken = (b: HostBatch): HostBatch => ({ ...b, world_count: () => b.world_count(), world_layout: (i) => b.world_layout(i), enable_physics: () => b.enable_physics(), step_all: () => b.step_all(), step_world: () => { throw new Error('boom'); } });
+        const broken = (b: HostBatch): HostBatch => ({ ...b, world_count: () => b.world_count(), world_layout: (i) => b.world_layout(i), enable_physics: () => b.enable_physics(), step_all: () => b.step_all(), step_world: () => { throw new Error('boom'); }, render_all: (...a) => b.render_all(...a), depth_ptr: () => b.depth_ptr(), id_ptr: () => b.id_ptr(), image_pixels: () => b.image_pixels() });
         const workers = fresh(2, () => new InProcessWorker(broken));
         const batch = await launch(2, workers);
         expect(await batch.step()).toEqual([0, 1]);
@@ -227,7 +227,7 @@ describe('a ParallelBatch over in-process workers running the real wasm', () => 
 
 describe('the batch host', () => {
     const fakeBatch = (stepWorld: (i: number) => boolean): HostBatch => ({
-        world_count: () => 2, enable_physics() {}, step_all() {}, world_layout: () => new Uint32Array(7), step_world: stepWorld,
+        world_count: () => 2, enable_physics() {}, step_all() {}, world_layout: () => new Uint32Array(7), step_world: stepWorld, render_all() {}, depth_ptr: () => 0, id_ptr: () => 0, image_pixels: () => 0,
     });
     const init = { type: 'init', memory: wasm.memory, worlds: 2, capacity: 8, ringCapacity: 16, physics: false } as const;
 
@@ -246,5 +246,110 @@ describe('the batch host', () => {
         const replies: BatchReply[] = [];
         createBatchHost(() => fakeBatch(() => true), (r) => replies.push(r))({ type: 'step' });
         expect(replies).toEqual([{ type: 'error', message: 'step before init' }]);
+    });
+});
+
+describe('rendering a ParallelBatch', () => {
+    const FACING = { position: [0, 0, 0], rotation: [0, 0, 0, 1] } as const;
+    const camera = { width: 16, height: 12, fovY: Math.PI / 3 };
+    const wall = (w: World, i: number) => w.spawn({ x: 0, y: 0, z: -(i + 3.5), hx: 50, hy: 50, hz: 0.5, invMass: 0 });
+
+    it('every world, whichever worker holds it, reads its own wall distance and body id', async () => {
+        const workers = fresh(3);
+        const batch = await launch(7, workers);
+        const walls = batch.worlds.map(wall);
+        await batch.step();
+        const images = await batch.render(camera, batch.worlds.map(() => FACING));
+        expect(images).toHaveLength(7);
+        images.forEach((img, i) => {
+            expect(img, `world ${i}`).not.toBeNull();
+            expect(Math.max(...img!.depth.map((z) => Math.abs(z - (i + 3))))).toBeLessThan(1e-3);
+            expect(new Set(img!.id)).toEqual(new Set([walls[i].id]));
+        });
+    });
+
+    it('sends each worker only the poses of its own worlds', async () => {
+        const workers = fresh(2);
+        const batch = await launch(4, workers);
+        batch.worlds.forEach((w) => wall(w, 0));
+        await batch.step();
+        // Worlds 0-1 on worker 0, 2-3 on worker 1: a camera pushed forward by its world index sees a wall that much closer.
+        const poses = [0, 1, 2, 3].map((i) => ({ position: [0, 0, -i * 0.5], rotation: [0, 0, 0, 1] }) as const);
+        const images = await batch.render(camera, poses);
+        images.forEach((img, i) => expect(Math.max(...img!.depth.map((z) => Math.abs(z - (3 - i * 0.5)))), `world ${i}`).toBeLessThan(1e-3));
+    });
+
+    it('a worker that fails while rendering leaves null for its worlds only and is failed for good', async () => {
+        const traps = (b: HostBatch): HostBatch => Object.assign(Object.create(b), { render_all: () => { throw new WebAssembly.RuntimeError('render trap'); } });
+        const workers = fresh(2, (k) => (k === 1 ? new InProcessWorker(traps) : new InProcessWorker()));
+        const batch = await launch(4, workers);
+        batch.worlds.forEach((w) => wall(w, 0));
+        await batch.step();
+        const images = await batch.render(camera, batch.worlds.map(() => FACING));
+        expect(images.map((i) => i === null)).toEqual([false, false, true, true]);
+        expect(batch.failedWorlds()).toEqual([2, 3]);
+        expect(batch.worlds[2].failure).toMatch(/render trap/);
+        expect(workers[1].terminated).toBe(1);
+        const again = await batch.render(camera, batch.worlds.map(() => FACING));
+        expect(again.map((i) => i === null)).toEqual([false, false, true, true]);
+    });
+
+    it('a render the core refuses is thrown to the caller and leaves every worker alive and usable', async () => {
+        const workers = fresh(2);
+        const batch = await launch(4, workers);
+        batch.worlds.forEach((w) => wall(w, 0));
+        await batch.step();
+        const poses = batch.worlds.map(() => FACING);
+        await expect(batch.render({ ...camera, far: 1e9 }, poses)).rejects.toThrow(/near < far|far <= /);
+        await expect(batch.render({ width: 4096, height: 4096, fovY: 1 }, poses)).rejects.toThrow(/pixels in total/);
+        expect(batch.failedWorlds()).toEqual([]);
+        expect(workers.map((w) => w.terminated)).toEqual([0, 0]);
+        const images = await batch.render(camera, poses);
+        expect(images.every((i) => i !== null && i.depth.every((z) => Math.abs(z - 3) < 1e-3))).toBe(true);
+    });
+
+    it('a bad pose in a later worker is refused before any worker is sent a render', async () => {
+        const workers = fresh(2);
+        const batch = await launch(4, workers);
+        const poses = batch.worlds.map(() => FACING) as unknown as { position: number[]; rotation: number[] }[];
+        poses[3] = { position: [Number.NaN, 0, 0], rotation: [0, 0, 0, 1] };
+        await expect(batch.render(camera, poses as never)).rejects.toThrow(/pose 3 needs a finite/);
+        await batch.step();
+        expect(batch.failedWorlds()).toEqual([]);
+    });
+
+    it('a pose with a position outside the supported range is refused by the core, not trapped on', async () => {
+        const workers = fresh(1);
+        const batch = await launch(1, workers);
+        await expect(batch.render(camera, [{ position: [1e9, 0, 0], rotation: [0, 0, 0, 1] }])).rejects.toThrow(/finite position within range/);
+        await expect(batch.render(camera, [{ position: [0, 0, 0], rotation: [0, 0, 0, 0] }])).rejects.toThrow(/non-zero/);
+        expect(batch.failedWorlds()).toEqual([]);
+    });
+
+    it('a reply with the wrong pixel count fails that worker instead of reading the wrong memory', async () => {
+        const workers = fresh(1);
+        workers[0].tamper = (r) => (r.type === 'rendered' ? { ...r, pixels: r.pixels + 1 } : r);
+        const batch = await launch(2, workers);
+        const images = await batch.render(camera, batch.worlds.map(() => FACING));
+        expect(images).toEqual([null, null]);
+        expect(batch.worlds[0].failure).toMatch(/pixels for a 16x12 image/);
+    });
+
+    it('refuses the wrong number of poses, a bad camera, an all-failed batch and a render during a step', async () => {
+        const workers = fresh(1);
+        const batch = await launch(2, workers);
+        await expect(batch.render(camera, [FACING])).rejects.toThrow(/one pose per world/);
+        await expect(batch.render({ ...camera, fovY: 4 }, [FACING, FACING])).rejects.toThrow(/fovY/);
+        const step = batch.step();
+        await expect(batch.render(camera, [FACING, FACING])).rejects.toThrow('already running');
+        await step;
+        batch.dispose();
+        await expect(batch.render(camera, [FACING, FACING])).rejects.toThrow('every worker has failed');
+    });
+
+    it('rendering before init is a failure the host reports, not a crash', () => {
+        const replies: BatchReply[] = [];
+        createBatchHost(() => { throw new Error('unused'); }, (r) => replies.push(r))({ type: 'render', width: 1, height: 1, lens: new Float32Array(6), poses: new Float32Array(7), ignore: 0 });
+        expect(replies).toEqual([{ type: 'error', message: 'render before init' }]);
     });
 });

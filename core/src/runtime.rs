@@ -367,6 +367,11 @@ fn runtime_hash(physics: u64, generations: &[u8], live: &[bool]) -> u64 {
 }
 
 impl Runtime {
+    /// The physics world a camera reads, or nothing before physics is enabled.
+    pub(crate) fn imaged_physics(&self) -> Option<&PhysicsWorld> {
+        self.physics_enabled.then_some(&self.physics)
+    }
+
     /// None without physics: transforms are only derivable from the physics columns, and a runtime that
     /// writes transforms directly has no other state a snapshot could rebuild them from.
     pub fn capture(&self) -> Option<RuntimeSnapshot> {

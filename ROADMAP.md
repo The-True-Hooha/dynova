@@ -179,7 +179,7 @@ Goal: close the gap with robot-learning engines such as Alloy (many parallel wor
 - **Phase 13 — Contact accuracy (done, docs/contacts.md: the exit scenes pass; no MuJoCo comparison)** (largest risk: moves every pinned hash again)
   - Goal: contact-rich manipulation and legged contact that holds up against MuJoCo on a fixed scene set. Candidates, chosen by measurement: friction cone and torsional friction, soft or compliant contacts, a stronger solver for contacts (block or Newton-style), grasp stability, contact friction tangents that no longer switch basis. A scene suite compares against recorded reference numbers; no MuJoCo dependency in the build.
   - **Exit:** a two-finger grasp holds a box under gravity and a lift; a box on an incline slides at the analytic rate; a stack of 20 is stable; step cost at 1k and 5k bodies is re-measured and the 5000-entity frame budget holds.
-- **Phase 14 — Camera sensors**
+- **Phase 14 — Camera sensors** (done)
   - Depth, colour-id and segmentation images per world from CPU raycasting on the existing grid, batched through a result buffer; a lens model; images for all worlds in one call.
   - **Exit:** a depth image of a known scene matches analytic distances within 1 mm; segmentation ids match entity ids; 64 worlds at 64x64 are rendered in a measured time.
 - **Phase 15 — Assets, robot descriptions and legged robots**

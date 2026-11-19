@@ -128,9 +128,15 @@ impl PhysicsWorld {
     /// Nearest body the ray `origin + t * dir` hits for `0 <= t <= max_dist`, ties going to the lowest id. `dir` must be a unit vector.
     /// A ray that starts inside a body hits it at `t = 0` with the normal pointing back along the ray.
     pub fn raycast(&self, origin: V3, dir: V3, max_dist: f32, ignore: u32) -> Option<RayHit> {
+        self.raycast_among(0..self.capacity as u32, origin, dir, max_dist, ignore)
+    }
+
+    /// `raycast` restricted to `bodies`, which must be ascending so the tie rule (lowest id) still holds; a body that is not active is skipped.
+    pub fn raycast_among(&self, bodies: impl IntoIterator<Item = u32>, origin: V3, dir: V3, max_dist: f32, ignore: u32) -> Option<RayHit> {
         let mut best: Option<RayHit> = None;
-        for i in 0..self.capacity {
-            if !self.active[i] || i as u32 == ignore { continue; }
+        for body in bodies {
+            let i = body as usize;
+            if i >= self.capacity || !self.active[i] || body == ignore { continue; }
             let pos = [self.pos_x[i], self.pos_y[i], self.pos_z[i]];
             let reach = extent(self, i);
             let m = sub(pos, origin);
@@ -150,9 +156,14 @@ impl PhysicsWorld {
             let Some(Local { t, normal }) = hit else { continue };
             let (t, normal) = if t <= 0.0 { (0.0, neg(dir)) } else { (t, normalize(rotate(q, normal)).unwrap_or(neg(dir))) };
             if t > max_dist || best.as_ref().is_some_and(|b| t >= b.t) { continue; }
-            best = Some(RayHit { body: i as u32, t, point: add(origin, scale(dir, t)), normal });
+            best = Some(RayHit { body, t, point: add(origin, scale(dir, t)), normal });
         }
         best
+    }
+
+    /// Ascending ids of the active bodies whose bounding sphere `visible` accepts, given centre and reach.
+    pub fn bodies_where(&self, mut visible: impl FnMut(V3, f32) -> bool) -> Vec<u32> {
+        (0..self.capacity).filter(|&i| self.active[i] && visible([self.pos_x[i], self.pos_y[i], self.pos_z[i]], extent(self, i))).map(|i| i as u32).collect()
     }
 
     /// Fills `out` with the bodies a sphere overlaps (lowest ids first, at most `MAX_OVERLAP_HITS`) and returns whether more existed.

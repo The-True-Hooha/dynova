@@ -7,12 +7,16 @@ export interface HostBatch extends BatchRuntime {
 
 export type BatchRequest =
     | { type: 'init'; memory: WebAssembly.Memory; worlds: number; capacity: number; ringCapacity: number; physics: boolean }
-    | { type: 'step' };
+    | { type: 'step' }
+    | { type: 'render'; width: number; height: number; lens: Float32Array; poses: Float32Array; ignore: number };
 
 export type BatchReply =
     | { type: 'ready'; memory: WebAssembly.Memory; layouts: Uint32Array[] }
     | { type: 'stepped'; micros: number[] }
-    | { type: 'error'; message: string };
+    | { type: 'rendered'; depthPtr: number; idPtr: number; pixels: number }
+    | { type: 'error'; message: string }
+    /** A render the core declined (a bad lens or pose). Nothing ran, so the worker is still good. */
+    | { type: 'refused'; message: string };
 
 /**
  * The message handler of one batch worker, with the wasm and the clock passed in so tests run the same code the worker runs.
@@ -44,6 +48,16 @@ export function createBatchHost(
                     layouts.push(layout);
                 }
                 post({ type: 'ready', memory: request.memory, layouts });
+            } else if (request.type === 'render') {
+                if (!batch) throw new Error('render before init');
+                try {
+                    batch.render_all(request.width, request.height, request.lens, request.poses, request.ignore);
+                } catch (err) {
+                    // A refusal is an Error the core returned; only a trap leaves the instance unusable.
+                    if (err instanceof WebAssembly.RuntimeError) throw err;
+                    return post({ type: 'refused', message: err instanceof Error ? err.message : String(err) });
+                }
+                post({ type: 'rendered', depthPtr: batch.depth_ptr(), idPtr: batch.id_ptr(), pixels: batch.image_pixels() });
             } else {
                 if (!batch) throw new Error('step before init');
                 const micros: number[] = [];

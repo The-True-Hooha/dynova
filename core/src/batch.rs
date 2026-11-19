@@ -3,6 +3,7 @@
 //! keeps that from coupling them) and a world's state after any number of steps equals the same world run alone. The
 //! native threaded step gives the same result for any thread count; one wasm instance steps its worlds on one thread, and a page that wants more runs one instance per worker (`ParallelBatch`).
 
+use crate::camera::{self, CameraError, Images};
 use crate::command_ring::MAX_CAPACITY;
 use crate::runtime::{can_reserve, Runtime};
 use wasm_bindgen::prelude::*;
@@ -45,6 +46,7 @@ impl std::fmt::Display for BatchError {
 #[wasm_bindgen]
 pub struct Batch {
     worlds: Vec<Runtime>,
+    images: Images,
 }
 
 impl Batch {
@@ -86,7 +88,35 @@ impl Batch {
                 rt
             })
             .collect();
-        Ok(Self { worlds })
+        Ok(Self { worlds, images: Images::default() })
+    }
+
+    pub(crate) fn render_images(&mut self, width: u32, height: u32, lens: &[f32], poses: &[f32], ignore: u32) -> Result<(), CameraError> {
+        let lens = camera::lens_from(width, height, lens)?;
+        lens.validate()?;
+        if poses.len() != self.worlds.len() * camera::POSE_WORDS {
+            return Err(CameraError::BadBuffer);
+        }
+        let per_world = lens.pixels();
+        if per_world as u64 * self.worlds.len() as u64 > camera::MAX_BATCH_PIXELS as u64 {
+            return Err(CameraError::BadSize);
+        }
+        let poses = poses.as_chunks::<{ camera::POSE_WORDS }>().0.iter().map(|w| {
+            let pose = camera::pose_from(w)?;
+            // Checked here so no world is written before a bad pose is found; `render` normalises the original, once.
+            pose.unit().ok_or(CameraError::BadPose)?;
+            Ok(pose)
+        }).collect::<Result<Vec<_>, _>>()?;
+        if self.worlds.iter().any(|w| w.imaged_physics().is_none()) {
+            return Err(CameraError::NoPhysics);
+        }
+        self.images.resize(per_world * self.worlds.len())?;
+        let (depth, id) = (self.images.depth.chunks_exact_mut(per_world), self.images.id.chunks_exact_mut(per_world));
+        for (((world, pose), depth), id) in self.worlds.iter().zip(&poses).zip(depth).zip(id) {
+            let physics = world.imaged_physics().ok_or(CameraError::NoPhysics)?;
+            camera::render(physics, &lens, pose, ignore, depth, id)?;
+        }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -149,6 +179,25 @@ impl Batch {
         }
     }
 
+    /// Renders one depth and one id image per world into one buffer each, world `i`'s image at pixels `i * w * h` onward, so the host
+    /// reads every image with two views. `lens` is shared (`[fx, fy, cx, cy, near, far]`) and `poses` holds 7 words per world.
+    /// Either every image is rendered or an error is returned and no buffer changes meaning.
+    pub fn render_all(&mut self, width: u32, height: u32, lens: &[f32], poses: &[f32], ignore: u32) -> Result<(), JsError> {
+        self.render_images(width, height, lens, poses, ignore).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    pub fn depth_ptr(&self) -> *const f32 {
+        self.images.depth.as_ptr()
+    }
+
+    pub fn id_ptr(&self) -> *const u32 {
+        self.images.id.as_ptr()
+    }
+
+    pub fn image_pixels(&self) -> u32 {
+        self.images.depth.len() as u32 / self.worlds.len().max(1) as u32
+    }
+
     pub fn world_count(&self) -> u32 {
         self.worlds.len() as u32
     }
@@ -204,7 +253,7 @@ mod tests {
     type Scene = (fn(&mut Runtime), u32);
 
     fn batch_of(scenes: &[Scene]) -> Batch {
-        let mut b = Batch { worlds: Vec::new() };
+        let mut b = Batch { worlds: Vec::new(), images: Images::default() };
         for (build, capacity) in scenes {
             let mut rt = Runtime::new(*capacity, 1024);
             rt.enable_physics();
@@ -277,7 +326,7 @@ mod tests {
 
     #[test]
     fn an_empty_batch_and_a_single_world_step_without_panicking() {
-        let mut empty = Batch { worlds: Vec::new() };
+        let mut empty = Batch { worlds: Vec::new(), images: Images::default() };
         empty.step_all();
         empty.step_all_threads(0);
         empty.step_all_threads(8);
@@ -405,5 +454,112 @@ mod tests {
         assert!(!b.step_world(u32::MAX));
         let ticks: Vec<u32> = (0..3).map(|i| b.world(i).unwrap().tick()).collect();
         assert_eq!(ticks, [0, 2, 0]);
+    }
+
+    const LENS: [f32; 6] = [27.7, 27.7, 16.0, 16.0, 0.0, 100.0];
+    const SMALL: [f32; 6] = [13.9, 13.9, 8.0, 8.0, 0.0, 100.0];
+    const FORWARD: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+    /// World `i` holds a wall `i + 3` metres in front of a camera at the origin, so depths differ per world.
+    fn walls(n: u32) -> Batch {
+        let mut b = Batch::try_new(n, 4, 64).unwrap();
+        b.enable_physics();
+        for (i, w) in b.worlds_mut().iter_mut().enumerate() {
+            assert!(w.spawn_box(0, 0.0, 0.0, -(i as f32 + 3.5), 50.0, 50.0, 0.5, 0.0, 0.0));
+            w.step();
+        }
+        b
+    }
+
+    fn poses(n: u32) -> Vec<f32> {
+        (0..n).flat_map(|_| [0.0, 0.0, 0.0, FORWARD[0], FORWARD[1], FORWARD[2], FORWARD[3]]).collect()
+    }
+
+    fn depths(b: &Batch) -> Vec<f32> {
+        b.images.depth.clone()
+    }
+
+    #[test]
+    fn render_all_puts_each_world_image_at_its_own_offset() {
+        let mut b = walls(3);
+        b.render_images(32, 32, &LENS, &poses(3), u32::MAX).unwrap();
+        let d = depths(&b);
+        assert_eq!(d.len(), 3 * 1024);
+        for w in 0..3 {
+            assert!(d[w * 1024..(w + 1) * 1024].iter().all(|z| (z - (w as f32 + 3.0)).abs() < 1e-3), "world {w}");
+            assert!(b.images.id[w * 1024..(w + 1) * 1024].iter().all(|&i| i == 0));
+        }
+        assert_eq!(b.image_pixels(), 1024);
+    }
+
+    #[test]
+    fn a_batch_image_equals_the_image_of_the_same_world_rendered_alone() {
+        let mut b = walls(4);
+        let mut p = poses(4);
+        p[7 * 2 + 1] = 0.5;
+        p[7 * 3 + 5] = 0.25;
+        b.render_images(24, 16, &LENS, &p, u32::MAX).unwrap();
+        for (i, pose) in p.chunks(7).enumerate() {
+            let mut alone = Batch::try_new(1, 4, 64).unwrap();
+            alone.enable_physics();
+            assert!(alone.worlds_mut()[0].spawn_box(0, 0.0, 0.0, -(i as f32 + 3.5), 50.0, 50.0, 0.5, 0.0, 0.0));
+            alone.worlds_mut()[0].step();
+            alone.render_images(24, 16, &LENS, pose, u32::MAX).unwrap();
+            let n = 24 * 16;
+            assert_eq!(b.images.depth[i * n..(i + 1) * n].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), alone.images.depth.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "world {i}");
+            assert_eq!(&b.images.id[i * n..(i + 1) * n], &alone.images.id[..]);
+        }
+    }
+
+    #[test]
+    fn a_refused_batch_render_changes_no_image_and_names_what_was_wrong() {
+        let mut b = walls(2);
+        b.render_images(8, 8, &LENS, &poses(2), u32::MAX).unwrap();
+        let mut moved = poses(2);
+        moved[1] = 0.5;
+        b.render_images(8, 8, &LENS, &moved, u32::MAX).unwrap();
+        let before = (depths(&b), b.images.id.clone());
+        let mut nan = poses(2);
+        nan[9] = f32::NAN;
+        let bad_lens = [0.0; 6];
+        for (r, want) in [
+            (b.render_images(8, 8, &LENS, &poses(1), u32::MAX), CameraError::BadBuffer),
+            (b.render_images(8, 8, &LENS[..5], &poses(2), u32::MAX), CameraError::BadBuffer),
+            (b.render_images(8, 8, &bad_lens, &poses(2), u32::MAX), CameraError::BadLens),
+            (b.render_images(0, 8, &LENS, &poses(2), u32::MAX), CameraError::BadSize),
+            (b.render_images(4096, 4096, &LENS, &poses(2), u32::MAX), CameraError::BadSize),
+            (b.render_images(8, 8, &LENS, &nan, u32::MAX), CameraError::BadPose),
+            (b.render_images(8, 8, &LENS, &[poses(1), vec![1e9, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]].concat(), u32::MAX), CameraError::BadPose),
+            (b.render_images(16, 16, &LENS, &[poses(1), vec![0.0; 7]].concat(), u32::MAX), CameraError::BadPose),
+        ] {
+            assert_eq!(r, Err(want));
+            assert_eq!((depths(&b), b.images.id.clone()), before);
+        }
+    }
+
+    #[test]
+    fn a_batch_where_one_world_has_no_physics_renders_nothing() {
+        let mut b = Batch::try_new(2, 4, 64).unwrap();
+        b.worlds_mut()[0].enable_physics();
+        assert_eq!(b.render_images(8, 8, &LENS, &poses(2), u32::MAX), Err(CameraError::NoPhysics));
+        assert!(b.images.depth.is_empty(), "nothing was allocated or written");
+    }
+
+    #[test]
+    fn a_world_stepped_after_a_render_is_imaged_where_it_now_is() {
+        let mut b = Batch::try_new(1, 4, 64).unwrap();
+        b.enable_physics();
+        let w = &mut b.worlds_mut()[0];
+        assert!(w.spawn_box(0, 0.0, 0.0, -20.0, 50.0, 50.0, 0.5, 0.0, 0.0));
+        assert!(w.spawn_sphere(1, 0.0, 0.0, -6.0, 1.0, 1.0, 0.0));
+        w.step();
+        b.render_images(16, 16, &SMALL, &poses(1), u32::MAX).unwrap();
+        let first = b.images.depth[8 * 16 + 8];
+        assert!((first - 5.0).abs() < 0.05, "{first}");
+        for _ in 0..30 {
+            b.step_all();
+        }
+        b.render_images(16, 16, &SMALL, &poses(1), u32::MAX).unwrap();
+        assert!(b.images.depth[8 * 16 + 8] > first + 0.01 || b.images.id[8 * 16 + 8] != 1, "the sphere fell, so the centre pixel changed");
     }
 }
