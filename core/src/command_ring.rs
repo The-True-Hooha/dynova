@@ -27,6 +27,8 @@ pub const TAG_CHECKPOINT: u8 = 18;
 pub const TAG_RESET: u8 = 19;
 pub const TAG_PARTICLE_CHAIN: u8 = 20;
 pub const TAG_PARTICLE_CLOTH: u8 = 21;
+pub const TAG_PARTICLE_ATTACH: u8 = 22;
+pub const TAG_PARTICLE_DETACH: u8 = 23;
 pub const HULL_VERTS_PER_SLOT: usize = 4;
 pub const KIN_SAMPLES_PER_SLOT: usize = 3;
 /// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
@@ -61,6 +63,8 @@ const OFF_CHAIN_FLAGS: usize = 32;
 const OFF_CHAIN_RADIUS: usize = 36;
 const OFF_CHAIN_INV_MASS: usize = 40;
 const OFF_CHAIN_STIFFNESS: usize = 44;
+
+const OFF_ATTACH_BODY: usize = 18;
 
 const OFF_CLOTH_U: usize = 18;
 const OFF_CLOTH_V: usize = 30;
@@ -124,6 +128,9 @@ pub enum Command {
     ParticleChain { id: u32, desc: ChainDesc },
     /// A sheet of particles with structural, shear and bending links; `id` names the group.
     ParticleCloth { id: u32, desc: ClothDesc },
+    /// Particle number `particle` (counted from the first particle of the world's first group) rides on body `body` at `local` in its frame.
+    ParticleAttach { particle: u32, body: u32, generation: u8, local: V3 },
+    ParticleDetach { particle: u32 },
 }
 
 impl Command {
@@ -135,7 +142,7 @@ impl Command {
             | Command::Teleport { id, generation, .. } => Some((*id, *generation)),
             Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } | Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. }
             | Command::JointCreate { .. } | Command::JointDestroy { .. } | Command::JointMotor { .. } | Command::KinematicBatch { .. }
-            | Command::Raycast { .. } | Command::OverlapSphere { .. } | Command::Checkpoint | Command::Reset | Command::ParticleChain { .. } | Command::ParticleCloth { .. } => None,
+            | Command::Raycast { .. } | Command::OverlapSphere { .. } | Command::Checkpoint | Command::Reset | Command::ParticleChain { .. } | Command::ParticleCloth { .. } | Command::ParticleAttach { .. } | Command::ParticleDetach { .. } => None,
         }
     }
 }
@@ -305,6 +312,17 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
         }
         Command::Checkpoint => b[0] = TAG_CHECKPOINT,
         Command::Reset => b[0] = TAG_RESET,
+        Command::ParticleAttach { particle, body, generation, local } => {
+            b[0] = TAG_PARTICLE_ATTACH;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&particle.to_le_bytes());
+            b[OFF_GEN] = *generation;
+            wr_f32x(b, OFF_POS, local);
+            b[OFF_ATTACH_BODY..OFF_ATTACH_BODY + 4].copy_from_slice(&body.to_le_bytes());
+        }
+        Command::ParticleDetach { particle } => {
+            b[0] = TAG_PARTICLE_DETACH;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&particle.to_le_bytes());
+        }
         Command::ParticleCloth { id, desc } => {
             b[0] = TAG_PARTICLE_CLOTH;
             b[OFF_ID..OFF_ID + 4].copy_from_slice(&id.to_le_bytes());
@@ -462,6 +480,12 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
         TAG_SEEK => Some(Command::Seek { tick: id }),
         TAG_CHECKPOINT => Some(Command::Checkpoint),
         TAG_RESET => Some(Command::Reset),
+        TAG_PARTICLE_ATTACH => {
+            let local: V3 = rd_f32x(b, OFF_POS);
+            let body = u32::from_le_bytes([b[OFF_ATTACH_BODY], b[OFF_ATTACH_BODY + 1], b[OFF_ATTACH_BODY + 2], b[OFF_ATTACH_BODY + 3]]);
+            (all_finite(&local) && local.iter().all(|f| f.abs() <= MAX_COORD)).then_some(Command::ParticleAttach { particle: id, body, generation, local })
+        }
+        TAG_PARTICLE_DETACH => Some(Command::ParticleDetach { particle: id }),
         TAG_PARTICLE_CLOTH => {
             let desc = ClothDesc {
                 origin: rd_f32x(b, OFF_POS),
@@ -883,15 +907,15 @@ mod tests {
 
     #[test]
     fn wire_tags_are_pinned_to_the_values_the_typescript_ring_writes() {
-        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, TAG_CHECKPOINT, TAG_RESET, TAG_PARTICLE_CHAIN, TAG_PARTICLE_CLOTH],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, TAG_CHECKPOINT, TAG_RESET, TAG_PARTICLE_CHAIN, TAG_PARTICLE_CLOTH, TAG_PARTICLE_ATTACH, TAG_PARTICLE_DETACH],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
         let mut ring = CommandRing::new(8);
         raw_slot(&mut ring, |b| { b[0] = 8; b[OFF_ID] = 3; b[OFF_GEN] = 2; b[OFF_POS..OFF_POS + 4].copy_from_slice(&1.5f32.to_le_bytes()); });
         raw_slot(&mut ring, |b| { b[0] = 9; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 10; b[OFF_ID] = 7; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 2; });
-        raw_slot(&mut ring, |b| { b[0] = 22; });
+        raw_slot(&mut ring, |b| { b[0] = 24; });
         let mut out = Vec::new();
         ring.drain_commands(8, &mut out);
         assert_eq!(out, vec![
@@ -900,7 +924,7 @@ mod tests {
             Command::Seek { tick: 7 },
             Command::Pause { on: true },
         ]);
-        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 22 (unassigned) are malformed");
+        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 24 (unassigned) are malformed");
     }
 
     #[test]
@@ -1203,6 +1227,19 @@ mod tests {
         }
         assert!(drain(&mut ring, &[]).is_empty());
         assert_eq!(ring.malformed_dropped(), edits.len() as u32);
+    }
+
+    #[test]
+    fn attach_and_detach_round_trip_and_a_non_finite_offset_is_dropped() {
+        let attach = Command::ParticleAttach { particle: 70_000, body: 123_456, generation: 9, local: [0.5, -1.0, 2.0] };
+        let mut ring = CommandRing::new(8);
+        assert!(ring.push(&attach) && ring.push(&Command::ParticleDetach { particle: 5 }));
+        assert_eq!(drain(&mut ring, &[]), vec![attach.clone(), Command::ParticleDetach { particle: 5 }]);
+        assert_eq!((attach.target(), Command::ParticleDetach { particle: 5 }.target()), (None, None));
+        raw_slot(&mut ring, |b| { encode_slot(&attach, b); wr_f32x(b, OFF_POS, &[f32::NAN, 0.0, 0.0]); });
+        raw_slot(&mut ring, |b| { encode_slot(&attach, b); wr_f32x(b, OFF_POS, &[2.0 * MAX_COORD, 0.0, 0.0]); });
+        assert!(drain(&mut ring, &[]).is_empty());
+        assert_eq!(ring.malformed_dropped(), 2);
     }
 
     fn ray_cmd() -> Command {

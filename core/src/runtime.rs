@@ -560,6 +560,24 @@ impl Runtime {
                 return found;
             }
             Command::JointMotor { id, vel, max } => return self.apply_joint_motor(id, vel, max),
+            Command::ParticleAttach { particle, body, generation, local } => {
+                if !self.body_is_live(body, generation) {
+                    self.ring.note_stale();
+                    return false;
+                }
+                let ok = self.physics_enabled && self.physics.particles.attach(particle, body, local);
+                if !ok {
+                    self.ring.note_malformed();
+                }
+                return ok;
+            }
+            Command::ParticleDetach { particle } => {
+                let found = self.physics_enabled && self.physics.particles.detach(particle);
+                if !found {
+                    self.ring.note_stale();
+                }
+                return found;
+            }
             Command::ParticleCloth { id, desc } => {
                 let ok = self.physics_enabled && (self.can_reserve)((desc.nu * desc.nv) as usize * crate::physics::PARTICLE_BYTES) && self.physics.particles.create_cloth(id, &desc);
                 if !ok {
@@ -2281,6 +2299,42 @@ mod tests {
         assert_eq!(rt.physics.particles.groups.len(), 1);
         assert_eq!(rt.malformed_dropped(), 1, "the second cloth reused a taken id");
         for t in [160, 120, 71, 70, 69, 100, 160] {
+            seek_to(&mut rt, t);
+            assert_eq!(rt.state_hash(), Some(hashes[t as usize]), "hash at {t}");
+        }
+    }
+
+    #[test]
+    fn attachments_made_by_command_survive_a_seek_and_a_destroyed_body_releases_them() {
+        let mut rt = Runtime::new(16, 256);
+        rt.enable_physics();
+        let mut hashes = vec![0u64];
+        for t in 0..160 {
+            match t {
+                0 => {
+                    rt.ring.push(&Command::Record { on: true });
+                    rt.ring.push(&spawn_cmd(0, 0, BodyDesc::box_at([0.0, 5.0, 0.0], [0.3, 0.3, 0.3], 1.0, 0.1)));
+                    rt.ring.push(&spawn_cmd(1, 0, BodyDesc::box_at([3.0, 5.0, 0.0], [0.3, 0.3, 0.3], 1.0, 0.1)));
+                }
+                70 => {
+                    rt.ring.push(&Command::ParticleChain { id: 1, desc: crate::physics::ChainDesc { from: [0.0, 6.0, 0.0], to: [3.0, 6.0, 0.0], count: 7, pin_first: false, pin_last: false, radius: 0.05, inv_mass: 20.0, stiffness: 1.0 } });
+                }
+                75 => {
+                    rt.ring.push(&Command::ParticleAttach { particle: 0, body: 0, generation: 0, local: [0.0, 0.3, 0.0] });
+                    rt.ring.push(&Command::ParticleAttach { particle: 6, body: 1, generation: 0, local: [0.0, 0.3, 0.0] });
+                    rt.ring.push(&Command::ParticleAttach { particle: 6, body: 1, generation: 0, local: [0.0; 3] });
+                    rt.ring.push(&Command::ParticleAttach { particle: 3, body: 1, generation: 7, local: [0.0; 3] });
+                }
+                100 => { rt.ring.push(&Command::Destroy { id: 1, generation: 0 }); }
+                110 => { rt.ring.push(&Command::ParticleDetach { particle: 0 }); rt.ring.push(&Command::ParticleDetach { particle: 0 }); }
+                _ => {}
+            }
+            rt.step();
+            hashes.push(rt.state_hash().unwrap());
+        }
+        assert!(rt.physics.particles.attachments.is_empty(), "the destroyed body's row and the detached one are gone");
+        assert_eq!((rt.malformed_dropped(), rt.stale_dropped()), (1, 2), "a second attachment of one particle, a stale body, a second detach");
+        for t in [160, 90, 76, 75, 74, 120, 101, 99, 160] {
             seek_to(&mut rt, t);
             assert_eq!(rt.state_hash(), Some(hashes[t as usize]), "hash at {t}");
         }

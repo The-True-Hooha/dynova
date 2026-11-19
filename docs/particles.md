@@ -18,7 +18,6 @@ After the rigid step, in four substeps of a tick: move the free particles, pull 
 - A particle moves at most 100 m/s. Collision is tested once per substep, so a body thinner than about 0.5 m can still be crossed at that speed.
 - A particle tests at most 64 bodies (the lowest ids), chosen from the bodies near its group (see Cloth), so cost is particles x nearby bodies x 4. A thousand particles against a thousand nearby bodies took about 11 ms a tick in a native release build.
 - Friction removes 0.4 of the sideways motion per substep and per body touched. It does not depend on load or on a moving body's speed.
-- Coupling is one way: particles do not push bodies. Attachment is the next step.
 
 ## Cloth
 
@@ -27,6 +26,16 @@ The ring command `ParticleCloth` (tag 21, logged and replayed): a `nu` by `nv` s
 - No particle-particle or self collision: a folded cloth passes through itself.
 - A body smaller than the gap between particles (spacing minus two radii) can pass between them; choose a radius of at least half the spacing.
 - Per tick, each group finds the bodies near it once (a box of its extent plus 100 m/s of travel), so bodies far away cost nothing. A 64 by 64 cloth is 4,096 particles and about 25,000 links.
+
+## Attachments and coupling
+
+Ring commands `ParticleAttach` (tag 22: particle, body id and generation, offset in the body's frame) and `ParticleDetach` (tag 23), logged and replayed. The particle number is its index in the world's particle columns (the first particle of a group is the group's `first`, which is the sum of the counts of the groups made before it). A particle has at most one attachment; a particle with no row is free. A destroyed body releases its attachments in the same step, even if a new body takes its slot.
+
+- An attached particle is held at its point on the body, moving with it (its velocity is the body's there); it does not fall or collide. Its links still pull on it, and the body feels the opposite: a compliant pull that closes at most a quarter of the gap per tick (`ATTACH_GAIN`) and shares the body among every particle attached to it, so a whole cloth attached to one box cannot spin it up. A load hung from a rope sags: the attachment is a soft spring, not a rigid joint, and a heavy hanging body stretches it (a 1 kg box swinging on a 2 m rope reached 3 m from the pin in the test).
+- Particles also push bodies they touch: a body that hits a rope slows and the rope moves on, and a rope dropped on a box adds momentum to it (tested). The reaction is the momentum the particle loses closing on the body, charged to the deepest body it touches, and a contact does not bounce.
+- A body that carries or is touched by particles can still sleep when the pushes stop; a push of zero does not wake it. A rope that rests on a body keeps pushing on it, so that body stays awake while loaded.
+- A particle with inverse mass 0 can be attached: it rides the body and adds no pull.
+- One body's total gain from particles in a substep is bounded to 100 m/s and 100 rad/s.
 
 ## Not yet
 

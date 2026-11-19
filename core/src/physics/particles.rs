@@ -7,7 +7,7 @@
 //! particles (spacing minus two radii) can pass between them; collision is tested once per substep, so a body thinner than a substep's travel can be crossed.
 
 use super::*;
-use crate::collision::V3;
+use crate::collision::{cross, rotate, V3};
 
 pub const MAX_PARTICLES: usize = 1 << 14;
 pub const MAX_PARTICLE_GROUPS: usize = 1 << 12;
@@ -25,8 +25,10 @@ const CONTACT_FRICTION: f32 = 0.4;
 /// A particle moves at most this far per second. Collision is tested once per substep, so a faster one could pass through a thin body: with the 4 substeps
 /// of a 60 Hz tick this is 0.42 m per substep, enough to tunnel a body thinner than that. Bodies thinner than about 0.5 m can still be crossed at the cap.
 pub const MAX_PARTICLE_SPEED: f32 = 100.0;
-/// Speed a particle may leave a body at because of being pushed out of it. Without a bound, depth / h would throw a particle that starts inside a body.
-const MAX_DEPENETRATION_SPEED: f32 = 2.0;
+/// Share of an attachment's gap closed per tick by the pull on the body. Below one because the body only moves once a tick: a full correction yanks a body that was attached away from its particle.
+const ATTACH_GAIN: f32 = 0.25;
+/// A particle pushes a body as if it weighed at most this many kilograms, so a nearly massless-inverse particle cannot throw a body.
+const MAX_REACTION_MASS: f32 = 1000.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Link {
@@ -35,6 +37,14 @@ pub struct Link {
     pub rest: f32,
     /// Share of the length error removed per iteration, in (0, 1].
     pub stiffness: f32,
+}
+
+/// Particle `particle` rides on body `body` at `local` (in the body's frame). One row per attached particle; a particle with no row is free.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Attachment {
+    pub particle: u32,
+    pub body: u32,
+    pub local: V3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +63,7 @@ pub struct Particles {
     pub radius: Vec<f32>,
     pub groups: Vec<Group>,
     pub links: Vec<Link>,
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -202,6 +213,21 @@ impl Particles {
         true
     }
 
+    /// Fails for a particle that does not exist or is already attached, or a non-finite offset.
+    pub fn attach(&mut self, particle: u32, body: u32, local: V3) -> bool {
+        if particle as usize >= self.len() || !local.iter().all(|c| c.is_finite() && c.abs() <= MAX_COORD) || self.attachments.iter().any(|a| a.particle == particle) {
+            return false;
+        }
+        self.attachments.push(Attachment { particle, body, local });
+        true
+    }
+
+    pub fn detach(&mut self, particle: u32) -> bool {
+        let before = self.attachments.len();
+        self.attachments.retain(|a| a.particle != particle);
+        self.attachments.len() != before
+    }
+
     pub fn hash(&self) -> u64 {
         let mut h = Fnv::new();
         h.word(self.len() as u64);
@@ -218,15 +244,28 @@ impl Particles {
         for g in &self.groups {
             for w in [g.id, g.first, g.count] { h.word(w as u64); }
         }
+        h.word(self.attachments.len() as u64);
+        for a in &self.attachments {
+            h.word(a.particle as u64);
+            h.word(a.body as u64);
+            for v in a.local { h.word(v.to_bits() as u64); }
+        }
         h.finish()
     }
 
     pub fn approx_bytes(&self) -> usize {
-        self.len() * 8 * 4 + self.links.len() * std::mem::size_of::<Link>() + self.groups.len() * std::mem::size_of::<Group>()
+        self.len() * 8 * 4 + self.links.len() * std::mem::size_of::<Link>() + self.groups.len() * std::mem::size_of::<Group>() + self.attachments.len() * std::mem::size_of::<Attachment>()
     }
 }
 
 impl PhysicsWorld {
+    /// The mass that closes a gap between a particle and a body when both give way in proportion to their inverse masses, so a correction never overshoots.
+    /// `sharers` particles pull on the same body at once, so each sees only its share of the body: the sum of their corrections cannot exceed one gap's worth.
+    fn reduced_mass(&self, particle_inv_mass: f32, body: usize, sharers: u32) -> f32 {
+        let total = particle_inv_mass + self.inv_mass[body] * sharers.max(1) as f32;
+        if total > 0.0 { (1.0 / total).min(MAX_REACTION_MASS) } else { 0.0 }
+    }
+
     /// One tick of particles against the bodies as the rigid step left them: `PARTICLE_SUBSTEPS` small steps, each moving the free
     /// particles, pulling every link back to its length, pushing particles out of bodies and then taking the velocity from the motion.
     pub(super) fn step_particles(&mut self) {
@@ -234,6 +273,20 @@ impl PhysicsWorld {
             return;
         }
         let mut p = std::mem::take(&mut self.particles);
+        // A body that is gone takes its attachments with it.
+        p.attachments.retain(|a| (a.body as usize) < self.capacity && self.active[a.body as usize]);
+        // Where each attached particle is held and how fast, from the body poses the rigid step left.
+        let held: Vec<(usize, V3, V3, u32)> = p.attachments.iter().map(|a| {
+            let b = a.body as usize;
+            let r = rotate([self.qx[b], self.qy[b], self.qz[b], self.qw[b]], a.local);
+            let w = [self.ang_x[b], self.ang_y[b], self.ang_z[b]];
+            let v = cross(w, r);
+            (a.particle as usize, [self.pos_x[b] + r[0], self.pos_y[b] + r[1], self.pos_z[b] + r[2]], [self.vel_x[b] + v[0], self.vel_y[b] + v[1], self.vel_z[b] + v[2]], a.body)
+        }).collect();
+        let mut sharers = vec![0u32; self.capacity];
+        for k in &held { sharers[k.3 as usize] += 1; }
+        let mut attached = vec![false; p.len()];
+        for k in &held { attached[k.0] = true; }
         let h = self.dt / PARTICLE_SUBSTEPS as f32;
         let g = [self.gx, self.gy, self.gz];
         let n = p.len();
@@ -251,10 +304,12 @@ impl PhysicsWorld {
         let mut group_of = vec![0usize; n];
         for (k, g) in p.groups.iter().enumerate() { group_of[g.first as usize..(g.first + g.count) as usize].fill(k); }
         let mut out = vec![[0.0f32; 3]; n];
+        let mut out_vel = vec![[0.0f32; 3]; n];
+        let mut reactions: Vec<(usize, V3, V3)> = Vec::new();
         for _ in 0..PARTICLE_SUBSTEPS {
             for i in 0..n {
                 prev[i] = [p.x[i], p.y[i], p.z[i]];
-                if p.inv_mass[i] == 0.0 { continue; }
+                if p.inv_mass[i] == 0.0 || attached[i] { continue; }
                 p.vx[i] += g[0] * h;
                 p.vy[i] += g[1] * h;
                 p.vz[i] += g[2] * h;
@@ -262,6 +317,7 @@ impl PhysicsWorld {
                 p.y[i] += p.vy[i] * h;
                 p.z[i] += p.vz[i] * h;
             }
+            for k in &held { (p.x[k.0], p.y[k.0], p.z[k.0]) = (k.1[0], k.1[1], k.1[2]); }
             for _ in 0..PARTICLE_ITERS {
                 for l in &p.links {
                     let (a, b) = (l.a as usize, l.b as usize);
@@ -276,16 +332,42 @@ impl PhysicsWorld {
                     p.x[b] -= d[0] * k * wb; p.y[b] -= d[1] * k * wb; p.z[b] -= d[2] * k * wb;
                 }
             }
+            // The links tugged each held particle away from its body: the body feels the opposite, as a pull towards where the particle went, and the particle goes back.
+            for k in &held {
+                let i = k.0;
+                let tug = [p.x[i] - k.1[0], p.y[i] - k.1[1], p.z[i] - k.1[2]];
+                if p.inv_mass[i] > 0.0 {
+                    // The body moves once a tick, so the gap is closed over a tick, not a substep: that is a gain of at most one, which cannot overshoot.
+                    let m = self.reduced_mass(p.inv_mass[i], k.3 as usize, sharers[k.3 as usize]) * ATTACH_GAIN / (self.dt * PARTICLE_SUBSTEPS as f32);
+                    reactions.push((k.3 as usize, [tug[0] * m, tug[1] * m, tug[2] * m], k.1));
+                }
+                (p.x[i], p.y[i], p.z[i]) = (k.1[0], k.1[1], k.1[2]);
+            }
             for i in 0..n {
                 out[i] = [0.0; 3];
-                if p.inv_mass[i] == 0.0 { continue; }
+                out_vel[i] = [0.0; 3];
+                if p.inv_mass[i] == 0.0 || attached[i] { continue; }
                 let before = [p.x[i], p.y[i], p.z[i]];
                 self.overlap_sphere_among(candidates[group_of[i]].iter().copied(), before, p.radius[i], NO_BODY, &mut hits);
                 // At most 64 bodies are tested per particle (`overlap_sphere` keeps the lowest ids). The push is at most one radius a substep, so a particle that starts inside a
                 // body leaves it over several substeps instead of being thrown out at depth / h.
+                // Only the deepest body gets the reaction, so a particle between two bodies is not counted twice.
+                let deepest = hits.iter().map(|h| h.depth).fold(0.0f32, f32::max);
+                let mut reacted = false;
                 for hit in &hits {
-                    out[i] = hit.normal;
+                    let first = !reacted && hit.depth >= deepest;
+                    reacted |= first;
                     let push = hit.depth.min(p.radius[i]);
+                    let m = self.reduced_mass(p.inv_mass[i], hit.body as usize, 1);
+                    // The body's velocity where it is touched, and how fast the particle was closing on it: that is the momentum the body gives up.
+                    let b = hit.body as usize;
+                    let r = [hit.point[0] - self.pos_x[b], hit.point[1] - self.pos_y[b], hit.point[2] - self.pos_z[b]];
+                    let spin = cross([self.ang_x[b], self.ang_y[b], self.ang_z[b]], r);
+                    let vb = [self.vel_x[b] + spin[0], self.vel_y[b] + spin[1], self.vel_z[b] + spin[2]];
+                    if first { out[i] = hit.normal; out_vel[i] = vb; }
+                    let closing = -((p.vx[i] - vb[0]) * hit.normal[0] + (p.vy[i] - vb[1]) * hit.normal[1] + (p.vz[i] - vb[2]) * hit.normal[2]);
+                    let speed = closing.clamp(0.0, MAX_PARTICLE_SPEED);
+                    if first { reactions.push((b, [-hit.normal[0] * speed * m, -hit.normal[1] * speed * m, -hit.normal[2] * speed * m], hit.point)); }
                     p.x[i] += hit.normal[0] * push;
                     p.y[i] += hit.normal[1] * push;
                     p.z[i] += hit.normal[2] * push;
@@ -302,11 +384,12 @@ impl PhysicsWorld {
                 p.vx[i] = (p.x[i] - prev[i][0]) / h;
                 p.vy[i] = (p.y[i] - prev[i][1]) / h;
                 p.vz[i] = (p.z[i] - prev[i][2]) / h;
-                let n = out[i];
-                let along = p.vx[i] * n[0] + p.vy[i] * n[1] + p.vz[i] * n[2];
-                if along > MAX_DEPENETRATION_SPEED {
-                    let excess = along - MAX_DEPENETRATION_SPEED;
-                    p.vx[i] -= n[0] * excess; p.vy[i] -= n[1] * excess; p.vz[i] -= n[2] * excess;
+                if attached[i] { continue; }
+                // Leaving a body faster than the body moves is only the push out of it: keep the body's own speed along the normal, no bounce.
+                let (n, vb) = (out[i], out_vel[i]);
+                let along = (p.vx[i] - vb[0]) * n[0] + (p.vy[i] - vb[1]) * n[1] + (p.vz[i] - vb[2]) * n[2];
+                if along > 0.0 {
+                    p.vx[i] -= n[0] * along; p.vy[i] -= n[1] * along; p.vz[i] -= n[2] * along;
                 }
                 let speed_sq = p.vx[i] * p.vx[i] + p.vy[i] * p.vy[i] + p.vz[i] * p.vz[i];
                 if speed_sq > MAX_PARTICLE_SPEED * MAX_PARTICLE_SPEED {
@@ -314,6 +397,17 @@ impl PhysicsWorld {
                     p.vx[i] *= k; p.vy[i] *= k; p.vz[i] *= k;
                 }
             }
+            // One application per body: the impulses of every particle that touched or held it add up first, and the total is what is bounded.
+            reactions.sort_by_key(|r| r.0);
+            let mut start = 0;
+            while start < reactions.len() {
+                let body = reactions[start].0;
+                let end = start + reactions[start..].iter().take_while(|r| r.0 == body).count();
+                self.apply_impulses_at(body, &reactions[start..end]);
+                start = end;
+            }
+            reactions.clear();
+            for k in &held { (p.vx[k.0], p.vy[k.0], p.vz[k.0]) = (k.2[0], k.2[1], k.2[2]); }
         }
         self.particles = p;
     }
@@ -698,5 +792,210 @@ mod tests {
         let lowest = w.particles.y.iter().cloned().fold(f32::MAX, f32::min);
         assert!(lowest > 0.0, "the near floor still holds the cloth: {lowest}");
         assert!(t.elapsed().as_secs_f32() < 30.0);
+    }
+
+    fn dyn_box(w: &mut PhysicsWorld, id: usize, at: V3, half: f32, inv_mass: f32) {
+        w.spawn(id, &BodyDesc::box_at(at, [half; 3], inv_mass, 0.0));
+    }
+
+    #[test]
+    fn an_attached_particle_rides_its_body_and_the_attachment_is_refused_when_it_cannot_be() {
+        let mut w = world();
+        w.gy = 0.0;
+        dyn_box(&mut w, 0, [0.0, 2.0, 0.0], 0.5, 1.0);
+        assert!(w.particles.create_chain(0, &rope(false, [1.0, 2.0, 0.0], [2.0, 2.0, 0.0], 2)));
+        assert!(w.particles.attach(0, 0, [0.5, 0.0, 0.0]));
+        let before = w.particles.clone();
+        assert!(!w.particles.attach(0, 0, [0.0; 3]), "already attached");
+        assert!(!w.particles.attach(9, 0, [0.0; 3]), "no such particle");
+        assert!(!w.particles.attach(1, 0, [f32::NAN, 0.0, 0.0]));
+        assert_eq!(w.particles, before);
+        w.vel_x[0] = 1.0;
+        for _ in 0..60 { w.step(); }
+        let (bx, px) = (w.pos_x[0], w.particles.x[0]);
+        assert!(bx > 0.9, "the body glided {bx}");
+        assert!((px - (bx + 0.5)).abs() < 0.05, "the particle {px} is not 0.5 ahead of the body at {bx}");
+    }
+
+    #[test]
+    fn a_body_hanging_from_a_pinned_rope_is_held_up_and_swings() {
+        let mut w = world();
+        dyn_box(&mut w, 0, [2.0, 7.0, 0.0], 0.25, 1.0);
+        assert!(w.particles.create_chain(0, &ChainDesc { inv_mass: 50.0, ..rope(true, [0.0, 8.0, 0.0], [2.0, 7.25, 0.0], 9) }));
+        assert!(w.particles.attach(8, 0, [0.0, 0.25, 0.0]));
+        for _ in 0..600 { w.step(); }
+        assert!(w.pos_y[0] > 5.0, "the weight fell to {}", w.pos_y[0]);
+        let reach = ((w.pos_x[0]).powi(2) + (w.pos_y[0] - 8.0).powi(2)).sqrt();
+        assert!(reach < 3.3, "the weight is {reach} m from the pin on a 2 m rope: an attachment is compliant, so a swinging load stretches it");
+    }
+
+    #[test]
+    fn a_destroyed_body_drops_its_attachments_and_detach_frees_the_particle() {
+        let mut w = world();
+        dyn_box(&mut w, 0, [0.0, 0.0, 0.0], 0.5, 1.0);
+        dyn_box(&mut w, 1, [5.0, 0.0, 0.0], 0.5, 1.0);
+        assert!(w.particles.create_chain(0, &rope(false, [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], 4)));
+        assert!(w.particles.attach(0, 0, [0.0, 0.5, 0.0]) && w.particles.attach(3, 1, [0.0, 0.5, 0.0]));
+        assert!(w.particles.detach(3) && !w.particles.detach(3));
+        assert!(w.particles.attach(3, 1, [0.0, 0.5, 0.0]));
+        w.deactivate(0);
+        w.step();
+        assert_eq!(w.particles.attachments.iter().map(|a| a.particle).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn a_body_driven_into_a_rope_pushes_it_along() {
+        let mut w = world();
+        w.gy = 0.0;
+        dyn_box(&mut w, 0, [0.0, 0.0, 0.0], 0.5, 1.0);
+        w.vel_x[0] = 1.0;
+        assert!(w.particles.create_chain(0, &ChainDesc { radius: 0.05, inv_mass: 100.0, ..rope(false, [1.2, 0.0, -0.5], [1.2, 0.0, 0.5], 11) }));
+        for _ in 0..240 { w.step(); }
+        assert!(w.pos_x[0] > 1.0, "the box pushed on to {}", w.pos_x[0]);
+        let mean = w.particles.x.iter().sum::<f32>() / w.particles.len() as f32;
+        assert!(mean > 1.7, "the rope was pushed to {mean} from 1.2");
+        assert!(w.vel_x[0] < 1.0 - 1.0e-3, "the rope slowed the box: {}", w.vel_x[0]);
+    }
+
+    #[test]
+    fn a_heavy_rope_dropped_on_a_box_gives_it_more_momentum_than_a_light_one() {
+        let hit = |inv_mass: f32| {
+            let mut w = world();
+            w.gy = 0.0;
+            dyn_box(&mut w, 0, [0.0, 0.0, 0.0], 0.5, 1.0);
+            assert!(w.particles.create_chain(0, &ChainDesc { inv_mass, radius: 0.05, ..rope(false, [-0.3, 0.8, 0.0], [0.3, 0.8, 0.0], 7) }));
+            w.particles.vy.fill(-3.0);
+            for _ in 0..60 { w.step(); }
+            w.vel_y[0]
+        };
+        assert!(hit(1.0) < hit(100.0) - 0.5, "{} vs {}", hit(1.0), hit(100.0));
+        assert!(hit(100.0) < 0.0, "even a light rope pushes the box down");
+    }
+
+    #[test]
+    fn a_far_off_attachment_pulls_but_does_not_throw_the_body() {
+        let mut w = world();
+        dyn_box(&mut w, 0, [0.0, 7.0, 0.0], 0.25, 1.0);
+        assert!(w.particles.create_chain(0, &ChainDesc { inv_mass: 50.0, ..rope(true, [0.0, 8.0, 0.0], [2.0, 8.0, 0.0], 9) }));
+        assert!(w.particles.attach(8, 0, [0.0, 0.25, 0.0]));
+        for _ in 0..600 { w.step(); }
+        assert!(w.pos_y[0].is_finite() && w.qw[0].is_finite() && w.pos_y[0] > 4.0, "{} {}", w.pos_y[0], w.qw[0]);
+    }
+
+    #[test]
+    fn attachments_are_hashed_and_snapshotted() {
+        let mut w = world();
+        dyn_box(&mut w, 0, [0.0, 2.0, 0.0], 0.5, 1.0);
+        assert!(w.particles.create_chain(0, &rope(false, [1.0, 2.0, 0.0], [2.0, 2.0, 0.0], 3)));
+        let bare = w.state_hash();
+        assert!(w.particles.attach(0, 0, [0.5, 0.0, 0.0]));
+        let snap = w.capture();
+        assert_ne!(w.state_hash(), bare);
+        for _ in 0..30 { w.step(); }
+        let later = w.state_hash();
+        assert!(w.restore(&snap));
+        for _ in 0..30 { w.step(); }
+        assert_eq!(w.state_hash(), later);
+        let mut w2 = world();
+        dyn_box(&mut w2, 0, [0.0, 2.0, 0.0], 0.5, 1.0);
+        assert!(w2.particles.create_chain(0, &rope(false, [1.0, 2.0, 0.0], [2.0, 2.0, 0.0], 3)));
+        assert!(w2.particles.attach(0, 0, [0.5, 0.1, 0.0]));
+        assert_ne!(w2.state_hash(), snap.hash(), "the local offset is hashed");
+    }
+
+    #[test]
+    fn an_impulse_at_a_point_spins_the_body_and_is_bounded() {
+        let mut w = world();
+        dyn_box(&mut w, 0, [0.0; 3], 0.5, 1.0);
+        w.spawn(1, &BodyDesc::box_at([5.0, 0.0, 0.0], [0.5; 3], 0.0, 0.0));
+        w.apply_impulse_at(0, [0.0, 0.0, 1.0], [0.5, 0.0, 0.0]);
+        assert!((w.vel_z[0] - 1.0).abs() < 1e-6 && w.ang_y[0].abs() > 0.1, "{} {}", w.vel_z[0], w.ang_y[0]);
+        let before = (w.vel_x[1], w.ang_y[1]);
+        w.apply_impulse_at(1, [1.0e9, 0.0, 0.0], [5.0, 1.0, 0.0]);
+        assert_eq!((w.vel_x[1], w.ang_y[1]), before, "a static body takes none");
+        w.apply_impulse_at(0, [1.0e9, 1.0e9, 0.0], [0.5, 0.5, 0.0]);
+        let v = (w.vel_x[0].powi(2) + w.vel_y[0].powi(2) + w.vel_z[0].powi(2)).sqrt();
+        let spin = (w.ang_x[0].powi(2) + w.ang_y[0].powi(2) + w.ang_z[0].powi(2)).sqrt();
+        assert!(v < 102.0 && spin < 102.0 + 2.0, "{v} {spin}");
+    }
+
+    #[test]
+    fn a_light_rope_hung_from_a_body_does_not_pump_energy_into_it() {
+        let mut w = world();
+        dyn_box(&mut w, 0, [2.0, 7.0, 0.0], 0.25, 1.0);
+        assert!(w.particles.create_chain(0, &rope(true, [0.0, 8.0, 0.0], [2.0, 7.25, 0.0], 9)));
+        assert!(w.particles.attach(8, 0, [0.0, 0.25, 0.0]));
+        let mut highest = f32::MIN;
+        for _ in 0..900 { w.step(); highest = highest.max(w.pos_y[0]); }
+        assert!(highest < 8.2, "the body rose to {highest}, above the pin at 8");
+        let spin = (w.ang_x[0].powi(2) + w.ang_y[0].powi(2) + w.ang_z[0].powi(2)).sqrt();
+        assert!(spin < 30.0 && w.pos_y[0].is_finite(), "{spin}");
+    }
+
+    #[test]
+    fn a_whole_cloth_stretched_over_one_box_does_not_spin_it_up() {
+        let mut w = world();
+        dyn_box(&mut w, 0, [0.0, 2.0, 0.0], 0.5, 1.0);
+        assert!(w.particles.create_cloth(0, &ClothDesc { origin: [-0.65, 2.5, -0.65], u: [1.3, 0.0, 0.0], v: [0.0, 0.0, 1.3], ..sheet(0.0, 17) }));
+        for k in 0..17 * 17 {
+            let (i, j) = ((k % 17) as f32, (k / 17) as f32);
+            assert!(w.particles.attach(k as u32, 0, [-0.5 + i / 16.0, 0.5, -0.5 + j / 16.0]));
+        }
+        for _ in 0..90 { w.step(); }
+        let spin = (w.ang_x[0].powi(2) + w.ang_y[0].powi(2) + w.ang_z[0].powi(2)).sqrt();
+        // Nothing holds the box up (the cloth is only attached to it), so it falls; the point is that the cloth does not spin or throw it.
+        let free_fall = 2.0 - 0.5 * 9.81 * 1.5 * 1.5;
+        assert!(spin < 20.0 && (w.pos_y[0] - free_fall).abs() < 1.0, "spin {spin}, y {}", w.pos_y[0]);
+    }
+
+    #[test]
+    fn a_sleeping_box_under_an_attached_rope_is_not_launched() {
+        let mut w = world();
+        w.spawn(1, &BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.0));
+        dyn_box(&mut w, 0, [0.0, 0.5, 0.0], 0.5, 1.0);
+        for _ in 0..240 { w.step(); }
+        assert!(w.sleeping[0], "the box settled");
+        assert!(w.particles.create_chain(0, &ChainDesc { inv_mass: 1.0, ..rope(false, [-0.5, 1.02, 0.0], [0.5, 1.02, 0.0], 3) }));
+        assert!(w.particles.attach(0, 0, [0.0, 0.5, 0.0]));
+        for _ in 0..120 { w.step(); }
+        assert!(w.pos_y[0] < 0.8, "the box was thrown to {}", w.pos_y[0]);
+    }
+
+    #[test]
+    fn a_slot_reused_in_the_same_tick_does_not_inherit_the_old_attachment() {
+        let mut w = world();
+        dyn_box(&mut w, 0, [0.0, 2.0, 0.0], 0.5, 1.0);
+        assert!(w.particles.create_chain(0, &rope(false, [1.0, 2.0, 0.0], [2.0, 2.0, 0.0], 2)));
+        assert!(w.particles.attach(0, 0, [0.5, 0.0, 0.0]));
+        w.deactivate(0);
+        dyn_box(&mut w, 0, [9.0, 9.0, 0.0], 0.5, 1.0);
+        w.step();
+        assert!(w.particles.attachments.is_empty());
+        assert!(w.particles.x[0] < 3.0, "the particle followed the new occupant to {}", w.particles.x[0]);
+    }
+
+    #[test]
+    fn a_particle_between_two_bodies_gives_only_the_deeper_one_a_reaction() {
+        let mut w = world();
+        w.gy = 0.0;
+        dyn_box(&mut w, 0, [-0.55, 0.0, 0.0], 0.5, 1.0);
+        dyn_box(&mut w, 1, [0.57, 0.0, 0.0], 0.5, 1.0);
+        assert!(w.particles.create_chain(0, &ChainDesc { inv_mass: 1.0, radius: 0.08, ..rope(false, [0.0, 0.0, 0.0], [0.0, 0.0, 0.1], 2) }));
+        w.particles.vx.fill(0.5);
+        w.step();
+        assert_eq!((w.vel_x[0], w.vel_x[1]), (0.0, 0.0), "the deeper body is the one the particle leaves, the other is not charged for it");
+    }
+
+    #[test]
+    fn a_zero_impulse_leaves_a_sleeping_body_asleep() {
+        let mut w = world();
+        w.spawn(1, &BodyDesc::box_at([0.0, -0.5, 0.0], [20.0, 0.5, 20.0], 0.0, 0.0));
+        dyn_box(&mut w, 0, [0.0, 0.5, 0.0], 0.5, 1.0);
+        for _ in 0..240 { w.step(); }
+        assert!(w.sleeping[0]);
+        w.apply_impulse_at(0, [0.0; 3], [0.0, 1.0, 0.0]);
+        assert!(w.sleeping[0], "a zero impulse woke it");
+        w.apply_impulse_at(0, [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]);
+        assert!(!w.sleeping[0], "a real one wakes it");
     }
 }

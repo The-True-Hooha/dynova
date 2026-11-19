@@ -14,7 +14,7 @@ pub(crate) use snapshot::Fnv;
 pub use kinematic::{Kin, MAX_KIN_TICKS};
 pub use query::{OverlapHit, RayHit, MAX_OVERLAP_HITS, MAX_QUERY_RANGE, NO_BODY};
 pub use joints::{Joint, JointDesc, MAX_JOINTS, JOINT_BALL, JOINT_DISTANCE, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER, MAX_JOINT_ID, MIN_ROD_LENGTH};
-pub use particles::{ChainDesc, ClothDesc, MAX_CLOTH_SIDE, PARTICLE_BYTES, Group, Link, Particles, MAX_CHAIN, MAX_GROUP_ID, MAX_PARTICLES, MAX_PARTICLE_GROUPS, MAX_PARTICLE_RADIUS, MIN_PARTICLE_RADIUS};
+pub use particles::{Attachment, ChainDesc, ClothDesc, MAX_CLOTH_SIDE, PARTICLE_BYTES, Group, Link, Particles, MAX_CHAIN, MAX_GROUP_ID, MAX_PARTICLES, MAX_PARTICLE_GROUPS, MAX_PARTICLE_RADIUS, MIN_PARTICLE_RADIUS};
 pub use snapshot::PhysicsSnapshot;
 
 const MIN_BUCKETS: usize = 4096;
@@ -39,6 +39,8 @@ const MAX_WIDE_DYNAMICS: usize = 16;
 const BROAD_EPS: f32 = 1e-3;
 /// How far a body may move from where the candidate pairs were found before they are found again.
 const CANDIDATE_SLACK: f32 = 0.05;
+/// Most speed (m/s) or spin (rad/s) one `apply_impulse_at` may add.
+const MAX_IMPULSE_DELTA: f32 = 100.0;
 const SOLVER_ITERS: u32   = 12;
 /// A jointed world solves contacts and joints together in closed chains (a legged robot on the ground), which 12 sweeps leave creeping: a quadruped sagged and tipped
 /// within 10k ticks at 12 and 20, and stood at 28.
@@ -353,6 +355,7 @@ impl PhysicsWorld {
     pub fn deactivate(&mut self, id: usize) {
         if id >= self.capacity { return; }
         self.active[id] = false;
+        self.particles.attachments.retain(|a| a.body as usize != id);
         self.wake_touching(id);
         self.forget_pairs(id as u32);
         self.drop_joints_of(id as u32);
@@ -394,6 +397,36 @@ impl PhysicsWorld {
 
     fn forget_pairs(&mut self, id: u32) {
         self.warm_cache.retain(|e| e.a != id && e.b != id);
+    }
+
+    /// `impulse` at world point `at`: changes the linear velocity and, through the scalar inertia, the spin. A static body takes none.
+    pub fn apply_impulse_at(&mut self, id: usize, impulse: [f32; 3], at: [f32; 3]) {
+        self.apply_impulses_at(id, &[(id, impulse, at)]);
+    }
+
+    /// Several impulses on one body, summed into one force and one torque before the speed and spin they add are bounded. A zero total leaves the body asleep.
+    pub fn apply_impulses_at(&mut self, id: usize, impulses: &[(usize, [f32; 3], [f32; 3])]) {
+        if id >= self.capacity || !self.active[id] || self.inv_mass[id] == 0.0 { return; }
+        let (mut impulse, mut torque) = ([0.0f32; 3], [0.0f32; 3]);
+        for (_, j, at) in impulses {
+            let r = [at[0] - self.pos_x[id], at[1] - self.pos_y[id], at[2] - self.pos_z[id]];
+            let t = crate::collision::cross(r, *j);
+            for k in 0..3 { impulse[k] += j[k]; torque[k] += t[k]; }
+        }
+        if impulse == [0.0; 3] && torque == [0.0; 3] { return; }
+        self.wake(id);
+        let (im, ii) = (self.inv_mass[id], self.inv_inertia[id]);
+        // Bounded, so a hostile or far-off attachment cannot give a body a speed or spin the integrator cannot hold.
+        let dv = (impulse[0] * impulse[0] + impulse[1] * impulse[1] + impulse[2] * impulse[2]).sqrt() * im;
+        let dw = (torque[0] * torque[0] + torque[1] * torque[1] + torque[2] * torque[2]).sqrt() * ii;
+        let k = if dv > MAX_IMPULSE_DELTA || dw > MAX_IMPULSE_DELTA { MAX_IMPULSE_DELTA / dv.max(dw) } else { 1.0 };
+        let (im, ii) = (im * k, ii * k);
+        self.vel_x[id] += impulse[0] * im;
+        self.vel_y[id] += impulse[1] * im;
+        self.vel_z[id] += impulse[2] * im;
+        self.ang_x[id] += torque[0] * ii;
+        self.ang_y[id] += torque[1] * ii;
+        self.ang_z[id] += torque[2] * ii;
     }
 
     pub fn apply_impulse(&mut self, id: usize, ix: f32, iy: f32, iz: f32) {
