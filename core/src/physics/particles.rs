@@ -30,6 +30,9 @@ const CONTACT_FRICTION: f32 = 0.4;
 pub const MAX_PARTICLE_SPEED: f32 = 100.0;
 /// Share of an attachment's gap closed per tick by the pull on the body. Below one because the body only moves once a tick: a full correction yanks a body that was attached away from its particle.
 const ATTACH_GAIN: f32 = 0.25;
+/// Most speed a fluid or sand particle's push out of a body is charged as. A resting particle is pushed out at about `g * h` a substep, far below this; the bound
+/// only stops a body that lands in the fluid from being thrown by the pile-up of corrections.
+const MAX_PRESSURE_SPEED: f32 = 0.5;
 /// A particle pushes a body as if it weighed at most this many kilograms, so a nearly massless-inverse particle cannot throw a body.
 const MAX_REACTION_MASS: f32 = 1000.0;
 
@@ -371,6 +374,12 @@ impl PhysicsWorld {
         }).collect();
         let mut sharers = vec![0u32; self.capacity];
         for k in &held { sharers[k.3 as usize] += 1; }
+        // How many fluid or sand particles pushed on each body in the substep before: they share the body's mass, so the sum of their corrections cannot overshoot.
+        let mut contacts = vec![0u32; self.capacity];
+        let mut next_contacts = vec![0u32; self.capacity];
+        let mut granular = vec![false; p.len()];
+        for g in &p.fluids { granular[g.first as usize..(g.first + g.count) as usize].fill(true); }
+        for g in &p.sand { granular[g.first as usize..(g.first + g.count) as usize].fill(true); }
         let mut attached = vec![false; p.len()];
         for k in &held { attached[k.0] = true; }
         let h = self.dt / PARTICLE_SUBSTEPS as f32;
@@ -446,7 +455,8 @@ impl PhysicsWorld {
                     let first = !reacted && hit.depth >= deepest;
                     reacted |= first;
                     let push = hit.depth.min(p.radius[i]);
-                    let m = self.reduced_mass(p.inv_mass[i], hit.body as usize, 1);
+                    let m = self.reduced_mass(p.inv_mass[i], hit.body as usize, contacts[hit.body as usize].max(1));
+                    if first && granular[i] { next_contacts[hit.body as usize] += 1; }
                     // The body's velocity where it is touched, and how fast the particle was closing on it: that is the momentum the body gives up.
                     let b = hit.body as usize;
                     let r = [hit.point[0] - self.pos_x[b], hit.point[1] - self.pos_y[b], hit.point[2] - self.pos_z[b]];
@@ -454,7 +464,10 @@ impl PhysicsWorld {
                     let vb = [self.vel_x[b] + spin[0], self.vel_y[b] + spin[1], self.vel_z[b] + spin[2]];
                     if first { out[i] = hit.normal; out_vel[i] = vb; }
                     let closing = -((p.vx[i] - vb[0]) * hit.normal[0] + (p.vy[i] - vb[1]) * hit.normal[1] + (p.vz[i] - vb[2]) * hit.normal[2]);
-                    let speed = closing.clamp(0.0, MAX_PARTICLE_SPEED);
+                    // A fluid or sand particle resting against a body is pushed out of it every substep, and that push is the pressure the body feels: it is
+                    // charged as the momentum the push gives the particle. A rope or cloth particle only gives up what it closed with.
+                    let pressure = if granular[i] { (push / h).min(MAX_PRESSURE_SPEED) } else { 0.0 };
+                    let speed = closing.max(pressure).clamp(0.0, MAX_PARTICLE_SPEED);
                     if first { reactions.push((b, [-hit.normal[0] * speed * m, -hit.normal[1] * speed * m, -hit.normal[2] * speed * m], hit.point)); }
                     p.x[i] += hit.normal[0] * push;
                     p.y[i] += hit.normal[1] * push;
@@ -492,6 +505,8 @@ impl PhysicsWorld {
                 p.damp_sand(t, &grounded);
                 p.stick_sand(nb, g, &prev, &on_body);
             }
+            std::mem::swap(&mut contacts, &mut next_contacts);
+            next_contacts.fill(0);
             // One application per body: the impulses of every particle that touched or held it add up first, and the total is what is bounded.
             reactions.sort_by_key(|r| r.0);
             let mut start = 0;

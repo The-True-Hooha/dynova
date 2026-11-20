@@ -56,6 +56,10 @@ Position-based fluid (the ring command `ParticleFluid`, tag 25, logged and repla
 - Collision is the same per-substep sphere test as other particles, so a body thinner than a substep's travel can be crossed at speed. Coarse, deep fluid is not supported: an 8 by 8 by 8 block at 0.5 m spacing (4 m deep) fell through a 1 m thick floor in the measurement, and a block spawned inside a thin slab spreads about a metre sideways. Spacings of 0.1 m and below, with bodies a few spacings thick, are what is tested.
 - The level agrees with the analytic one to a few percent at spacings of 0.04 and 0.1; at 0.01 m a measurement found it 30 percent high, which is not understood (the level helper averages the top tenth of a small block). Fine fluid is untested for accuracy.
 
+## Buoyancy
+
+A fluid or sand particle that rests against a body is pushed out of it every substep, and that push is charged to the body as pressure (bounded at 0.5 m/s of push a substep), shared among the particles pressing on it through the mass of the body. A cube of density ratio 0.25, 0.5 and 0.75 dropped into 0.6 m of water floats deeper the denser it is (tested). The depth is only roughly Archimedes: in the measurement the draft was 0.04 to 0.06 m (analytic 0.075), 0.16 m (analytic 0.15) and 0.22 to 0.30 m (analytic 0.225), and it moved by tens of percent between runs of different length because the cube and the water keep sloshing. The roadmap's "floats at its analytic depth" is therefore met only loosely; a tight tolerance would need boundary particles or a pressure force on the body, which this does not have.
+
 ## Sand
 
 The ring command `ParticleSand` (tag 26, logged and replayed; same slot layout as fluid, with Coulomb `friction` in 0 to 1 where fluid has viscosity): a lattice of 2 to 32 grains per axis, spacing equal to the grain diameter. A grain weighs 1600 kg/m3 times its diameter cubed. Fluid and sand share the 4,096 particle cap.

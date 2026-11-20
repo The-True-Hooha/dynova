@@ -484,4 +484,34 @@ mod tests {
             assert!(ns.len() <= 63);
         }
     }
+
+    /// Mean draft (waterline minus the bottom of the box) of a 0.3 m cube of the given density ratio floating in 0.6 m of basin, over the last 300 of 1000 ticks.
+    fn draft(ratio: f32) -> f32 {
+        let d = 0.05;
+        let mut w = PhysicsWorld::new(8);
+        w.gy = -9.81;
+        basin(&mut w, 0.3);
+        assert!(w.particles.create_fluid(0, &column(d, [12, 14, 12], [-0.28, 0.025, -0.28])));
+        let side = 0.3;
+        w.spawn(5, &BodyDesc::box_at([0.0, 0.62, 0.0], [side / 2.0; 3], 1.0 / (ratio * FLUID_DENSITY * side * side * side), 0.0));
+        let (mut sum, mut n) = (0.0, 0);
+        for t in 0..1000 {
+            w.step();
+            if t >= 700 && t % 10 == 0 { sum += level(&w.particles, d) - (w.pos_y[5] - side / 2.0); n += 1; }
+        }
+        sum / n as f32
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "a particle simulation: too slow unoptimised, runs in the opt-level 3 gate")]
+    fn a_cube_floats_deeper_the_denser_it_is_and_near_its_analytic_depth_within_loose_bounds() {
+        let (light, half, heavy) = (draft(0.25), draft(0.5), draft(0.75));
+        assert!(light < half && half < heavy, "{light} {half} {heavy}");
+        // Archimedes: a cube of density ratio r floats with a draft of r times its side (0.3 m). The coupling is approximate (measured errors range from -50 to +30 percent
+        // across runs of different length), so the bounds are loose and the ordering is the firm claim.
+        assert!((half - 0.15).abs() < 0.15 * 0.25, "half density draft {half}, analytic 0.15");
+        for (got, ratio) in [(light, 0.25f32), (half, 0.5), (heavy, 0.75)] {
+            assert!((got - ratio * 0.3).abs() < ratio * 0.3 * 0.55, "ratio {ratio}: draft {got}, analytic {}", ratio * 0.3);
+        }
+    }
 }
