@@ -46,6 +46,16 @@ Ring commands `ParticleAttach` (tag 22: particle, body id and generation, offset
 - A particle with inverse mass 0 can be attached: it rides the body and adds no pull.
 - One body's total gain from particles in a substep is bounded to 100 m/s and 100 rad/s.
 
+## Fluid
+
+Position-based fluid (the ring command `ParticleFluid`, tag 25, logged and replayed): a block of 2 to 32 particles per axis on a lattice of `spacing` (0.01 to 1 m), with an XSPH `viscosity` in [0, 1]. A particle weighs 1000 kg/m3 times its spacing cubed, so bodies feel real momentum. Each substep the neighbours within 2 spacings are found (cells sorted by key and index, so identical on every target) and 8 density iterations move each particle to cancel its density error; no libm is used.
+
+- An 8 by 14 by 8 column of water (0.4 by 0.7 by 0.4 m, 0.05 m spacing) released in one corner of a 0.6 m basin spreads and settles to a level within 5 percent of the analytic volume (tested: about 4 percent low, because the surface layer feels no pressure; bounded 5 percent low to 1 percent high).
+- Cost is about 7 microseconds a particle a tick in a native release build, so a world holds at most 4,096 fluid particles (about 30 ms).
+- Fluid groups do not see each other: two pours into one place pass through one another. One group is one body of water.
+- Collision is the same per-substep sphere test as other particles, so a body thinner than a substep's travel can be crossed at speed. Coarse, deep fluid is not supported: an 8 by 8 by 8 block at 0.5 m spacing (4 m deep) fell through a 1 m thick floor in the measurement, and a block spawned inside a thin slab spreads about a metre sideways. Spacings of 0.1 m and below, with bodies a few spacings thick, are what is tested.
+- The level agrees with the analytic one to a few percent at spacings of 0.04 and 0.1; at 0.01 m a measurement found it 30 percent high, which is not understood (the level helper averages the top tenth of a small block). Fine fluid is untested for accuracy.
+
 ## From TypeScript and Python
 
 ```ts

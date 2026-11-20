@@ -6,6 +6,7 @@ mod accuracy;
 #[cfg(test)]
 mod contact_accuracy;
 mod joints;
+mod fluid;
 mod kinematic;
 mod particles;
 mod query;
@@ -14,6 +15,7 @@ pub(crate) use snapshot::Fnv;
 pub use kinematic::{Kin, MAX_KIN_TICKS};
 pub use query::{OverlapHit, RayHit, MAX_OVERLAP_HITS, MAX_QUERY_RANGE, NO_BODY};
 pub use joints::{Joint, JointDesc, MAX_JOINTS, JOINT_BALL, JOINT_DISTANCE, JOINT_FIXED, JOINT_HINGE, JOINT_SLIDER, MAX_JOINT_ID, MIN_ROD_LENGTH};
+pub use fluid::{FluidDesc, FluidGroup, FLUID_DENSITY, MAX_FLUID_PARTICLES, MAX_FLUID_SIDE};
 pub use particles::{Attachment, SoftDesc, MAX_SOFT_SIDE, ChainDesc, ClothDesc, MAX_CLOTH_SIDE, PARTICLE_BYTES, Group, Link, Particles, MAX_CHAIN, MAX_GROUP_ID, MAX_PARTICLES, MAX_PARTICLE_GROUPS, MAX_PARTICLE_RADIUS, MIN_PARTICLE_RADIUS};
 pub use snapshot::PhysicsSnapshot;
 

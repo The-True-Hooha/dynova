@@ -67,6 +67,7 @@ pub struct Particles {
     pub groups: Vec<Group>,
     pub links: Vec<Link>,
     pub attachments: Vec<Attachment>,
+    pub fluids: Vec<super::fluid::FluidGroup>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -325,6 +326,8 @@ impl Particles {
         for g in &self.groups {
             for w in [g.id, g.first, g.count] { h.word(w as u64); }
         }
+        // Only a world with fluid groups hashes them, so every world without any hashes as it did before fluids existed.
+        if !self.fluids.is_empty() { self.fluid_hash(&mut h); }
         h.word(self.attachments.len() as u64);
         for a in &self.attachments {
             h.word(a.particle as u64);
@@ -335,7 +338,7 @@ impl Particles {
     }
 
     pub fn approx_bytes(&self) -> usize {
-        self.len() * 8 * 4 + self.links.len() * std::mem::size_of::<Link>() + self.groups.len() * std::mem::size_of::<Group>() + self.attachments.len() * std::mem::size_of::<Attachment>()
+        self.len() * 8 * 4 + self.links.len() * std::mem::size_of::<Link>() + self.groups.len() * std::mem::size_of::<Group>() + self.attachments.len() * std::mem::size_of::<Attachment>() + self.fluids.len() * std::mem::size_of::<super::fluid::FluidGroup>()
     }
 }
 
@@ -399,6 +402,8 @@ impl PhysicsWorld {
                 p.z[i] += p.vz[i] * h;
             }
             for k in &held { (p.x[k.0], p.y[k.0], p.z[k.0]) = (k.1[0], k.1[1], k.1[2]); }
+            let neighbours = if p.fluids.is_empty() { None } else { Some(p.find_neighbours()) };
+            if let Some(nb) = &neighbours { p.solve_density(nb); }
             for _ in 0..PARTICLE_ITERS {
                 for l in &p.links {
                     let (a, b) = (l.a as usize, l.b as usize);
@@ -478,6 +483,7 @@ impl PhysicsWorld {
                     p.vx[i] *= k; p.vy[i] *= k; p.vz[i] *= k;
                 }
             }
+            if let Some(nb) = &neighbours { p.smooth_velocities(nb); }
             // One application per body: the impulses of every particle that touched or held it add up first, and the total is what is bounded.
             reactions.sort_by_key(|r| r.0);
             let mut start = 0;
