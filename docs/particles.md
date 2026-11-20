@@ -58,7 +58,17 @@ Position-based fluid (the ring command `ParticleFluid`, tag 25, logged and repla
 
 ## Buoyancy
 
-A fluid or sand particle that rests against a body is pushed out of it every substep, and that push is charged to the body as pressure (bounded at 0.5 m/s of push a substep), shared among the particles pressing on it through the mass of the body. A cube of density ratio 0.25, 0.5 and 0.75 dropped into 0.6 m of water floats deeper the denser it is (tested). The depth is only roughly Archimedes: in the measurement the draft was 0.04 to 0.06 m (analytic 0.075), 0.16 m (analytic 0.15) and 0.22 to 0.30 m (analytic 0.225), and it moved by tens of percent between runs of different length because the cube and the water keep sloshing. The roadmap's "floats at its analytic depth" is therefore met only loosely; a tight tolerance would need boundary particles or a pressure force on the body, which this does not have.
+Water lifts a body as much as the water it displaces weighs (Archimedes). Each substep's poses are held for the tick, so the displaced volume is measured once a tick: the body is cut into 20 by 20 vertical columns across its bounding sphere, a ray up and a ray down give where each column enters and leaves it (every shape is convex), and the length of that inside the water is summed. The water is the group's footprint between its lowest particle and its surface (the mean of its top tenth plus half a spacing), measured along gravity. The lift acts at the centre of the displaced volume, so a half-submerged body is also turned. The water takes speed out of a body in proportion to the water it displaces (`WATER_DRAG`, 6 per second, capped at half a body's speed a substep). A fluid particle that lands on a body faster than 1.5 m/s also gives it its momentum. Sand keeps the push-out pressure charge (bounded at 0.5 m/s a substep, shared among the grains pressing on the body).
+
+A cube of density ratio 0.25, 0.5 and 0.75 dropped into 0.6 m of water settles at a draft of 0.070, 0.141 and 0.211 m against Archimedes' 0.075, 0.15 and 0.225 (6 percent shallow; tested within 12 percent). A cube held still in settled water feels the weight of the water it displaces to within 15 percent (tested). The error is the column grid: its cells are about 9 percent of the width of an axis-aligned cube, and the way a face falls across them moves the volume by up to that.
+
+Limits:
+- The water is the group's bounding region, not the particles: a stream, a splash or water poured onto a body from above is not seen as water, so it neither lifts nor weighs on the body (a landing particle still gives its momentum). A plate lying under still water that has nothing under it is lifted as if the water were under it.
+- Groups poured into one place overlap; a body takes the lift of the group that displaces most of it.
+- Drag is against still water, so a current does not carry a body.
+- Floating bodies never sleep.
+- A thin body is sampled by few columns; a body larger than the pond may get no lift.
+- Cost: up to 800 rays a tick for each dynamic body in the water's region.
 
 ## Sand
 

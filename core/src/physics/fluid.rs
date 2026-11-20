@@ -4,8 +4,9 @@
 //! sqrt are used, and the sort breaks ties by index, so every target agrees to the bit.
 
 use super::particles::{Group, Particles, MAX_GROUP_ID, MAX_PARTICLES, MAX_PARTICLE_GROUPS};
+use super::query::NO_BODY;
 use super::*;
-use crate::collision::V3;
+use crate::collision::{cross, dot, normalize, scale, V3};
 
 pub const MAX_FLUID_SIDE: u32 = 32;
 /// Fluid and sand particles in one world. A tick costs about 7 microseconds a particle in a native release build (the density iterations dominate), so this bounds it near 30 ms.
@@ -13,6 +14,15 @@ pub const MAX_FLUID_PARTICLES: usize = 4096;
 pub const FLUID_ITERS: u32 = 8;
 /// Water, kg/m^3: sets the mass of a particle, which is what a body feels of it.
 pub const FLUID_DENSITY: f32 = 1000.0;
+/// Columns a body is cut into along each side of its bounding cube when its displaced water is measured.
+const BUOYANCY_GRID: usize = 20;
+/// How fast the water takes the speed out of a body, per second, in proportion to the water the body displaces: a floating body (displaced water weighs what it
+/// does) loses this share of its speed each second. That damps bobbing of a body that floats about 0.15 m deep to about a third of critical; a deeper draft is
+/// damped less.
+pub const WATER_DRAG: f32 = 6.0;
+/// A fluid particle gives a body the momentum of what it closes on it faster than this (m/s): water landing on a body. Slower closing is the jitter of water at rest
+/// and the bobbing of a floating body, which the lift already accounts for; counting it pushed a floating cube 20 percent too deep (at 0.5).
+pub const FLUID_IMPACT_SPEED: f32 = 1.5;
 /// Smoothing radius over spacing.
 const H_RATIO: f32 = 2.0;
 /// Constraint softening: keeps a lone particle (no neighbours) from dividing by zero.
@@ -71,6 +81,91 @@ fn spiky(d: V3, r: f32, h: f32) -> V3 {
 pub struct Neighbours {
     pub start: Vec<u32>,
     pub list: Vec<u32>,
+}
+
+/// The impulse per unit of speed the water takes from a body at a point, over a substep of `h`: `WATER_DRAG` times the displaced water's mass, capped at half of
+/// what would stop the body there (`inv_mass_at` is the inverse mass it has at that point), so a body far lighter than its water is slowed and never flipped.
+pub(super) fn drag_scale(water_mass: f32, h: f32, inv_mass_at: f32) -> f32 {
+    (water_mass * WATER_DRAG * h).min(0.5 / inv_mass_at)
+}
+
+/// What the water does to one body in a substep: lifts it by `impulse` at `at` and resists its motion in proportion to `water_mass`, the water it displaces.
+#[derive(Clone, Copy)]
+pub(super) struct Lift {
+    pub body: usize,
+    pub impulse: V3,
+    pub at: V3,
+    pub water_mass: f32,
+}
+
+impl PhysicsWorld {
+    /// The push of each fluid group's water on the dynamic bodies it surrounds, as a lift over `h` seconds and the water it displaces: Archimedes. The water is the part of
+    /// the group's footprint between its lowest particle and its surface (the mean of its top tenth, plus half a spacing), measured along gravity. A body is cut into
+    /// vertical columns; a ray up and a ray down give where each enters and leaves it (every shape is convex), and the length of that inside the water is the displaced
+    /// volume. The lift acts at the centre of that volume, so a body that is half in the water is also tipped upright. Water pushes on a body only through this: the
+    /// particles feel the body, the body does not feel particle contacts, because those cannot be read as a pressure where a gap opens under a body.
+    /// Limits: the water is the group's bounding region, so a stream, a splash or water poured onto a body from above is not seen as water (it neither lifts nor
+    /// weighs on the body); drag is against still water; the columns span the body's bounding sphere, so a thin body is sampled by few of them; floating bodies never sleep.
+    pub(super) fn buoyant_lifts(&self, p: &Particles, g: V3, candidates: &[Vec<u32>], h: f32) -> Vec<Lift> {
+        let mut lifts = Vec::new();
+        let gmag = dot(g, g).sqrt();
+        let Some(up) = normalize(scale(g, -1.0)).filter(|_| gmag > 0.0) else { return lifts };
+        let side = normalize(cross(up, if up[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] })).unwrap_or([1.0, 0.0, 0.0]);
+        let across = cross(up, side);
+        for f in &p.fluids {
+            let r = f.first as usize..(f.first + f.count) as usize;
+            let Some(k) = p.groups.iter().position(|g| g.first == f.first) else { continue };
+            let at = |i: usize| [p.x[i], p.y[i], p.z[i]];
+            let mut heights: Vec<f32> = r.clone().map(|i| dot(at(i), up)).collect();
+            heights.sort_by(|a, b| b.total_cmp(a));
+            let top = &heights[..(heights.len() / 10).max(1)];
+            let surface = top.iter().sum::<f32>() / top.len() as f32 + f.spacing * 0.5;
+            let floor = heights[heights.len() - 1] - f.spacing * 0.5;
+            let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+            for i in r.clone() {
+                for (a, axis) in [side, across].into_iter().enumerate() {
+                    let c = dot(at(i), axis);
+                    lo[a] = lo[a].min(c - f.spacing * 0.5);
+                    hi[a] = hi[a].max(c + f.spacing * 0.5);
+                }
+            }
+            for &b in &candidates[k] {
+                let b = b as usize;
+                if self.inv_mass[b] == 0.0 { continue; }
+                let c = [self.pos_x[b], self.pos_y[b], self.pos_z[b]];
+                let e = extent(self, b);
+                let (cu, cs, ca) = (dot(c, up), dot(c, side), dot(c, across));
+                if cu - e > surface || cu + e < floor || cs + e < lo[0] || cs - e > hi[0] || ca + e < lo[1] || ca - e > hi[1] { continue; }
+                let cell = 2.0 * e / BUOYANCY_GRID as f32;
+                let (mut volume, mut moment) = (0.0f32, [0.0f32; 3]);
+                for ia in 0..BUOYANCY_GRID {
+                    for ib in 0..BUOYANCY_GRID {
+                        let (da, db) = (-e + (ia as f32 + 0.5) * cell, -e + (ib as f32 + 0.5) * cell);
+                        let column = [c[0] + side[0] * da + across[0] * db, c[1] + side[1] * da + across[1] * db, c[2] + side[2] * da + across[2] * db];
+                        let (s, a) = (cs + da, ca + db);
+                        if s < lo[0] || s > hi[0] || a < lo[1] || a > hi[1] { continue; }
+                        let ones = || std::iter::once(b as u32);
+                        let below = [column[0] - up[0] * (e + 1.0e-3), column[1] - up[1] * (e + 1.0e-3), column[2] - up[2] * (e + 1.0e-3)];
+                        let above = [column[0] + up[0] * (e + 1.0e-3), column[1] + up[1] * (e + 1.0e-3), column[2] + up[2] * (e + 1.0e-3)];
+                        let (Some(enter), Some(leave)) = (self.raycast_among(ones(), below, up, 2.0 * e + 2.0e-3, NO_BODY), self.raycast_among(ones(), above, scale(up, -1.0), 2.0 * e + 2.0e-3, NO_BODY)) else { continue };
+                        let (bottom, topmost) = (dot(enter.point, up).max(floor), dot(leave.point, up).min(surface));
+                        if topmost <= bottom { continue; }
+                        let v = cell * cell * (topmost - bottom);
+                        let mid = (bottom + topmost) * 0.5;
+                        volume += v;
+                        for k in 0..3 { moment[k] += v * (column[k] - up[k] * dot(column, up) + up[k] * mid); }
+                    }
+                }
+                if volume <= 0.0 { continue; }
+                let push = FLUID_DENSITY * gmag * volume * h;
+                lifts.push(Lift { body: b, impulse: scale(up, push), at: scale(moment, 1.0 / volume), water_mass: FLUID_DENSITY * volume });
+            }
+        }
+        // Groups poured into one place overlap: a body takes the lift of the group that displaces most of it, not the sum.
+        lifts.sort_by(|a, b| a.body.cmp(&b.body).then(b.water_mass.total_cmp(&a.water_mass)));
+        lifts.dedup_by_key(|l| l.body);
+        lifts
+    }
 }
 
 impl Particles {
@@ -504,14 +599,149 @@ mod tests {
 
     #[test]
     #[cfg_attr(debug_assertions, ignore = "a particle simulation: too slow unoptimised, runs in the opt-level 3 gate")]
-    fn a_cube_floats_deeper_the_denser_it_is_and_near_its_analytic_depth_within_loose_bounds() {
+    fn a_cube_floats_deeper_the_denser_it_is_and_at_its_analytic_depth_within_twelve_percent() {
         let (light, half, heavy) = (draft(0.25), draft(0.5), draft(0.75));
         assert!(light < half && half < heavy, "{light} {half} {heavy}");
-        // Archimedes: a cube of density ratio r floats with a draft of r times its side (0.3 m). The coupling is approximate (measured errors range from -50 to +30 percent
-        // across runs of different length), so the bounds are loose and the ordering is the firm claim.
-        assert!((half - 0.15).abs() < 0.15 * 0.25, "half density draft {half}, analytic 0.15");
+        // Archimedes: a cube of density ratio r floats with a draft of r times its side (0.3 m). The columns the body is cut into cover its face to within a cell
+        // (a cell is about 9 percent of the width of an axis-aligned cube, and which way it rounds moves the draft by up to that), and the water's level is read off its top tenth, so the bound is 12 percent.
         for (got, ratio) in [(light, 0.25f32), (half, 0.5), (heavy, 0.75)] {
-            assert!((got - ratio * 0.3).abs() < ratio * 0.3 * 0.55, "ratio {ratio}: draft {got}, analytic {}", ratio * 0.3);
+            assert!((got - ratio * 0.3).abs() < ratio * 0.3 * 0.12, "ratio {ratio}: draft {got}, analytic {}", ratio * 0.3);
         }
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "a particle simulation: too slow unoptimised, runs in the opt-level 3 gate")]
+    fn a_cube_held_in_settled_water_feels_the_weight_of_the_water_it_displaces() {
+        let (d, side, big) = (0.05, 0.3f32, 1.0e-5f32);
+        let mut w = PhysicsWorld::new(8);
+        w.gy = -9.81;
+        basin(&mut w, 0.3);
+        assert!(w.particles.create_fluid(0, &column(d, [12, 14, 12], [-0.28, 0.025, -0.28])));
+        for _ in 0..300 { w.step(); }
+        let bottom = level(&w.particles, d) - 0.15;
+        w.spawn(5, &BodyDesc::box_at([0.0, bottom + side / 2.0, 0.0], [side / 2.0; 3], big, 0.0));
+        let (mut sum, mut n, mut top) = (0.0f64, 0, 0.0f32);
+        for t in 0..900 {
+            w.pos_y[5] = bottom + side / 2.0;
+            // Gravity gives the speed back in the step, so the body is at rest when the water acts and drag has nothing to oppose.
+            w.vel_y[5] = -w.gy * w.dt;
+            w.step();
+            if t >= 600 { sum += (w.vel_y[5] / big) as f64; n += 1; top += level(&w.particles, d); }
+        }
+        // Newtons the water pushed up with, over the weight of the water the cube displaces at the level it settled to (the cube raises the water).
+        let pushed = sum / n as f64 / w.dt as f64;
+        let displaced = FLUID_DENSITY as f64 * 9.81 * (side * side) as f64 * (top / n as f32 - bottom) as f64;
+        assert!((pushed / displaced - 1.0).abs() < 0.15, "pushed {pushed} N, displaced water weighs {displaced} N");
+    }
+
+    fn pond() -> (PhysicsWorld, Vec<Vec<u32>>) {
+        let mut w = PhysicsWorld::new(8);
+        w.gy = -9.81;
+        assert!(w.particles.create_fluid(0, &column(0.05, [12, 10, 12], [-0.275, 0.025, -0.275])));
+        (w, vec![vec![0, 1, 2, 3]])
+    }
+
+    fn lifts(w: &PhysicsWorld, groups: &[Vec<u32>]) -> Vec<Lift> {
+        w.buoyant_lifts(&w.particles, [w.gx, w.gy, w.gz], groups, 1.0)
+    }
+
+    /// Volume of water a lift displaces: its impulse over a one second substep is density times gravity times volume.
+    fn volume_of(l: &Lift) -> f32 {
+        l.impulse[1] / (FLUID_DENSITY * 9.81)
+    }
+
+    #[test]
+    fn a_sphere_displaces_the_water_below_the_surface_and_is_lifted_at_the_centre_of_that_water() {
+        let (mut w, groups) = pond();
+        let r = 0.1f32;
+        let ball = 4.0 / 3.0 * std::f32::consts::PI * r * r * r;
+        // The surface is 0.5 m: a half-submerged sphere displaces half its volume, centred 3r/8 below its middle.
+        w.spawn(0, &BodyDesc::sphere_at([0.0, 0.5, 0.0], r, 1.0, 0.0));
+        let l = lifts(&w, &groups);
+        assert_eq!(l.len(), 1);
+        assert!((volume_of(&l[0]) / (ball / 2.0) - 1.0).abs() < 0.06, "{} of {}", volume_of(&l[0]), ball / 2.0);
+        assert!((l[0].at[1] - (0.5 - 3.0 * r / 8.0)).abs() < 0.01, "{:?}", l[0].at);
+        assert!((l[0].water_mass - FLUID_DENSITY * volume_of(&l[0])).abs() < 1.0e-3 * l[0].water_mass);
+        let mut w = pond().0;
+        w.spawn(0, &BodyDesc::sphere_at([0.0, 0.25, 0.0], r, 1.0, 0.0));
+        let l = lifts(&w, &groups);
+        assert!((volume_of(&l[0]) / ball - 1.0).abs() < 0.06);
+        assert!((l[0].at[1] - 0.25).abs() < 0.005);
+        assert!(l[0].impulse[0].abs() < 1.0e-6 && l[0].impulse[2].abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn a_body_off_centre_is_lifted_off_centre_so_it_tips() {
+        let (mut w, groups) = pond();
+        w.spawn(0, &BodyDesc::sphere_at([0.15, 0.5, -0.1], 0.1, 1.0, 0.0));
+        let l = lifts(&w, &groups);
+        assert!((l[0].at[0] - 0.15).abs() < 0.01 && (l[0].at[2] + 0.1).abs() < 0.01, "{:?}", l[0].at);
+    }
+
+    #[test]
+    fn a_body_out_of_the_water_gets_no_lift() {
+        let (mut w, groups) = pond();
+        w.spawn(0, &BodyDesc::sphere_at([0.0, 0.9, 0.0], 0.1, 1.0, 0.0));
+        w.spawn(1, &BodyDesc::sphere_at([1.5, 0.25, 0.0], 0.1, 1.0, 0.0));
+        w.spawn(2, &BodyDesc::sphere_at([0.0, -0.5, 0.0], 0.1, 1.0, 0.0));
+        w.spawn(3, &BodyDesc::sphere_at([0.0, 0.25, 0.0], 0.1, 0.0, 0.0));
+        assert!(lifts(&w, &groups).is_empty(), "above, beside, below and a static body in the water are all unlifted");
+        w.spawn(4, &BodyDesc::sphere_at([0.0, 0.25, 0.0], 0.1, 1.0, 0.0));
+        let groups = vec![vec![4]];
+        assert_eq!(lifts(&w, &groups).len(), 1);
+        w.gy = 0.0;
+        assert!(lifts(&w, &groups).is_empty(), "no gravity, no up");
+    }
+
+    #[test]
+    fn a_turned_box_displaces_about_the_water_a_straight_one_does() {
+        let straight = {
+            let (mut w, groups) = pond();
+            w.spawn(0, &BodyDesc::box_at([0.0, 0.45, 0.0], [0.1; 3], 1.0, 0.0));
+            volume_of(&lifts(&w, &groups)[0])
+        };
+        assert!((straight / (0.2 * 0.2 * 0.15) - 1.0).abs() < 0.1, "{straight}");
+        let (mut w, groups) = pond();
+        w.spawn(0, &BodyDesc::box_at([0.0, 0.45, 0.0], [0.1; 3], 1.0, 0.0));
+        let half = std::f32::consts::FRAC_PI_4 / 2.0;
+        (w.qx[0], w.qy[0], w.qz[0], w.qw[0]) = (0.0, half.sin(), 0.0, half.cos());
+        let turned = volume_of(&lifts(&w, &groups)[0]);
+        assert!((turned / straight - 1.0).abs() < 0.1, "{turned} against {straight}");
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "a particle simulation: too slow unoptimised, runs in the opt-level 3 gate")]
+    fn water_takes_the_speed_out_of_a_body_moving_through_it() {
+        let mut w = PhysicsWorld::new(8);
+        w.gy = -9.81;
+        basin(&mut w, 0.3);
+        assert!(w.particles.create_fluid(0, &column(0.05, [12, 10, 12], [-0.28, 0.025, -0.28])));
+        for _ in 0..200 { w.step(); }
+        let ball = 4.0 / 3.0 * std::f32::consts::PI * 0.1f32.powi(3);
+        // As dense as the water, so the lift cancels its weight and only the drag is left.
+        w.spawn(5, &BodyDesc::sphere_at([0.0, 0.2, 0.0], 0.1, 1.0 / (FLUID_DENSITY * ball), 0.0));
+        w.vel_y[5] = 0.5;
+        for _ in 0..30 { w.step(); }
+        assert!(w.vel_y[5].abs() < 0.25, "still moving at {} m/s half a second on", w.vel_y[5]);
+    }
+
+    #[test]
+    fn two_groups_poured_into_one_place_lift_a_body_once() {
+        let (mut w, _) = pond();
+        assert!(w.particles.create_fluid(1, &column(0.05, [12, 10, 12], [-0.275, 0.025, -0.275])));
+        w.spawn(0, &BodyDesc::sphere_at([0.0, 0.5, 0.0], 0.1, 1.0, 0.0));
+        let l = lifts(&w, &[vec![0], vec![0]]);
+        assert_eq!(l.len(), 1, "one lift for one body");
+        let ball = 4.0 / 3.0 * std::f32::consts::PI * 0.1f32.powi(3);
+        assert!((volume_of(&l[0]) / (ball / 2.0) - 1.0).abs() < 0.06);
+    }
+
+    #[test]
+    fn drag_never_takes_more_than_half_the_speed_of_a_body_in_a_substep() {
+        let ball = FLUID_DENSITY * 4.19e-3;
+        // A 10 gram ball displacing 4 kg of water: uncapped the drag would flip its speed.
+        assert!(drag_scale(ball, 1.0 / 240.0, 100.0) * 100.0 <= 0.5 + 1.0e-6);
+        // A body as heavy as its water gets the plain rate.
+        assert_eq!(drag_scale(ball, 1.0 / 240.0, 1.0 / ball), ball * WATER_DRAG / 240.0);
     }
 }

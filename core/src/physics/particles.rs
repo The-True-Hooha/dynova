@@ -6,8 +6,9 @@
 //! Limits: no collision between particles, so a folded cloth passes through itself; a particle is a sphere, so a body smaller than the gap between
 //! particles (spacing minus two radii) can pass between them; collision is tested once per substep, so a body thinner than a substep's travel can be crossed.
 
+use super::fluid::{drag_scale, FLUID_IMPACT_SPEED};
 use super::*;
-use crate::collision::{cross, rotate, V3};
+use crate::collision::{cross, dot, rotate, V3};
 
 pub const MAX_PARTICLES: usize = 1 << 14;
 pub const MAX_PARTICLE_GROUPS: usize = 1 << 12;
@@ -30,7 +31,7 @@ const CONTACT_FRICTION: f32 = 0.4;
 pub const MAX_PARTICLE_SPEED: f32 = 100.0;
 /// Share of an attachment's gap closed per tick by the pull on the body. Below one because the body only moves once a tick: a full correction yanks a body that was attached away from its particle.
 const ATTACH_GAIN: f32 = 0.25;
-/// Most speed a fluid or sand particle's push out of a body is charged as. A resting particle is pushed out at about `g * h` a substep, far below this; the bound
+/// Most speed a sand grain's push out of a body is charged as. A resting particle is pushed out at about `g * h` a substep, far below this; the bound
 /// only stops a body that lands in the fluid from being thrown by the pile-up of corrections.
 const MAX_PRESSURE_SPEED: f32 = 0.5;
 /// A particle pushes a body as if it weighed at most this many kilograms, so a nearly massless-inverse particle cannot throw a body.
@@ -374,16 +375,17 @@ impl PhysicsWorld {
         }).collect();
         let mut sharers = vec![0u32; self.capacity];
         for k in &held { sharers[k.3 as usize] += 1; }
-        // How many fluid or sand particles pushed on each body in the substep before: they share the body's mass, so the sum of their corrections cannot overshoot.
+        // How many fluid particles or sand grains pushed on each body in the substep before: they share the body's mass, so the sum of their corrections cannot overshoot.
         let mut contacts = vec![0u32; self.capacity];
         let mut next_contacts = vec![0u32; self.capacity];
         let mut granular = vec![false; p.len()];
-        for g in &p.fluids { granular[g.first as usize..(g.first + g.count) as usize].fill(true); }
+        let mut fluid = vec![false; p.len()];
+        for g in &p.fluids { fluid[g.first as usize..(g.first + g.count) as usize].fill(true); }
         for g in &p.sand { granular[g.first as usize..(g.first + g.count) as usize].fill(true); }
+        let g = [self.gx, self.gy, self.gz];
         let mut attached = vec![false; p.len()];
         for k in &held { attached[k.0] = true; }
         let h = self.dt / PARTICLE_SUBSTEPS as f32;
-        let g = [self.gx, self.gy, self.gz];
         let n = p.len();
         let mut prev = vec![[0.0f32; 3]; n];
         let mut hits = Vec::new();
@@ -396,6 +398,8 @@ impl PhysicsWorld {
             let hi = [r.clone().map(|i| p.x[i]).fold(f32::MIN, f32::max) + reach, r.clone().map(|i| p.y[i]).fold(f32::MIN, f32::max) + reach, r.map(|i| p.z[i]).fold(f32::MIN, f32::max) + reach];
             self.bodies_where(|c, e| (0..3).all(|k| c[k] + e >= lo[k] && c[k] - e <= hi[k]))
         }).collect();
+        // The water lifts a body as much as the water it displaces weighs: a push each substep from the poses the rigid step left, which hold through the tick.
+        let lift = self.buoyant_lifts(&p, g, &candidates, h);
         let mut group_of = vec![0usize; n];
         for (k, g) in p.groups.iter().enumerate() { group_of[g.first as usize..(g.first + g.count) as usize].fill(k); }
         let mut out = vec![[0.0f32; 3]; n];
@@ -456,7 +460,7 @@ impl PhysicsWorld {
                     reacted |= first;
                     let push = hit.depth.min(p.radius[i]);
                     let m = self.reduced_mass(p.inv_mass[i], hit.body as usize, contacts[hit.body as usize].max(1));
-                    if first && granular[i] { next_contacts[hit.body as usize] += 1; }
+                    if first && (granular[i] || fluid[i]) { next_contacts[hit.body as usize] += 1; }
                     // The body's velocity where it is touched, and how fast the particle was closing on it: that is the momentum the body gives up.
                     let b = hit.body as usize;
                     let r = [hit.point[0] - self.pos_x[b], hit.point[1] - self.pos_y[b], hit.point[2] - self.pos_z[b]];
@@ -464,11 +468,12 @@ impl PhysicsWorld {
                     let vb = [self.vel_x[b] + spin[0], self.vel_y[b] + spin[1], self.vel_z[b] + spin[2]];
                     if first { out[i] = hit.normal; out_vel[i] = vb; }
                     let closing = -((p.vx[i] - vb[0]) * hit.normal[0] + (p.vy[i] - vb[1]) * hit.normal[1] + (p.vz[i] - vb[2]) * hit.normal[2]);
-                    // A fluid or sand particle resting against a body is pushed out of it every substep, and that push is the pressure the body feels: it is
-                    // charged as the momentum the push gives the particle. A rope or cloth particle only gives up what it closed with.
+                    // A sand grain resting against a body is pushed out of it every substep, and that push is the pressure the body feels: it is charged as the
+                    // momentum the push gives the grain. A rope or cloth particle only gives up what it closed with. Water pushes a body through `buoyant_lifts`, and through the momentum of a particle that lands on it faster than `FLUID_IMPACT_SPEED`.
                     let pressure = if granular[i] { (push / h).min(MAX_PRESSURE_SPEED) } else { 0.0 };
                     let speed = closing.max(pressure).clamp(0.0, MAX_PARTICLE_SPEED);
-                    if first { reactions.push((b, [-hit.normal[0] * speed * m, -hit.normal[1] * speed * m, -hit.normal[2] * speed * m], hit.point)); }
+                    let j = if fluid[i] { (closing - FLUID_IMPACT_SPEED).clamp(0.0, MAX_PARTICLE_SPEED) * m } else { speed * m };
+                    if first { reactions.push((b, [-hit.normal[0] * j, -hit.normal[1] * j, -hit.normal[2] * j], hit.point)); }
                     p.x[i] += hit.normal[0] * push;
                     p.y[i] += hit.normal[1] * push;
                     p.z[i] += hit.normal[2] * push;
@@ -479,6 +484,13 @@ impl PhysicsWorld {
                     p.y[i] -= (m[1] - along * hit.normal[1]) * CONTACT_FRICTION;
                     p.z[i] -= (m[2] - along * hit.normal[2]) * CONTACT_FRICTION;
                 }
+            }
+            for l in &lift {
+                let r = [l.at[0] - self.pos_x[l.body], l.at[1] - self.pos_y[l.body], l.at[2] - self.pos_z[l.body]];
+                let spin = cross([self.ang_x[l.body], self.ang_y[l.body], self.ang_z[l.body]], r);
+                let drag = drag_scale(l.water_mass, h, self.inv_mass[l.body] + dot(r, r) * self.inv_inertia[l.body]);
+                let v = [self.vel_x[l.body] + spin[0], self.vel_y[l.body] + spin[1], self.vel_z[l.body] + spin[2]];
+                reactions.push((l.body, [l.impulse[0] - v[0] * drag, l.impulse[1] - v[1] * drag, l.impulse[2] - v[2] * drag], l.at));
             }
             for i in 0..n {
                 if p.inv_mass[i] == 0.0 { continue; }
