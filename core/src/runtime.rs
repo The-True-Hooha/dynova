@@ -4,6 +4,7 @@ use crate::hull::{HullData, MAX_HULL_VERTS};
 use crate::inspector::Inspector;
 use crate::command_ring::KinSample;
 use crate::joint_state::JointStates;
+use crate::particle_state::ParticleStates;
 use crate::query_results::{self as qr, QueryResults};
 use crate::physics::{BodyDesc, Fnv, JointDesc, PhysicsSnapshot, PhysicsWorld, SHAPE_HULL};
 use crate::recorder::{Recorder, MAX_KEYFRAME_BYTES};
@@ -58,8 +59,11 @@ const H_QUERY_HEAD: usize = 37;
 const H_JSTATE_SEQ: usize = 38;
 const H_JSTATE_ROWS: usize = 39;
 const H_JSTATE_N: usize = 40;
+const H_PSTATE_SEQ: usize = 41;
+const H_PSTATE_ROWS: usize = 42;
+const H_PSTATE_N: usize = 43;
 const H_LIVE: usize = 32;
-pub const HEADER_WORDS: usize = 41;
+pub const HEADER_WORDS: usize = 44;
 
 /// Bytes a Grow of a world to `capacity` slots may need per slot of the new capacity: three new transform buffers, the two older
 /// generations still kept, and the physics and inspector columns while a resize copies (see the `MAX_CAPACITY` budget test), rounded up.
@@ -96,6 +100,7 @@ pub struct Runtime {
     inspector: Option<Inspector>,
     query_results: Option<QueryResults>,
     joint_states: Option<JointStates>,
+    particle_states: Option<ParticleStates>,
     inspecting: bool,
     recorder: Option<Recorder>,
     /// Tick the world is at, ahead of the published `ticks` word while a step is still running (a seek moves it mid-step).
@@ -133,6 +138,7 @@ impl Runtime {
             inspector: None,
             query_results: None,
             joint_states: None,
+            particle_states: None,
             inspecting: false,
             recorder: None,
             head: 0,
@@ -312,6 +318,7 @@ impl Runtime {
         }
 
         self.publish_joint_states();
+        self.publish_particle_states();
         self.header[H_PAUSED].store(self.paused as u32, Ordering::Release);
         self.record_tick(new_tick, mode);
 
@@ -573,7 +580,7 @@ impl Runtime {
             }
             Command::ParticleSoft { id, desc } => {
                 let count = (desc.n[0] * desc.n[1] * desc.n[2]) as usize;
-                let ok = self.physics_enabled && (self.can_reserve)(count * crate::physics::PARTICLE_BYTES) && self.physics.particles.create_soft(id, &desc);
+                let ok = self.physics_enabled && self.particle_room(count) && self.physics.particles.create_soft(id, &desc);
                 if !ok {
                     self.ring.note_malformed();
                 }
@@ -587,7 +594,7 @@ impl Runtime {
                 return found;
             }
             Command::ParticleCloth { id, desc } => {
-                let ok = self.physics_enabled && (self.can_reserve)((desc.nu * desc.nv) as usize * crate::physics::PARTICLE_BYTES) && self.physics.particles.create_cloth(id, &desc);
+                let ok = self.physics_enabled && self.particle_room((desc.nu * desc.nv) as usize) && self.physics.particles.create_cloth(id, &desc);
                 if !ok {
                     self.ring.note_malformed();
                 }
@@ -595,7 +602,7 @@ impl Runtime {
             }
             Command::ParticleChain { id, desc } => {
                 // The probe is the one Grow and Checkpoint ask.
-                let ok = self.physics_enabled && (self.can_reserve)(desc.count as usize * crate::physics::PARTICLE_BYTES) && self.physics.particles.create_chain(id, &desc);
+                let ok = self.physics_enabled && self.particle_room(desc.count as usize) && self.physics.particles.create_chain(id, &desc);
                 if !ok {
                     self.ring.note_malformed();
                 }
@@ -674,6 +681,27 @@ impl Runtime {
     #[cfg(test)]
     pub fn query_row(&self, n: u32) -> [u32; qr::ROW_WORDS] {
         self.query_results.as_ref().expect("a query was answered").row(n)
+    }
+
+    /// Positions and radii of every particle, after every step and every seek. The buffer is allocated when the first particle exists and the count follows the
+    /// world, so a seek to before the first rope reads zero rows.
+    /// Memory for `count` more particles, and for the row buffer the host reads them from (256 KiB, made once) if it does not exist yet.
+    fn particle_room(&self, count: usize) -> bool {
+        let rows = if self.particle_states.is_none() { crate::physics::MAX_PARTICLES * 16 } else { 0 };
+        (self.can_reserve)(count * crate::physics::PARTICLE_BYTES + rows)
+    }
+
+    fn publish_particle_states(&mut self) {
+        if !self.physics_enabled { return; }
+        if self.particle_states.is_none() {
+            if self.physics.particles.is_empty() { return; }
+            let states = ParticleStates::new();
+            self.header[H_PSTATE_ROWS].store(states.rows_ptr() as u32, Ordering::Release);
+            self.particle_states = Some(states);
+        }
+        if let Some(states) = &self.particle_states {
+            states.write(&self.header[H_PSTATE_SEQ], &self.header[H_PSTATE_N], &self.physics.particles);
+        }
     }
 
     fn publish_joint_states(&mut self) {
@@ -2375,6 +2403,51 @@ mod tests {
     }
 
     #[test]
+    fn particle_rows_are_published_every_step_and_after_a_seek_inside_the_sequence_word() {
+        let mut rt = Runtime::new(16, 256);
+        rt.enable_physics();
+        assert_eq!((header(&rt, H_PSTATE_ROWS), header(&rt, H_PSTATE_N)), (0, 0), "nothing before a particle exists");
+        rt.ring.push(&Command::Record { on: true });
+        rt.step();
+        for t in 0..20 { if t == 10 { rt.ring.push(&chain(1, [0.0, 3.0, 0.0])); } rt.step(); }
+        assert_ne!(header(&rt, H_PSTATE_ROWS), 0);
+        assert_eq!((header(&rt, H_PSTATE_N), header(&rt, H_PSTATE_SEQ) % 2), (9, 0));
+        let seq = header(&rt, H_PSTATE_SEQ);
+        let row = rt.particle_states.as_ref().unwrap().row(8);
+        let p = &rt.physics.particles;
+        assert_eq!(row, [p.x[8].to_bits(), p.y[8].to_bits(), p.z[8].to_bits(), p.radius[8].to_bits()]);
+        rt.step();
+        assert_eq!(header(&rt, H_PSTATE_SEQ), seq + 2, "one bracket per step");
+        seek_to(&mut rt, 5);
+        assert_eq!(header(&rt, H_PSTATE_N), 0, "before the rope, no rows");
+        seek_to(&mut rt, 21);
+        assert_eq!(header(&rt, H_PSTATE_N), 9);
+    }
+
+    #[test]
+    fn a_world_without_particles_allocates_no_particle_rows() {
+        let mut rt = Runtime::new(16, 256);
+        rt.enable_physics();
+        for _ in 0..5 { rt.step(); }
+        assert!(rt.particle_states.is_none());
+    }
+
+    #[test]
+    fn a_particle_command_is_refused_when_the_allocator_has_no_room_for_it_and_its_rows() {
+        let mut rt = Runtime::new(16, 64);
+        rt.enable_physics();
+        rt.set_memory_probe(|bytes| bytes < crate::physics::MAX_PARTICLES * 16);
+        rt.ring.push(&chain(1, [0.0, 3.0, 0.0]));
+        rt.step();
+        assert!(rt.physics.particles.is_empty() && rt.particle_states.is_none());
+        assert_eq!(rt.malformed_dropped(), 1, "refused, not trapped");
+        rt.set_memory_probe(|_| true);
+        rt.ring.push(&chain(1, [0.0, 3.0, 0.0]));
+        rt.step();
+        assert_eq!(rt.physics.particles.len(), 9);
+    }
+
+    #[test]
     fn keyframes_are_taken_every_interval_and_the_hash_word_follows_every_step() {
         let (rt, takes) = recorded_run();
         assert_eq!(header(&rt, H_KEYFRAMES), 1 + RUN / 60, "ticks 1, 60, 120, 180, 240");
@@ -2678,10 +2751,10 @@ mod tests {
             [H_EPOCH, H_CAPACITY, H_BUF0, H_STATE, H_GENERATIONS, H_TICKS, H_STALE, H_MALFORMED, H_BUCKETS, H_BUCKET_LEN, H_RING_PENDING,
              H_DROPPED_CONTACTS, H_OVERRUNS, H_CONTACTS, H_INSPECT_SEQ, H_INSPECT_BODIES, H_INSPECT_CONTACTS, H_INSPECT_CONTACT_N,
              H_STEP_LAST_US, H_STEP_TOTAL_US, H_INSPECT_TICK, H_INSPECT_ON, H_REC_ON, H_REC_START, H_REC_END, H_HASH_LO, H_HASH_HI, H_KEYFRAMES,
-             H_PAUSED, H_SEEKS, H_LIVE, H_REC_SEQ, H_INSPECT_JOINTS, H_INSPECT_JOINT_N, H_QUERY_ROWS, H_QUERY_HEAD, H_JSTATE_SEQ, H_JSTATE_ROWS, H_JSTATE_N],
-            [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40],
+             H_PAUSED, H_SEEKS, H_LIVE, H_REC_SEQ, H_INSPECT_JOINTS, H_INSPECT_JOINT_N, H_QUERY_ROWS, H_QUERY_HEAD, H_JSTATE_SEQ, H_JSTATE_ROWS, H_JSTATE_N, H_PSTATE_SEQ, H_PSTATE_ROWS, H_PSTATE_N],
+            [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43],
         );
-        assert_eq!(HEADER_WORDS, 41);
+        assert_eq!(HEADER_WORDS, 44);
     }
 
     #[test]

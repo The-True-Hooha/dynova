@@ -20,6 +20,17 @@ export const TAG_RAYCAST = 16;
 export const TAG_OVERLAP_SPHERE = 17;
 export const TAG_CHECKPOINT = 18;
 export const TAG_RESET = 19;
+export const TAG_PARTICLE_CHAIN = 20;
+export const TAG_PARTICLE_CLOTH = 21;
+export const TAG_PARTICLE_ATTACH = 22;
+export const TAG_PARTICLE_DETACH = 23;
+export const TAG_PARTICLE_SOFT = 24;
+export const MAX_PARTICLES = 1 << 14;
+export const MAX_PARTICLE_LINKS = 32768;
+export const MAX_CHAIN = 1024;
+export const MAX_CLOTH_SIDE = 64;
+export const MAX_SOFT_SIDE = 12;
+export const MAX_GROUP_ID = 1 << 24;
 export const NO_ENTITY = 0xffffffff;
 export const MAX_QUERY_RANGE = 1e6;
 export const KIN_SAMPLES_PER_SLOT = 3;
@@ -91,6 +102,13 @@ export interface OverlapSphereDesc {
     radius: number;
     ignore: number;
 }
+
+export type V3 = readonly [number, number, number];
+
+export interface ChainDesc { id: number; from: V3; to: V3; count: number; pinFirst: boolean; pinLast: boolean; radius: number; invMass: number; stiffness: number }
+export interface ClothDesc { id: number; origin: V3; u: V3; v: V3; nu: number; nv: number; pins: number; radius: number; invMass: number; stiffness: number; bendStiffness: number }
+export interface SoftDesc { id: number; origin: V3; size: V3; n: readonly [number, number, number]; radius: number; invMass: number; stiffness: number }
+export interface AttachDesc { particle: number; body: number; gen: number; local: V3 }
 
 export interface JointCreateDesc {
     id: number;
@@ -335,6 +353,84 @@ export class CommandRing {
         d.center.forEach((v, k) => this.view.setFloat32(off + 6 + k * 4, v, true));
         this.view.setFloat32(off + 18, d.radius, true);
         this.view.setUint32(off + 34, d.ignore, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    private particleSlot(tag: number): number | null {
+        if (this.isFull()) return null;
+        const off = this.slotOffset(Atomics.load(this.tail, 0));
+        for (let i = 0; i < SLOT_BYTES; i++) this.view.setUint8(off + i, 0);
+        this.view.setUint8(off, tag);
+        return off;
+    }
+
+    private put3(off: number, v: V3): void {
+        v.forEach((x, k) => this.view.setFloat32(off + k * 4, x, true));
+    }
+
+    particleChain(d: ChainDesc): boolean {
+        const off = this.particleSlot(TAG_PARTICLE_CHAIN);
+        if (off === null) return false;
+        this.view.setUint32(off + 1, d.id, true);
+        this.put3(off + 6, d.from);
+        this.put3(off + 18, d.to);
+        this.view.setUint16(off + 30, Math.min(d.count, 0xffff), true);
+        this.view.setUint8(off + 32, (d.pinFirst ? 1 : 0) | (d.pinLast ? 2 : 0));
+        this.view.setFloat32(off + 36, d.radius, true);
+        this.view.setFloat32(off + 40, d.invMass, true);
+        this.view.setFloat32(off + 44, d.stiffness, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    particleCloth(d: ClothDesc): boolean {
+        const off = this.particleSlot(TAG_PARTICLE_CLOTH);
+        if (off === null) return false;
+        this.view.setUint32(off + 1, d.id, true);
+        this.put3(off + 6, d.origin);
+        this.put3(off + 18, d.u);
+        this.put3(off + 30, d.v);
+        this.view.setUint16(off + 42, Math.min(d.nu, 0xffff), true);
+        this.view.setUint16(off + 44, Math.min(d.nv, 0xffff), true);
+        this.view.setUint8(off + 46, d.pins);
+        this.view.setFloat32(off + 48, d.radius, true);
+        this.view.setFloat32(off + 52, d.invMass, true);
+        this.view.setFloat32(off + 56, d.stiffness, true);
+        this.view.setFloat32(off + 60, d.bendStiffness, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    particleSoft(d: SoftDesc): boolean {
+        const off = this.particleSlot(TAG_PARTICLE_SOFT);
+        if (off === null) return false;
+        this.view.setUint32(off + 1, d.id, true);
+        this.put3(off + 6, d.origin);
+        this.put3(off + 18, d.size);
+        d.n.forEach((n, k) => this.view.setUint8(off + 30 + k, Math.min(n, 255)));
+        this.view.setFloat32(off + 36, d.radius, true);
+        this.view.setFloat32(off + 40, d.invMass, true);
+        this.view.setFloat32(off + 44, d.stiffness, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    particleAttach(d: AttachDesc): boolean {
+        const off = this.particleSlot(TAG_PARTICLE_ATTACH);
+        if (off === null) return false;
+        this.view.setUint32(off + 1, d.particle, true);
+        this.view.setUint8(off + 5, d.gen);
+        this.put3(off + 6, d.local);
+        this.view.setUint32(off + 18, d.body, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    particleDetach(particle: number): boolean {
+        const off = this.particleSlot(TAG_PARTICLE_DETACH);
+        if (off === null) return false;
+        this.view.setUint32(off + 1, particle, true);
         Atomics.add(this.tail, 0, 1);
         return true;
     }

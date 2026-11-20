@@ -1,7 +1,7 @@
 import { HEADER_WORDS, QUERY_ROW_WORDS, TransformView } from './TransformView.js';
 import { positionControl, type PositionGains } from './control.js';
 import type { RecordingState } from './TransformView.js';
-import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, JOINT_DISTANCE, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc, KIN_SAMPLES_PER_SLOT, MAX_KIN_TICKS, KinematicSample, RaycastDesc, OverlapSphereDesc, NO_ENTITY, MAX_QUERY_RANGE } from './CommandRing.js';
+import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, JOINT_DISTANCE, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc, KIN_SAMPLES_PER_SLOT, MAX_KIN_TICKS, KinematicSample, RaycastDesc, OverlapSphereDesc, NO_ENTITY, MAX_QUERY_RANGE, MAX_PARTICLES, MAX_CHAIN, MAX_CLOTH_SIDE, MAX_SOFT_SIDE, MAX_GROUP_ID, ChainDesc, ClothDesc, SoftDesc, AttachDesc } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import type { MemoryMode } from './memory.js';
 
@@ -117,6 +117,13 @@ export interface JointOptions {
     motor?: { velocity: number; maxForce: number };
 }
 
+/** A group of particles a command made: its id, the index of its first particle in `readParticles()` and how many it has. */
+export interface ParticleGroup {
+    readonly id: number;
+    readonly first: number;
+    readonly count: number;
+}
+
 export interface JointHandle {
     readonly id: number;
 }
@@ -149,11 +156,17 @@ type Queued =
     | { k: 'kinematic'; samples: KinematicSample[] }
     | { k: 'raycast'; d: RaycastDesc }
     | { k: 'overlap'; d: OverlapSphereDesc }
+    | { k: 'chain'; d: ChainDesc }
+    | { k: 'cloth'; d: ClothDesc }
+    | { k: 'soft'; d: SoftDesc }
+    | { k: 'attach'; d: AttachDesc }
+    | { k: 'detach'; particle: number }
     | { k: 'hullVerts'; hull: number; coords: number[] }
     | { k: 'hullCommit'; hull: number; count: number };
 
 const DEFAULT_MAX_DEFERRED = 1 << 16;
 const MAX_TELEPORT_COORD = 1e6;
+const MAX_PARTICLE_GROUPS = 4096;
 
 export class World {
     readonly memory: WebAssembly.Memory;
@@ -182,6 +195,10 @@ export class World {
     private nextHull = 0;
     /** Joint ids only grow: a seek can drop joints the SDK believes are live, and a reused id could then hit a different joint. */
     private nextJoint = 0;
+    /** Group ids only grow, like joint ids, so a seek that drops a group cannot hand its id to another. */
+    private nextGroup = 0;
+    /** Particles the commands sent so far would make if every one is accepted: the index the next group starts at. */
+    private nextParticle = 0;
     private knownSeeks = 0;
 
     private constructor(
@@ -321,6 +338,11 @@ export class World {
             case 'kinematic': return this.ring.kinematicBatch(c.samples);
             case 'raycast': return this.ring.raycast(c.d);
             case 'overlap': return this.ring.overlapSphere(c.d);
+            case 'chain': return this.ring.particleChain(c.d);
+            case 'cloth': return this.ring.particleCloth(c.d);
+            case 'soft': return this.ring.particleSoft(c.d);
+            case 'attach': return this.ring.particleAttach(c.d);
+            case 'detach': return this.ring.particleDetach(c.particle);
             case 'hullVerts': return this.ring.hullVerts(c.hull, c.coords);
             case 'hullCommit': return this.ring.hullCommit(c.hull, c.count);
         }
@@ -532,6 +554,88 @@ export class World {
             else throw new Error(`unknown query result kind ${kind}`);
         }
         return { results, lost };
+    }
+
+    /**
+     * Make a rope of `count` particles from `from` to `to`, joined by distance links. Returns the group id, the index of its first particle in `readParticles()` and its size.
+     * `first` assumes every earlier particle command was accepted and no seek went back before one; a refused command (counted in `malformedDropped`) shifts later groups.
+     */
+    createChain(o: { from: readonly [number, number, number]; to: readonly [number, number, number]; count: number; pinFirst?: boolean; pinLast?: boolean; radius?: number; invMass?: number; stiffness?: number }): ParticleGroup {
+        this.assertAlive();
+        const d = { from: o.from, to: o.to, count: o.count, pinFirst: o.pinFirst ?? false, pinLast: o.pinLast ?? false, radius: o.radius ?? 0.02, invMass: o.invMass ?? 1, stiffness: o.stiffness ?? 1 };
+        if (!Number.isInteger(d.count) || d.count < 2 || d.count > MAX_CHAIN) throw new RangeError(`a chain has 2..${MAX_CHAIN} particles, got ${d.count}`);
+        this.assertParticleBody(d.from, d.to, d.radius, d.invMass, d.stiffness);
+        const span = Math.hypot(Math.fround(d.to[0]) - Math.fround(d.from[0]), Math.fround(d.to[1]) - Math.fround(d.from[1]), Math.fround(d.to[2]) - Math.fround(d.from[2]));
+        if (!(span > 1e-4)) throw new RangeError('the two ends of a chain must be apart');
+        return this.queueGroup(d.count, (id) => ({ k: 'chain', d: { id, ...d } }));
+    }
+
+    /** A `nu` by `nv` sheet (2..64 a side) spanned by edge vectors `u` and `v`. `pins`: bits 0-3 pin the corners, bit 4 the whole first row. */
+    createCloth(o: { origin: readonly [number, number, number]; u: readonly [number, number, number]; v: readonly [number, number, number]; nu: number; nv: number; pins?: number; radius?: number; invMass?: number; stiffness?: number; bendStiffness?: number }): ParticleGroup {
+        this.assertAlive();
+        const d = { origin: o.origin, u: o.u, v: o.v, nu: o.nu, nv: o.nv, pins: o.pins ?? 0, radius: o.radius ?? 0.05, invMass: o.invMass ?? 1, stiffness: o.stiffness ?? 1, bendStiffness: o.bendStiffness ?? 0.3 };
+        for (const n of [d.nu, d.nv]) if (!Number.isInteger(n) || n < 2 || n > MAX_CLOTH_SIDE) throw new RangeError(`a cloth is 2..${MAX_CLOTH_SIDE} particles a side, got ${n}`);
+        if (!Number.isInteger(d.pins) || d.pins < 0 || d.pins > 31) throw new RangeError('cloth pins is a 5 bit mask');
+        if (!Number.isFinite(d.bendStiffness) || d.bendStiffness < 0 || d.bendStiffness > 1) throw new RangeError('bendStiffness must be within 0..1');
+        const [u, v] = [d.u.map(Math.fround), d.v.map(Math.fround)];
+        const area = Math.hypot(Math.fround(u[1] * v[2] - u[2] * v[1]), Math.fround(u[2] * v[0] - u[0] * v[2]), Math.fround(u[0] * v[1] - u[1] * v[0]));
+        if (!(area > 1e-4)) throw new RangeError('the edge vectors u and v of a cloth must span an area');
+        this.assertParticleBody(d.origin, d.u, d.radius, d.invMass, d.stiffness);
+        this.assertParticleBody(d.v, d.v, d.radius, d.invMass, d.stiffness);
+        return this.queueGroup(d.nu * d.nv, (id) => ({ k: 'cloth', d: { id, ...d } }));
+    }
+
+    /** An axis-aligned lattice of `n` particles (2..12 each) filling the box from `origin` to `origin + size`. */
+    createSoftBlock(o: { origin: readonly [number, number, number]; size: readonly [number, number, number]; n: readonly [number, number, number]; radius?: number; invMass?: number; stiffness?: number }): ParticleGroup {
+        this.assertAlive();
+        const d = { origin: o.origin, size: o.size, n: o.n, radius: o.radius ?? 0.05, invMass: o.invMass ?? 1, stiffness: o.stiffness ?? 1 };
+        if (d.n.length !== 3) throw new RangeError('n is three counts, one per axis');
+        for (const n of d.n) if (!Number.isInteger(n) || n < 2 || n > MAX_SOFT_SIDE) throw new RangeError(`a soft block is 2..${MAX_SOFT_SIDE} particles along each axis, got ${n}`);
+        if (d.size.length !== 3 || !d.size.every((s) => Number.isFinite(s) && Math.fround(s) > Math.fround(1e-3))) throw new RangeError('a soft block needs a size above 1 mm on every axis');
+        this.assertParticleBody(d.origin, d.size, d.radius, d.invMass, d.stiffness);
+        return this.queueGroup(d.n[0] * d.n[1] * d.n[2], (id) => ({ k: 'soft', d: { id, ...d } }));
+    }
+
+    /** Hold particle `particle` (an index into `readParticles()`) on `body` at `local` in the body's frame. A particle has one attachment. */
+    attachParticle(particle: number, body: EntityHandle, local: readonly [number, number, number]): void {
+        this.assertAlive();
+        if (!Number.isInteger(particle) || particle < 0 || particle >= MAX_PARTICLES) throw new RangeError(`particle must be an index below ${MAX_PARTICLES}, got ${particle}`);
+        if (!local.every((v) => Number.isFinite(v) && Math.abs(v) <= MAX_TELEPORT_COORD)) throw new RangeError('the attachment offset must be finite and within range');
+        if (!this.enqueue({ k: 'attach', d: { particle, body: body.id, gen: body.gen, local } })) throw new Error('CommandRing full');
+    }
+
+    detachParticle(particle: number): void {
+        this.assertAlive();
+        if (!Number.isInteger(particle) || particle < 0 || particle >= MAX_PARTICLES) throw new RangeError(`particle must be an index below ${MAX_PARTICLES}, got ${particle}`);
+        if (!this.enqueue({ k: 'detach', particle })) throw new Error('CommandRing full');
+    }
+
+    /** `[x, y, z, radius]` per particle as of the last published tick, in one read; the particle index is the row number. */
+    readParticles(): Float32Array {
+        this.assertAlive();
+        return this.transforms.particles();
+    }
+
+    private assertParticleBody(a: readonly number[], b: readonly number[], radius: number, invMass: number, stiffness: number): void {
+        if (a.length !== 3 || b.length !== 3) throw new RangeError('particle positions and sizes are 3-vectors');
+        // The core works in f32, so the limits are judged on the f32 values it will see.
+        radius = Math.fround(radius); invMass = Math.fround(invMass); stiffness = Math.fround(stiffness);
+        if (![...a, ...b].every((v) => Number.isFinite(v) && Math.abs(v) <= MAX_TELEPORT_COORD)) throw new RangeError('particle positions and sizes must be finite and within range');
+        if (!(radius >= 1e-3 && radius <= 100)) throw new RangeError(`particle radius must be within 0.001..100, got ${radius}`);
+        if (!(invMass >= 0 && invMass <= 1e6)) throw new RangeError(`particle invMass must be within 0..1e6, got ${invMass}`);
+        if (!(stiffness > 0 && stiffness <= 1)) throw new RangeError(`stiffness must be within (0, 1], got ${stiffness}`);
+    }
+
+    private queueGroup(count: number, make: (id: number) => Queued): ParticleGroup {
+        if (this.nextGroup >= MAX_GROUP_ID) throw new RangeError('group id limit reached');
+        if (this.nextGroup >= MAX_PARTICLE_GROUPS) throw new RangeError(`a world holds at most ${MAX_PARTICLE_GROUPS} particle groups`);
+        if (this.nextParticle + count > MAX_PARTICLES) throw new RangeError(`a world holds at most ${MAX_PARTICLES} particles`);
+        const id = this.nextGroup;
+        if (!this.enqueue(make(id))) throw new Error('CommandRing full');
+        this.nextGroup++;
+        const first = this.nextParticle;
+        this.nextParticle += count;
+        return { id, first, count };
     }
 
     /**

@@ -185,7 +185,7 @@ Goal: close the gap with robot-learning engines such as Alloy (many parallel wor
 - **Phase 15 — Assets, robot descriptions and legged robots** (done: URDF in TypeScript and Python, an MJCF subset in TypeScript, a humanoid that stands but does not walk)
   - URDF and MJCF import (links, joints, collision shapes) into the joint table, an asset set with licences recorded, a quadruped and a humanoid, standing and walking controllers.
   - **Exit:** an imported arm matches its description's pose by forward kinematics; a quadruped stands for 10k ticks and takes steps without tipping; the assets load in the browser and from Python.
-- **Phase 16 — Particles, cloth, cables and soft bodies**
+- **Phase 16 — Particles, cloth, cables and soft bodies** (done: ropes, cloth, soft blocks, attachments, read buffer, TypeScript and Python)
   - A position-based particle solver with distance and bending constraints, collisions with rigid bodies, attachment to rigid bodies and joints, in the snapshot, replay and state hash.
   - **Exit:** a cloth drapes over a box and settles; a cable swings from a hinge; a soft block is dropped and rests; a robot pushes a cable; seek round trip is bit-identical.
 - **Phase 17 — Fluids and granular materials**

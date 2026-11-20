@@ -11,7 +11,7 @@ import numpy as np
 from . import _wire as w
 from ._wasm import Instance
 
-__all__ = ["World", "Handle", "JointHandle", "WorldFailed", "StaleHandle", "RingFull"]
+__all__ = ["World", "Handle", "JointHandle", "ParticleGroup", "WorldFailed", "StaleHandle", "RingFull"]
 
 DEFAULT_MAX_DEFERRED = 65536
 _NOT_LIVE = -1
@@ -23,6 +23,13 @@ class Handle(NamedTuple):
     """An entity: its slot and the generation that makes a reused slot a different entity."""
     id: int
     gen: int
+
+
+class ParticleGroup(NamedTuple):
+    """A group a particle command made: its id, the index of its first particle in `read_particles()` and its size."""
+    id: int
+    first: int
+    count: int
 
 
 class JointHandle(NamedTuple):
@@ -78,6 +85,8 @@ class World:
         self._live_gen: List[int] = [_NOT_LIVE] * capacity
         self._free: List[Handle] = []
         self._next_joint = 0
+        self._next_group = 0
+        self._next_particle = 0
         self._known_seeks = 0
         self._fatal: Optional[str] = None
 
@@ -356,6 +365,98 @@ class World:
         at = int(header[w.H_BUF0 + index])
         view = self._inst.mem()[at : at + capacity * w.FLOATS_PER_TRANSFORM * 4].view(np.float32).reshape(capacity, w.FLOATS_PER_TRANSFORM)
         return view.copy() if copy else self._inst.owned(view)
+
+    def _group(self, count: int, send) -> "ParticleGroup":
+        if self._next_group >= w.MAX_GROUP_ID:
+            raise ValueError("group id limit reached")
+        if self._next_group >= w.MAX_PARTICLE_GROUPS:
+            raise ValueError(f"a world holds at most {w.MAX_PARTICLE_GROUPS} particle groups")
+        if self._next_particle + count > w.MAX_PARTICLES:
+            raise ValueError(f"a world holds at most {w.MAX_PARTICLES} particles")
+        send(self._next_group)
+        group = ParticleGroup(self._next_group, self._next_particle, count)
+        self._next_group += 1
+        self._next_particle += count
+        return group
+
+    @staticmethod
+    def _check_particle(vectors: Sequence[Sequence[float]], radius: float, inv_mass: float, stiffness: float) -> None:
+        f32 = lambda x: float(np.float32(x))
+        radius, inv_mass, stiffness = (f32(x) if _finite(x) and abs(x) < 3e38 else x for x in (radius, inv_mass, stiffness))
+        if not all(len(v) == 3 and _finite(*v) and max(abs(c) for c in v) <= w.MAX_TELEPORT_COORD for v in vectors):
+            raise ValueError("particle positions and sizes must be finite 3-vectors within range")
+        if not (_finite(radius) and 1e-3 <= radius <= 100):
+            raise ValueError(f"particle radius must be within 0.001..100, got {radius!r}")
+        if not (_finite(inv_mass) and 0 <= inv_mass <= 1e6):
+            raise ValueError(f"particle inv_mass must be within 0..1e6, got {inv_mass!r}")
+        if not (_finite(stiffness) and 0 < stiffness <= 1):
+            raise ValueError(f"stiffness must be within (0, 1], got {stiffness!r}")
+
+    def create_chain(self, frm: Sequence[float], to: Sequence[float], count: int, *, pin_first: bool = False, pin_last: bool = False, radius: float = 0.02,
+                     inv_mass: float = 1.0, stiffness: float = 1.0) -> "ParticleGroup":
+        """A rope of `count` particles from `frm` to `to`. The rules of the TypeScript `createChain`; `first` assumes earlier particle commands were accepted."""
+        self._alive()
+        if not isinstance(count, int) or not 2 <= count <= w.MAX_CHAIN:
+            raise ValueError(f"a chain has 2..{w.MAX_CHAIN} particles, got {count!r}")
+        self._check_particle([frm, to], radius, inv_mass, stiffness)
+        if not math.dist(frm, to) > 1e-4:
+            raise ValueError("the two ends of a chain must be apart")
+        return self._group(count, lambda id: self._send(w.particle_chain(id, frm, to, count, pin_first, pin_last, radius, inv_mass, stiffness)))
+
+    def create_cloth(self, origin: Sequence[float], u: Sequence[float], v: Sequence[float], nu: int, nv: int, *, pins: int = 0, radius: float = 0.05,
+                     inv_mass: float = 1.0, stiffness: float = 1.0, bend_stiffness: float = 0.3) -> "ParticleGroup":
+        self._alive()
+        for n in (nu, nv):
+            if not isinstance(n, int) or not 2 <= n <= w.MAX_CLOTH_SIDE:
+                raise ValueError(f"a cloth is 2..{w.MAX_CLOTH_SIDE} particles a side, got {n!r}")
+        if not isinstance(pins, int) or not 0 <= pins <= 31:
+            raise ValueError("cloth pins is a 5 bit mask")
+        if not (_finite(bend_stiffness) and 0 <= bend_stiffness <= 1):
+            raise ValueError("bend_stiffness must be within 0..1")
+        self._check_particle([origin, u, v], radius, inv_mass, stiffness)
+        cross = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+        if not math.hypot(*cross) > 1e-4:
+            raise ValueError("the edge vectors u and v of a cloth must span an area")
+        return self._group(nu * nv, lambda id: self._send(w.particle_cloth(id, origin, u, v, nu, nv, pins, radius, inv_mass, stiffness, bend_stiffness)))
+
+    def create_soft_block(self, origin: Sequence[float], size: Sequence[float], n: Sequence[int], *, radius: float = 0.05, inv_mass: float = 1.0,
+                          stiffness: float = 1.0) -> "ParticleGroup":
+        self._alive()
+        if len(n) != 3 or not all(isinstance(k, int) and 2 <= k <= w.MAX_SOFT_SIDE for k in n):
+            raise ValueError(f"a soft block is 2..{w.MAX_SOFT_SIDE} particles along each axis, got {tuple(n)!r}")
+        self._check_particle([origin, size], radius, inv_mass, stiffness)
+        if not all(s > 1e-3 for s in size):
+            raise ValueError("a soft block needs a size above 1 mm on every axis")
+        return self._group(n[0] * n[1] * n[2], lambda id: self._send(w.particle_soft(id, origin, size, n, radius, inv_mass, stiffness)))
+
+    def attach_particle(self, particle: int, body: Handle, local: Sequence[float]) -> None:
+        """Hold particle number `particle` (a row of `read_particles()`) on `body` at `local` in the body's frame."""
+        self._alive()
+        if not isinstance(particle, int) or not 0 <= particle < w.MAX_PARTICLES:
+            raise ValueError(f"particle must be an index below {w.MAX_PARTICLES}, got {particle!r}")
+        if len(local) != 3 or not _finite(*local) or max(abs(c) for c in local) > w.MAX_TELEPORT_COORD:
+            raise ValueError("the attachment offset must be finite and within range")
+        self._send(w.particle_attach(particle, body.id, body.gen, local))
+
+    def detach_particle(self, particle: int) -> None:
+        self._alive()
+        if not isinstance(particle, int) or not 0 <= particle < w.MAX_PARTICLES:
+            raise ValueError(f"particle must be an index below {w.MAX_PARTICLES}, got {particle!r}")
+        self._send(w.particle_detach(particle))
+
+    def read_particles(self) -> np.ndarray:
+        """`(n, 4)` float32 rows `x y z radius` of every particle at the last published tick (a copy, read inside the runtime's sequence word)."""
+        self._alive()
+        header = self._header()
+        for _ in range(64):
+            seq = int(header[w.H_PSTATE_SEQ])
+            if seq & 1:
+                continue
+            rows, count = int(header[w.H_PSTATE_ROWS]), int(header[w.H_PSTATE_N])
+            data = self._inst.mem()[rows : rows + count * w.PSTATE_ROW_WORDS * 4].tobytes() if rows and count else b""
+            if int(header[w.H_PSTATE_SEQ]) == seq:
+                return np.frombuffer(data, dtype=np.float32).reshape(-1, w.PSTATE_ROW_WORDS).copy()
+        raise RuntimeError("particle rows kept changing while they were read")
 
     def read_joint_states(self) -> np.ndarray:
         """Structured rows `(joint, kind, position, velocity)` of every hinge, slider and distance joint at the last published tick (a copy)."""

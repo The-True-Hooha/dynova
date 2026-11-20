@@ -8,6 +8,7 @@ import pytest
 from dynova import _wire as w
 
 GOLD = json.loads((Path(__file__).parent / "golden_ts.json").read_text())
+GOLD_PARTICLES = json.loads((Path(__file__).parent / "golden_particles_ts.json").read_text())
 
 
 def hexed(slot: bytes) -> str:
@@ -57,7 +58,8 @@ def test_tags_are_the_values_the_runtime_pins():
     assert [w.TAG_SPAWN, w.TAG_DESTROY, w.TAG_FORCE, w.TAG_GROW, w.TAG_GRAVITY] == [0, 1, 2, 3, 4]
     assert [w.TAG_TELEPORT, w.TAG_RECORD, w.TAG_SEEK, w.TAG_PAUSE] == [8, 9, 10, 11]
     assert [w.TAG_JOINT_CREATE, w.TAG_JOINT_DESTROY, w.TAG_JOINT_MOTOR, w.TAG_CHECKPOINT, w.TAG_RESET] == [12, 13, 14, 18, 19]
-    assert w.HEADER_WORDS == 41
+    assert [w.TAG_PARTICLE_CHAIN, w.TAG_PARTICLE_CLOTH, w.TAG_PARTICLE_ATTACH, w.TAG_PARTICLE_DETACH, w.TAG_PARTICLE_SOFT] == [20, 21, 22, 23, 24]
+    assert (w.H_PSTATE_SEQ, w.H_PSTATE_ROWS, w.H_PSTATE_N, w.HEADER_WORDS) == (41, 42, 43, 44)
 
 
 def test_a_value_beyond_f32_is_an_error_not_a_silent_infinity():
@@ -71,3 +73,21 @@ def test_floats_round_to_f32_like_math_fround():
     x, y, z = struct.unpack_from("<3f", slot, 6)
     assert (x, y, z) == (struct.unpack("<f", struct.pack("<f", 0.1))[0], struct.unpack("<f", struct.pack("<f", 0.2))[0], struct.unpack("<f", struct.pack("<f", 1 / 3))[0])
     assert not math.isclose(x, 0.1, rel_tol=0, abs_tol=1e-12)
+
+
+PARTICLE_CASES = {
+    "chain": lambda: w.particle_chain(70000, (1, 2, 3), (-1, 2, 3.5), 300, True, True, 0.025, 2, 0.75),
+    "cloth": lambda: w.particle_cloth(70000, (1, 2, 3), (2, 0, 0.5), (0, 0, 3), 64, 17, 22, 0.04, 2, 0.75, 0.25),
+    "soft": lambda: w.particle_soft(70000, (1, 2, 3), (0.5, 1, 2), (4, 12, 2), 0.1, 2, 0.75),
+    "attach": lambda: w.particle_attach(70000, 123456, 9, (0.5, -1, 2)),
+    "detach": lambda: w.particle_detach(5),
+}
+
+
+@pytest.mark.parametrize("name", sorted(PARTICLE_CASES))
+def test_particle_encoders_write_the_bytes_the_typescript_ring_wrote(name):
+    assert hexed(PARTICLE_CASES[name]()) == GOLD_PARTICLES[name]
+
+
+def test_the_particle_golden_has_exactly_these_cases():
+    assert set(PARTICLE_CASES) == set(GOLD_PARTICLES)

@@ -1299,6 +1299,36 @@ mod tests {
         assert_eq!(ring.malformed_dropped(), edits.len() as u32);
     }
 
+    // golden_particles_ts.json is written by the TypeScript ring and read by the Python tests too: all three decode the same bytes to the same commands.
+    #[test]
+    fn the_particle_bytes_the_typescript_ring_writes_decode_to_these_commands() {
+        let gold = include_str!("../../python/tests/golden_particles_ts.json");
+        let slot = |name: &str| -> [u8; SLOT_BYTES] {
+            let at = gold.find(&format!("\"{name}\": \"")).unwrap() + name.len() + 5;
+            let hex = &gold[at..at + SLOT_BYTES * 2];
+            std::array::from_fn(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+        };
+        let mut ring = CommandRing::new(8);
+        for name in ["chain", "cloth", "soft", "attach", "detach"] {
+            raw_slot(&mut ring, |b| *b = slot(name));
+        }
+        let want = [
+            Command::ParticleChain { id: 70_000, desc: ChainDesc { from: [1.0, 2.0, 3.0], to: [-1.0, 2.0, 3.5], count: 300, pin_first: true, pin_last: true, radius: 0.025, inv_mass: 2.0, stiffness: 0.75 } },
+            Command::ParticleCloth { id: 70_000, desc: ClothDesc { origin: [1.0, 2.0, 3.0], u: [2.0, 0.0, 0.5], v: [0.0, 0.0, 3.0], nu: 64, nv: 17, pins: 22, radius: 0.04, inv_mass: 2.0, stiffness: 0.75, bend_stiffness: 0.25 } },
+            Command::ParticleSoft { id: 70_000, desc: SoftDesc { origin: [1.0, 2.0, 3.0], size: [0.5, 1.0, 2.0], n: [4, 12, 2], radius: 0.1, inv_mass: 2.0, stiffness: 0.75 } },
+            Command::ParticleAttach { particle: 70_000, body: 123_456, generation: 9, local: [0.5, -1.0, 2.0] },
+            Command::ParticleDetach { particle: 5 },
+        ];
+        assert_eq!(drain(&mut ring, &[]), want);
+        assert_eq!(ring.malformed_dropped(), 0);
+        for c in &want {
+            let mut b = [0u8; SLOT_BYTES];
+            encode_slot(c, &mut b);
+            let name = match c { Command::ParticleChain { .. } => "chain", Command::ParticleCloth { .. } => "cloth", Command::ParticleSoft { .. } => "soft", Command::ParticleAttach { .. } => "attach", _ => "detach" };
+            assert_eq!(b, slot(name), "Rust encodes {name} to the same bytes");
+        }
+    }
+
     fn ray_cmd() -> Command {
         Command::Raycast { id: 70_000, origin: [1.0, 2.0, 3.0], dir: [0.0, 0.0, -2.0], max_dist: 50.5, ignore: 9 }
     }

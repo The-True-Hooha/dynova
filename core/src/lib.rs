@@ -13,6 +13,7 @@ pub mod inspector;
 pub mod query_results;
 pub mod camera;
 pub mod joint_state;
+pub mod particle_state;
 pub mod recorder;
 pub mod determinism;
 

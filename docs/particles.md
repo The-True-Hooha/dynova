@@ -46,6 +46,21 @@ Ring commands `ParticleAttach` (tag 22: particle, body id and generation, offset
 - A particle with inverse mass 0 can be attached: it rides the body and adds no pull.
 - One body's total gain from particles in a substep is bounded to 100 m/s and 100 rad/s.
 
-## Not yet
+## From TypeScript and Python
 
-The host reads no particle positions yet (a double-buffered transform buffer comes with the SDK step), and the TypeScript and Python rings do not write tag 20.
+```ts
+const rope = world.createChain({ from: [0, 5, 0], to: [2, 5, 0], count: 11, pinFirst: true });   // { id, first, count }
+const cloth = world.createCloth({ origin, u, v, nu: 21, nv: 21, pins: 0b10001 });
+const block = world.createSoftBlock({ origin, size, n: [4, 4, 4] });
+world.attachParticle(rope.first + 10, body, [0, 0.5, 0]);
+const rows = world.readParticles();   // Float32Array [x, y, z, radius] per particle, one read, one tick
+```
+```python
+rope = world.create_chain((0, 5, 0), (2, 5, 0), 11, pin_first=True)
+rows = world.read_particles()         # (n, 4) float32
+```
+
+- The read is one call over a header-announced buffer (words 41 to 43, the same sequence-word pattern as joint states): rewritten after every step and seek, empty before the first particle, never one call per particle. The header grew from 41 to 44 words, so the wasm package must be rebuilt; a stale one is refused at load.
+- `first` is predicted by the host as the sum of the sizes of the groups it has made. It is wrong if an earlier particle command was refused (counted in `malformedDropped`) a seek or a `Reset` went back before one, or a world already holds 4,096 groups or 32,768 links (the core refuses those and counts them in `malformedDropped`), so read `readParticles()` after a step if in doubt. Group ids only grow.
+- Requests are checked on the host with the same bounds as the core, so a bad one throws before anything is queued. The wire bytes of every particle command are pinned in `python/tests/golden_particles_ts.json`, written by the TypeScript ring and read by the Rust and Python tests.
+- Particles are not part of `Batch.render` cameras (cameras image bodies only).

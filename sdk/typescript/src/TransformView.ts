@@ -39,7 +39,11 @@ export const H_QUERY_HEAD = 37;
 export const H_JSTATE_SEQ = 38;
 export const H_JSTATE_ROWS = 39;
 export const H_JSTATE_N = 40;
-export const HEADER_WORDS = 41;
+export const H_PSTATE_SEQ = 41;
+export const H_PSTATE_ROWS = 42;
+export const H_PSTATE_N = 43;
+export const PSTATE_ROW_WORDS = 4;
+export const HEADER_WORDS = 44;
 
 export const JSTATE_ROW_WORDS = 4;
 export const QUERY_ROW_WORDS = 10;
@@ -170,6 +174,28 @@ export class TransformView {
             return rows;
         }
         throw new Error('joint states kept changing while they were read');
+    }
+
+    /**
+     * `[x, y, z, radius]` of every particle as of the last tick the runtime published, in the order the particles were made, copied inside the runtime's sequence
+     * word so they all belong to one tick. Empty while no particle exists. One call reads them all (no per-particle call).
+     */
+    particles(): Float32Array {
+        for (let attempt = 0; attempt < RECORDING_ATTEMPTS; attempt++) {
+            this.live();
+            const seq = Atomics.load(this.header, H_PSTATE_SEQ);
+            if (seq & 1) continue;
+            const ptr = Atomics.load(this.header, H_PSTATE_ROWS) >>> 0;
+            const n = Atomics.load(this.header, H_PSTATE_N) >>> 0;
+            if (ptr === 0 || n === 0) {
+                if (Atomics.load(this.header, H_PSTATE_SEQ) === seq) return new Float32Array(0);
+                continue;
+            }
+            const rows = new Float32Array(this.memory.buffer, ptr, n * PSTATE_ROW_WORDS).slice();
+            if (Atomics.load(this.header, H_PSTATE_SEQ) !== seq) continue;
+            return rows;
+        }
+        throw new Error('particle rows kept changing while they were read');
     }
 
     /**
