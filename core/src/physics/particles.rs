@@ -68,6 +68,7 @@ pub struct Particles {
     pub links: Vec<Link>,
     pub attachments: Vec<Attachment>,
     pub fluids: Vec<super::fluid::FluidGroup>,
+    pub sand: Vec<super::sand::SandGroup>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -328,6 +329,7 @@ impl Particles {
         }
         // Only a world with fluid groups hashes them, so every world without any hashes as it did before fluids existed.
         if !self.fluids.is_empty() { self.fluid_hash(&mut h); }
+        if !self.sand.is_empty() { self.sand_hash(&mut h); }
         h.word(self.attachments.len() as u64);
         for a in &self.attachments {
             h.word(a.particle as u64);
@@ -338,7 +340,7 @@ impl Particles {
     }
 
     pub fn approx_bytes(&self) -> usize {
-        self.len() * 8 * 4 + self.links.len() * std::mem::size_of::<Link>() + self.groups.len() * std::mem::size_of::<Group>() + self.attachments.len() * std::mem::size_of::<Attachment>() + self.fluids.len() * std::mem::size_of::<super::fluid::FluidGroup>()
+        self.len() * 8 * 4 + self.links.len() * std::mem::size_of::<Link>() + self.groups.len() * std::mem::size_of::<Group>() + self.attachments.len() * std::mem::size_of::<Attachment>() + self.fluids.len() * std::mem::size_of::<super::fluid::FluidGroup>() + self.sand.len() * std::mem::size_of::<super::sand::SandGroup>()
     }
 }
 
@@ -402,8 +404,8 @@ impl PhysicsWorld {
                 p.z[i] += p.vz[i] * h;
             }
             for k in &held { (p.x[k.0], p.y[k.0], p.z[k.0]) = (k.1[0], k.1[1], k.1[2]); }
-            let neighbours = if p.fluids.is_empty() { None } else { Some(p.find_neighbours()) };
-            if let Some(nb) = &neighbours { p.solve_density(nb); }
+            let neighbours = if p.fluids.is_empty() && p.sand.is_empty() { None } else { Some(p.find_neighbours()) };
+            let touched = neighbours.as_ref().map(|nb| { p.solve_density(nb); p.solve_sand(nb, &prev) });
             for _ in 0..PARTICLE_ITERS {
                 for l in &p.links {
                     let (a, b) = (l.a as usize, l.b as usize);
@@ -484,6 +486,12 @@ impl PhysicsWorld {
                 }
             }
             if let Some(nb) = &neighbours { p.smooth_velocities(nb); }
+            if let (Some(t), Some(nb)) = (&touched, &neighbours) {
+                let on_body: Vec<bool> = out.iter().map(|n| *n != [0.0; 3]).collect();
+                let grounded = p.grounded_sand(nb, &on_body);
+                p.damp_sand(t, &grounded);
+                p.stick_sand(nb, g, &prev, &on_body);
+            }
             // One application per body: the impulses of every particle that touched or held it add up first, and the total is what is bounded.
             reactions.sort_by_key(|r| r.0);
             let mut start = 0;

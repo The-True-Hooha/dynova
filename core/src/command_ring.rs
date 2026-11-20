@@ -1,6 +1,6 @@
 use crate::collision::V3;
 use crate::hull::MAX_HULL_COORD;
-use crate::physics::{BodyDesc, ChainDesc, ClothDesc, FluidDesc, SoftDesc, JointDesc, MAX_COORD};
+use crate::physics::{BodyDesc, ChainDesc, ClothDesc, FluidDesc, SandDesc, SoftDesc, JointDesc, MAX_COORD};
 use std::sync::atomic::{AtomicU32, Ordering};
 use wasm_bindgen::prelude::*;
 
@@ -31,6 +31,7 @@ pub const TAG_PARTICLE_ATTACH: u8 = 22;
 pub const TAG_PARTICLE_DETACH: u8 = 23;
 pub const TAG_PARTICLE_SOFT: u8 = 24;
 pub const TAG_PARTICLE_FLUID: u8 = 25;
+pub const TAG_PARTICLE_SAND: u8 = 26;
 pub const HULL_VERTS_PER_SLOT: usize = 4;
 pub const KIN_SAMPLES_PER_SLOT: usize = 3;
 /// Largest entity capacity a Grow may request; sized so buffers, retained generations and physics columns fit in 1 GiB.
@@ -147,6 +148,8 @@ pub enum Command {
     ParticleSoft { id: u32, desc: SoftDesc },
     /// A block of fluid particles on a lattice; `id` names the group.
     ParticleFluid { id: u32, desc: FluidDesc },
+    /// A block of sand grains on a lattice, with friction between grains; `id` names the group. Same slot layout as `ParticleFluid` (the last field is friction).
+    ParticleSand { id: u32, desc: SandDesc },
 }
 
 impl Command {
@@ -158,7 +161,7 @@ impl Command {
             | Command::Teleport { id, generation, .. } => Some((*id, *generation)),
             Command::Grow { .. } | Command::Gravity { .. } | Command::HullVerts { .. } | Command::HullCommit { .. } | Command::Inspect { .. } | Command::Record { .. } | Command::Seek { .. } | Command::Pause { .. }
             | Command::JointCreate { .. } | Command::JointDestroy { .. } | Command::JointMotor { .. } | Command::KinematicBatch { .. }
-            | Command::Raycast { .. } | Command::OverlapSphere { .. } | Command::Checkpoint | Command::Reset | Command::ParticleChain { .. } | Command::ParticleCloth { .. } | Command::ParticleAttach { .. } | Command::ParticleDetach { .. } | Command::ParticleSoft { .. } | Command::ParticleFluid { .. } => None,
+            | Command::Raycast { .. } | Command::OverlapSphere { .. } | Command::Checkpoint | Command::Reset | Command::ParticleChain { .. } | Command::ParticleCloth { .. } | Command::ParticleAttach { .. } | Command::ParticleDetach { .. } | Command::ParticleSoft { .. } | Command::ParticleFluid { .. } | Command::ParticleSand { .. } => None,
         }
     }
 }
@@ -334,6 +337,14 @@ fn encode_slot(cmd: &Command, b: &mut [u8; SLOT_BYTES]) {
             b[OFF_GEN] = *generation;
             wr_f32x(b, OFF_POS, local);
             b[OFF_ATTACH_BODY..OFF_ATTACH_BODY + 4].copy_from_slice(&body.to_le_bytes());
+        }
+        Command::ParticleSand { id, desc } => {
+            b[0] = TAG_PARTICLE_SAND;
+            b[OFF_ID..OFF_ID + 4].copy_from_slice(&id.to_le_bytes());
+            wr_f32x(b, OFF_POS, &desc.origin);
+            for (k, n) in desc.n.iter().enumerate() { b[OFF_FLUID_N + k] = (*n).min(255) as u8; }
+            wr_f32(b, OFF_FLUID_SPACING, desc.spacing);
+            wr_f32(b, OFF_FLUID_VISCOSITY, desc.friction);
         }
         Command::ParticleFluid { id, desc } => {
             b[0] = TAG_PARTICLE_FLUID;
@@ -518,6 +529,15 @@ fn decode_slot(b: &[u8; SLOT_BYTES]) -> Option<Command> {
             let local: V3 = rd_f32x(b, OFF_POS);
             let body = u32::from_le_bytes([b[OFF_ATTACH_BODY], b[OFF_ATTACH_BODY + 1], b[OFF_ATTACH_BODY + 2], b[OFF_ATTACH_BODY + 3]]);
             (all_finite(&local) && local.iter().all(|f| f.abs() <= MAX_COORD)).then_some(Command::ParticleAttach { particle: id, body, generation, local })
+        }
+        TAG_PARTICLE_SAND => {
+            let desc = SandDesc {
+                origin: rd_f32x(b, OFF_POS),
+                n: [b[OFF_FLUID_N] as u32, b[OFF_FLUID_N + 1] as u32, b[OFF_FLUID_N + 2] as u32],
+                spacing: rd_f32(b, OFF_FLUID_SPACING),
+                friction: rd_f32(b, OFF_FLUID_VISCOSITY),
+            };
+            desc.is_valid().then_some(Command::ParticleSand { id, desc })
         }
         TAG_PARTICLE_FLUID => {
             let desc = FluidDesc {
@@ -961,15 +981,15 @@ mod tests {
 
     #[test]
     fn wire_tags_are_pinned_to_the_values_the_typescript_ring_writes() {
-        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, TAG_CHECKPOINT, TAG_RESET, TAG_PARTICLE_CHAIN, TAG_PARTICLE_CLOTH, TAG_PARTICLE_ATTACH, TAG_PARTICLE_DETACH, TAG_PARTICLE_SOFT, TAG_PARTICLE_FLUID],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
+        assert_eq!([TAG_SPAWN, TAG_DESTROY, TAG_FORCE, TAG_GROW, TAG_GRAVITY, TAG_HULL_VERTS, TAG_HULL_COMMIT, TAG_INSPECT, TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE, TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR, TAG_KINEMATIC_BATCH, TAG_RAYCAST, TAG_OVERLAP_SPHERE, TAG_CHECKPOINT, TAG_RESET, TAG_PARTICLE_CHAIN, TAG_PARTICLE_CLOTH, TAG_PARTICLE_ATTACH, TAG_PARTICLE_DETACH, TAG_PARTICLE_SOFT, TAG_PARTICLE_FLUID, TAG_PARTICLE_SAND],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
         let mut ring = CommandRing::new(8);
         raw_slot(&mut ring, |b| { b[0] = 8; b[OFF_ID] = 3; b[OFF_GEN] = 2; b[OFF_POS..OFF_POS + 4].copy_from_slice(&1.5f32.to_le_bytes()); });
         raw_slot(&mut ring, |b| { b[0] = 9; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 10; b[OFF_ID] = 7; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 1; });
         raw_slot(&mut ring, |b| { b[0] = 11; b[OFF_POS] = 2; });
-        raw_slot(&mut ring, |b| { b[0] = 26; });
+        raw_slot(&mut ring, |b| { b[0] = 27; });
         let mut out = Vec::new();
         ring.drain_commands(8, &mut out);
         assert_eq!(out, vec![
@@ -978,7 +998,7 @@ mod tests {
             Command::Seek { tick: 7 },
             Command::Pause { on: true },
         ]);
-        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 26 (unassigned) are malformed");
+        assert_eq!(ring.malformed_dropped(), 2, "Pause byte 2 and tag 27 (unassigned) are malformed");
     }
 
     #[test]
@@ -1374,6 +1394,27 @@ mod tests {
         ];
         for edit in &edits {
             raw_slot(&mut ring, |b| { encode_slot(&fluid_cmd(), b); edit(b); });
+        }
+        assert!(drain(&mut ring, &[]).is_empty());
+        assert_eq!(ring.malformed_dropped(), edits.len() as u32);
+    }
+
+    #[test]
+    fn a_sand_block_round_trips_and_a_malformed_one_is_dropped_whole() {
+        let sand = Command::ParticleSand { id: 70_000, desc: SandDesc { origin: [1.0, 2.0, 3.0], n: [4, 32, 2], spacing: 0.05, friction: 0.75 } };
+        let mut ring = CommandRing::new(32);
+        assert!(ring.push(&sand));
+        assert_eq!(drain(&mut ring, &[]), vec![sand.clone()]);
+        assert_eq!(sand.target(), None);
+        let edits: [fn(&mut [u8; SLOT_BYTES]); 5] = [
+            |b| b[OFF_FLUID_N] = 1,
+            |b| wr_f32(b, OFF_FLUID_SPACING, 0.0),
+            |b| wr_f32(b, OFF_FLUID_VISCOSITY, 1.1),
+            |b| wr_f32(b, OFF_FLUID_VISCOSITY, -0.1),
+            |b| wr_f32x(b, OFF_POS, &[2.0 * MAX_COORD, 0.0, 0.0]),
+        ];
+        for edit in &edits {
+            raw_slot(&mut ring, |b| { encode_slot(&sand, b); edit(b); });
         }
         assert!(drain(&mut ring, &[]).is_empty());
         assert_eq!(ring.malformed_dropped(), edits.len() as u32);

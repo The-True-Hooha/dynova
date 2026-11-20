@@ -8,7 +8,7 @@ use super::*;
 use crate::collision::V3;
 
 pub const MAX_FLUID_SIDE: u32 = 32;
-/// Fluid particles in one world. A tick costs about 7 microseconds a particle in a native release build (the density iterations dominate), so this bounds it near 30 ms.
+/// Fluid and sand particles in one world. A tick costs about 7 microseconds a particle in a native release build (the density iterations dominate), so this bounds it near 30 ms.
 pub const MAX_FLUID_PARTICLES: usize = 4096;
 pub const FLUID_ITERS: u32 = 8;
 /// Water, kg/m^3: sets the mass of a particle, which is what a body feels of it.
@@ -77,7 +77,7 @@ impl Particles {
     /// Fails, changing nothing, for a bad description, a taken id or a full table.
     pub fn create_fluid(&mut self, id: u32, d: &FluidDesc) -> bool {
         let [nx, ny, nz] = d.n.map(|n| n as usize);
-        if id >= MAX_GROUP_ID || !d.is_valid() || self.groups.len() >= MAX_PARTICLE_GROUPS || self.groups.iter().any(|g| g.id == id) || self.len() + nx * ny * nz > MAX_PARTICLES || self.fluids.iter().map(|g| g.count as usize).sum::<usize>() + nx * ny * nz > MAX_FLUID_PARTICLES {
+        if id >= MAX_GROUP_ID || !d.is_valid() || self.groups.len() >= MAX_PARTICLE_GROUPS || self.groups.iter().any(|g| g.id == id) || self.len() + nx * ny * nz > MAX_PARTICLES || self.granular_len() + nx * ny * nz > MAX_FLUID_PARTICLES {
             return false;
         }
         let first = self.len() as u32;
@@ -101,12 +101,17 @@ impl Particles {
         true
     }
 
-    /// Finds each fluid particle's neighbours at the current positions: the particles of its own group within the smoothing radius, itself excluded.
+    /// Particles in fluid and sand groups: what `MAX_FLUID_PARTICLES` bounds.
+    pub fn granular_len(&self) -> usize {
+        self.fluids.iter().map(|g| g.count as usize).sum::<usize>() + self.sand.iter().map(|g| g.count as usize).sum::<usize>()
+    }
+
+    /// Finds each fluid and sand particle's neighbours at the current positions: the particles of its own group within the group's reach (fluid groups first, then sand), itself excluded.
     pub fn find_neighbours(&self) -> Neighbours {
         let mut out = Neighbours::default();
-        for g in &self.fluids {
-            let (lo, hi) = (g.first as usize, (g.first + g.count) as usize);
-            let h = g.spacing * H_RATIO;
+        let ranges = self.fluids.iter().map(|g| (g.first, g.count, g.spacing * H_RATIO)).chain(self.sand.iter().map(|g| (g.first, g.count, g.spacing * super::sand::SAND_REACH)));
+        for (first, count, h) in ranges {
+            let (lo, hi) = (first as usize, (first + count) as usize);
             // Clamped two short of the 21 bit field on each side, so the neighbour cells the search adds cannot leave it and alias another cell.
             const LIMIT: i64 = (1 << 20) - 2;
             let cell = |v: f32| ((v / h).floor() as i64).clamp(-LIMIT, LIMIT) + (1 << 20);

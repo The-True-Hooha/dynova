@@ -56,6 +56,15 @@ Position-based fluid (the ring command `ParticleFluid`, tag 25, logged and repla
 - Collision is the same per-substep sphere test as other particles, so a body thinner than a substep's travel can be crossed at speed. Coarse, deep fluid is not supported: an 8 by 8 by 8 block at 0.5 m spacing (4 m deep) fell through a 1 m thick floor in the measurement, and a block spawned inside a thin slab spreads about a metre sideways. Spacings of 0.1 m and below, with bodies a few spacings thick, are what is tested.
 - The level agrees with the analytic one to a few percent at spacings of 0.04 and 0.1; at 0.01 m a measurement found it 30 percent high, which is not understood (the level helper averages the top tenth of a small block). Fine fluid is untested for accuracy.
 
+## Sand
+
+The ring command `ParticleSand` (tag 26, logged and replayed; same slot layout as fluid, with Coulomb `friction` in 0 to 1 where fluid has viscosity): a lattice of 2 to 32 grains per axis, spacing equal to the grain diameter. A grain weighs 1600 kg/m3 times its diameter cubed. Fluid and sand share the 4,096 particle cap.
+
+- Contact: each substep, pairs closer than a diameter are pushed apart in 8 iterations, with the sliding they did against each other limited by a Coulomb term.
+- Static friction: a grain that rests on something (it touches a body, or is linked to a grain that does, through contacts) stays put while the slope of the contact normal under it is no steeper than `atan(friction)`, and slides when steeper; grounded grains that touch another lose a tenth of their speed a substep. A column of sand in free fall is not grounded, so it falls freely (tested).
+- Heap angle: a 10 by 10 by 10 block of 0.05 m grains dropped on a floor stands at about 11 degrees with no friction and at 23, 49 and 57 degrees at friction 0.3, 0.6 and 1.0 (height over the radius that holds nine tenths of the grains, after 600 ticks). The test asserts that the angle grows with friction and is at least `atan(friction)` (17, 31 and 45 degrees). The hold is sticky, so a heap stands steeper than that: this is a lower bound, not the angle of repose a granular pour reaches, and a block that barely spreads is not a pour.
+- A heavy body landing on a heap can end up overlapping grains: held grains are put back where the substep began without testing bodies again. Pinned grains (inverse mass 0) are skipped by contact and friction.
+
 ## From TypeScript and Python
 
 ```ts
