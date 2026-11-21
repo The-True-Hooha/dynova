@@ -262,7 +262,7 @@ class World:
 
     def seek(self, tick: int) -> None:
         self._alive()
-        if not isinstance(tick, int) or not 0 <= tick <= 0xFFFFFFFF:
+        if not isinstance(tick, (int, np.integer)) or not 0 <= tick <= 0xFFFFFFFF:
             raise ValueError(f"tick must be an integer in [0, 2^32), got {tick!r}")
         self._send(w.seek(tick))
 
@@ -401,7 +401,7 @@ class World:
                      inv_mass: float = 1.0, stiffness: float = 1.0) -> "ParticleGroup":
         """A rope of `count` particles from `frm` to `to`. The rules of the TypeScript `createChain`; `first` assumes earlier particle commands were accepted."""
         self._alive()
-        if not isinstance(count, int) or not 2 <= count <= w.MAX_CHAIN:
+        if not isinstance(count, (int, np.integer)) or not 2 <= count <= w.MAX_CHAIN:
             raise ValueError(f"a chain has 2..{w.MAX_CHAIN} particles, got {count!r}")
         self._check_particle([frm, to], radius, inv_mass, stiffness)
         if not math.dist(frm, to) > 1e-4:
@@ -412,9 +412,9 @@ class World:
                      inv_mass: float = 1.0, stiffness: float = 1.0, bend_stiffness: float = 0.3) -> "ParticleGroup":
         self._alive()
         for n in (nu, nv):
-            if not isinstance(n, int) or not 2 <= n <= w.MAX_CLOTH_SIDE:
+            if not isinstance(n, (int, np.integer)) or not 2 <= n <= w.MAX_CLOTH_SIDE:
                 raise ValueError(f"a cloth is 2..{w.MAX_CLOTH_SIDE} particles a side, got {n!r}")
-        if not isinstance(pins, int) or not 0 <= pins <= 31:
+        if not isinstance(pins, (int, np.integer)) or not 0 <= pins <= 31:
             raise ValueError("cloth pins is a 5 bit mask")
         if not (_finite(bend_stiffness) and 0 <= bend_stiffness <= 1):
             raise ValueError("bend_stiffness must be within 0..1")
@@ -427,7 +427,7 @@ class World:
     def create_soft_block(self, origin: Sequence[float], size: Sequence[float], n: Sequence[int], *, radius: float = 0.05, inv_mass: float = 1.0,
                           stiffness: float = 1.0) -> "ParticleGroup":
         self._alive()
-        if len(n) != 3 or not all(isinstance(k, int) and 2 <= k <= w.MAX_SOFT_SIDE for k in n):
+        if len(n) != 3 or not all(isinstance(k, (int, np.integer)) and 2 <= k <= w.MAX_SOFT_SIDE for k in n):
             raise ValueError(f"a soft block is 2..{w.MAX_SOFT_SIDE} particles along each axis, got {tuple(n)!r}")
         self._check_particle([origin, size], radius, inv_mass, stiffness)
         if not all(s > 1e-3 for s in size):
@@ -436,7 +436,7 @@ class World:
 
     @staticmethod
     def _check_lattice(origin: Sequence[float], n: Sequence[int], spacing: float, name: str, last: float) -> None:
-        if len(n) != 3 or not all(isinstance(k, int) and 2 <= k <= w.MAX_FLUID_SIDE for k in n):
+        if len(n) != 3 or not all(isinstance(k, (int, np.integer)) and 2 <= k <= w.MAX_FLUID_SIDE for k in n):
             raise ValueError(f"a lattice is 2..{w.MAX_FLUID_SIDE} particles along each axis, got {tuple(n)!r}")
         if not (len(origin) == 3 and _finite(*origin) and max(abs(c) for c in origin) <= w.MAX_TELEPORT_COORD):
             raise ValueError("the origin must be a finite 3-vector within range")
@@ -459,7 +459,7 @@ class World:
     def attach_particle(self, particle: int, body: Handle, local: Sequence[float]) -> None:
         """Hold particle number `particle` (a row of `read_particles()`) on `body` at `local` in the body's frame."""
         self._alive()
-        if not isinstance(particle, int) or not 0 <= particle < w.MAX_PARTICLES:
+        if not isinstance(particle, (int, np.integer)) or not 0 <= particle < w.MAX_PARTICLES:
             raise ValueError(f"particle must be an index below {w.MAX_PARTICLES}, got {particle!r}")
         if len(local) != 3 or not _finite(*local) or max(abs(c) for c in local) > w.MAX_TELEPORT_COORD:
             raise ValueError("the attachment offset must be finite and within range")
@@ -467,7 +467,7 @@ class World:
 
     def detach_particle(self, particle: int) -> None:
         self._alive()
-        if not isinstance(particle, int) or not 0 <= particle < w.MAX_PARTICLES:
+        if not isinstance(particle, (int, np.integer)) or not 0 <= particle < w.MAX_PARTICLES:
             raise ValueError(f"particle must be an index below {w.MAX_PARTICLES}, got {particle!r}")
         self._send(w.particle_detach(particle))
 

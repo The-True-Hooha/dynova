@@ -16,7 +16,7 @@ __all__ = ["Batch", "Images", "partition"]
 def partition(worlds: int, workers: int) -> List[int]:
     """How many worlds each worker gets: contiguous, every worker at least one, no two counts more than one apart."""
     for name, value in (("worlds", worlds), ("workers", workers)):
-        if not isinstance(value, int) or value < 1:
+        if not isinstance(value, (int, np.integer)) or value < 1:
             raise ValueError(f"{name} must be a positive integer, got {value!r}")
     n = min(workers, worlds)
     return [worlds // n + (1 if i < worlds % n else 0) for i in range(n)]
@@ -150,7 +150,7 @@ class Batch:
         if not live:
             raise WasmError("every worker has failed")
         ignore = NO_BODY if ignore is None else ignore
-        if not isinstance(ignore, int) or not 0 <= ignore <= NO_BODY:
+        if not isinstance(ignore, (int, np.integer)) or not 0 <= ignore <= NO_BODY:
             raise ValueError(f"ignore must be a body id or None, got {ignore!r}")
         packed = {id(g): table[g.first : g.first + len(g.worlds)].astype("<f4").tobytes() for g in live}
         if self._pool is None:

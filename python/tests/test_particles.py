@@ -181,3 +181,17 @@ def test_the_viscosity_and_friction_given_reach_the_ring_slot_not_a_default():
         w.create_fluid((0, 0, 0), (2, 2, 2), 0.05, viscosity=0.7)
         import struct
         assert [(s[0], struct.unpack_from("<f", s, 28)[0]) for s in sent] == [(26, pytest.approx(0.3, abs=1e-6)), (25, pytest.approx(0.7, abs=1e-6))]
+
+
+def test_numpy_integers_are_accepted_wherever_a_count_is_and_a_float_count_is_not():
+    batch = Batch(np.int64(1), capacity=np.int32(32), ring_capacity=np.int64(256))
+    w = batch.worlds[0]
+    with batch:
+        rope = w.create_chain((0, 5, 0), (2, 5, 0), np.int64(6))
+        sheet = w.create_cloth((0, 5, 1), (1, 0, 0), (0, 0, 1), np.int32(3), np.int64(3))
+        water = w.create_fluid((0, 1, 0), (np.int64(2), np.int64(2), np.int64(2)), 0.1)
+        assert (rope.count, sheet.count, water.count) == (6, 9, 8)
+        assert batch.step() == []
+        assert w.read_particles().shape == (23, 4)
+        with pytest.raises(ValueError):
+            w.create_chain((0, 5, 0), (2, 5, 0), 6.0)

@@ -172,8 +172,9 @@ class WasmBatch:
 
     def __init__(self, worlds: int, capacity: int, ring_capacity: int, physics: bool = True) -> None:
         for name, value in (("worlds", worlds), ("capacity", capacity), ("ring_capacity", ring_capacity)):
-            if not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF:
+            if not isinstance(value, (int, np.integer)) or not 0 <= value <= 0xFFFFFFFF:
                 raise ValueError(f"{name} must be an integer in [0, 2^32), got {value!r}")
+        worlds, capacity, ring_capacity = int(worlds), int(capacity), int(ring_capacity)
         self.instance = Instance()
         pointer, error, failed = self.instance.call("batch_new", worlds, capacity, ring_capacity)
         if failed:
