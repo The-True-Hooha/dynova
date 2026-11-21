@@ -22,7 +22,7 @@ for (const [name, query] of [['a driven arm', 'n=64&amp=3'], ['an arm driven int
         }
         // The scene has to reach what the kernel must get right.
         expect(r.widest).toBeGreaterThan(query.includes('skew') ? 0.5 : 1.5);
-        expect(r.guards).toEqual({ concurrentReadsAgree: true, nanMotor: true, hugeMotor: true, nanKick: true, staticLink: true, usedAfterDestroy: true });
+        expect(r.guards).toEqual({ concurrentReadsAgree: true, readIsASnapshot: true, nanMotor: true, hugeMotor: true, nanKick: true, staticLink: true, usedAfterDestroy: true });
         if (query.includes('amp=9')) expect(r.atLimit).toBeGreaterThan(20);
     });
 }

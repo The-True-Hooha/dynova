@@ -105,7 +105,6 @@ export function reacherParams(s: ReacherScene): Float32Array {
  */
 export class GpuReacher {
     private destroyed = false;
-    private reading: Promise<unknown> = Promise.resolve();
 
     private constructor(
         readonly worlds: number,
@@ -116,7 +115,6 @@ export class GpuReacher {
         private readonly state: GPUBuffer,
         private readonly motors: GPUBuffer,
         private readonly obs: GPUBuffer,
-        private readonly staging: GPUBuffer,
     ) {}
 
     static async create(device: GPUDevice, worlds: number, scene: ReacherScene = REACHER): Promise<GpuReacher> {
@@ -132,12 +130,11 @@ export class GpuReacher {
         const state = device.createBuffer({ size: worlds * STATE_FLOATS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
         const motors = device.createBuffer({ size: worlds * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
         const obs = device.createBuffer({ size: worlds * OBS_FLOATS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-        const staging = device.createBuffer({ size: worlds * STATE_FLOATS * 4 + worlds * OBS_FLOATS * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
         const bind = device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
             entries: [params, state, motors, obs].map((buffer, binding) => ({ binding, resource: { buffer } })),
         });
-        const reacher = new GpuReacher(worlds, scene, device, pipeline, bind, state, motors, obs, staging);
+        const reacher = new GpuReacher(worlds, scene, device, pipeline, bind, state, motors, obs);
         reacher.reset();
         return reacher;
     }
@@ -179,25 +176,35 @@ export class GpuReacher {
         this.device.queue.submit([enc.finish()]);
     }
 
-    /** Waits for the queued ticks and returns `[state rows, observation pairs]` as of the last one. One copy each way, never one call per world. */
-    read(): Promise<{ state: Float32Array; obs: Float32Array }> {
+    /** The state rows and observation pairs as of the ticks queued before this call. One copy each way, never one call per world. */
+    async read(): Promise<{ state: Float32Array; obs: Float32Array }> {
         this.assertAlive();
-        // One staging buffer: a second read waits for the first to unmap.
-        const next = this.reading.then(() => this.copyOut());
-        this.reading = next.catch(() => undefined);
-        return next;
+        const all = await this.copyOut(true);
+        return { state: all.subarray(0, this.worlds * STATE_FLOATS), obs: all.subarray(this.worlds * STATE_FLOATS) };
     }
 
-    private async copyOut(): Promise<{ state: Float32Array; obs: Float32Array }> {
-        const enc = this.device.createCommandEncoder();
+    /** Only the observation pairs `[angle, angular velocity]`: what a control loop reads each tick, 2 floats a world instead of 26. */
+    readObs(): Promise<Float32Array> {
+        this.assertAlive();
+        return this.copyOut(false);
+    }
+
+    // The copy is submitted before this returns, so later step/setMotors/reset calls cannot leak into it; each read owns its staging buffer, so reads need no ordering.
+    private async copyOut(withState: boolean): Promise<Float32Array> {
         const stateBytes = this.worlds * STATE_FLOATS * 4;
-        enc.copyBufferToBuffer(this.state, 0, this.staging, 0, stateBytes);
-        enc.copyBufferToBuffer(this.obs, 0, this.staging, stateBytes, this.worlds * OBS_FLOATS * 4);
+        const obsBytes = this.worlds * OBS_FLOATS * 4;
+        const size = withState ? stateBytes + obsBytes : obsBytes;
+        const staging = this.device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const enc = this.device.createCommandEncoder();
+        if (withState) enc.copyBufferToBuffer(this.state, 0, staging, 0, stateBytes);
+        enc.copyBufferToBuffer(this.obs, 0, staging, withState ? stateBytes : 0, obsBytes);
         this.device.queue.submit([enc.finish()]);
-        await this.staging.mapAsync(GPUMapMode.READ);
-        const all = new Float32Array(this.staging.getMappedRange().slice(0));
-        this.staging.unmap();
-        return { state: all.subarray(0, this.worlds * STATE_FLOATS), obs: all.subarray(this.worlds * STATE_FLOATS) };
+        try {
+            await staging.mapAsync(GPUMapMode.READ);
+            return new Float32Array(staging.getMappedRange().slice(0));
+        } finally {
+            staging.destroy();
+        }
     }
 
     private assertAlive(): void {
@@ -206,6 +213,6 @@ export class GpuReacher {
 
     destroy(): void {
         this.destroyed = true;
-        for (const b of [this.state, this.motors, this.obs, this.staging]) b.destroy();
+        for (const b of [this.state, this.motors, this.obs]) b.destroy();
     }
 }

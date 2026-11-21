@@ -23,9 +23,16 @@ async function probe(device: GPUDevice) {
     g.reset(Float32Array.from([0, 1, 0, 0, 2, 0]));
     g.step(3);
     const [a, b] = await Promise.all([g.read(), g.read()]);
+    g.reset(Float32Array.from([0, 1, 0, 0, 2, 0]));
+    g.setMotors(Float32Array.from([2, 2]));
+    g.step(3);
+    const early = g.readObs();
+    g.step(40);
+    const [snap, late] = await Promise.all([early, g.readObs()]);
     const refused = (f: () => void) => { try { f(); return false; } catch (e) { return e instanceof RangeError; } };
     const out = {
         concurrentReadsAgree: Array.from(a.state).join() === Array.from(b.state).join() && a.state.length === 48,
+        readIsASnapshot: [0, 1, 2, 3].some((k) => Math.abs(snap[k] - late[k]) > 1e-3),
         nanMotor: refused(() => g.setMotors(Float32Array.from([0, Number.NaN]))),
         hugeMotor: refused(() => g.setMotors(Float32Array.from([0, 1e4]))),
         nanKick: refused(() => g.reset(Float32Array.from([0, 0, 0, 0, Number.NaN, 0]))),
