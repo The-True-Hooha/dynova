@@ -87,6 +87,7 @@ class World:
         self._next_joint = 0
         self._next_group = 0
         self._next_particle = 0
+        self._next_granular = 0
         self._known_seeks = 0
         self._fatal: Optional[str] = None
 
@@ -366,14 +367,18 @@ class World:
         view = self._inst.mem()[at : at + capacity * w.FLOATS_PER_TRANSFORM * 4].view(np.float32).reshape(capacity, w.FLOATS_PER_TRANSFORM)
         return view.copy() if copy else self._inst.owned(view)
 
-    def _group(self, count: int, send) -> "ParticleGroup":
+    def _group(self, count: int, send, granular: bool = False) -> "ParticleGroup":
         if self._next_group >= w.MAX_GROUP_ID:
             raise ValueError("group id limit reached")
         if self._next_group >= w.MAX_PARTICLE_GROUPS:
             raise ValueError(f"a world holds at most {w.MAX_PARTICLE_GROUPS} particle groups")
         if self._next_particle + count > w.MAX_PARTICLES:
             raise ValueError(f"a world holds at most {w.MAX_PARTICLES} particles")
+        if granular and self._next_granular + count > w.MAX_FLUID_PARTICLES:
+            raise ValueError(f"a world holds at most {w.MAX_FLUID_PARTICLES} fluid and sand particles")
         send(self._next_group)
+        if granular:
+            self._next_granular += count
         group = ParticleGroup(self._next_group, self._next_particle, count)
         self._next_group += 1
         self._next_particle += count
@@ -428,6 +433,28 @@ class World:
         if not all(s > 1e-3 for s in size):
             raise ValueError("a soft block needs a size above 1 mm on every axis")
         return self._group(n[0] * n[1] * n[2], lambda id: self._send(w.particle_soft(id, origin, size, n, radius, inv_mass, stiffness)))
+
+    @staticmethod
+    def _check_lattice(origin: Sequence[float], n: Sequence[int], spacing: float, name: str, last: float) -> None:
+        if len(n) != 3 or not all(isinstance(k, int) and 2 <= k <= w.MAX_FLUID_SIDE for k in n):
+            raise ValueError(f"a lattice is 2..{w.MAX_FLUID_SIDE} particles along each axis, got {tuple(n)!r}")
+        if not (len(origin) == 3 and _finite(*origin) and max(abs(c) for c in origin) <= w.MAX_TELEPORT_COORD):
+            raise ValueError("the origin must be a finite 3-vector within range")
+        f32 = lambda x: float(np.float32(x)) if _finite(x) and abs(x) < 3e38 else x
+        if not (_finite(spacing) and f32(0.01) <= f32(spacing) <= 1):
+            raise ValueError(f"spacing must be within 0.01..1 m, got {spacing!r}")
+        if not (_finite(last) and 0 <= f32(last) <= 1):
+            raise ValueError(f"{name} must be within 0..1, got {last!r}")
+
+    def create_fluid(self, origin: Sequence[float], n: Sequence[int], spacing: float, *, viscosity: float = 0.02) -> "ParticleGroup":
+        """A block of water particles on a lattice. The rules of the TypeScript `createFluid`; fluid and sand share a cap of 4096 particles."""
+        self._check_lattice(origin, n, spacing, "viscosity", viscosity)
+        return self._group(n[0] * n[1] * n[2], lambda id: self._send(w.particle_fluid(id, origin, n, spacing, viscosity)), granular=True)
+
+    def create_sand(self, origin: Sequence[float], n: Sequence[int], spacing: float, *, friction: float = 0.6) -> "ParticleGroup":
+        """A block of sand grains on a lattice, with Coulomb friction in 0..1. The rules of the TypeScript `createSand`."""
+        self._check_lattice(origin, n, spacing, "friction", friction)
+        return self._group(n[0] * n[1] * n[2], lambda id: self._send(w.particle_sand(id, origin, n, spacing, friction)), granular=True)
 
     def attach_particle(self, particle: int, body: Handle, local: Sequence[float]) -> None:
         """Hold particle number `particle` (a row of `read_particles()`) on `body` at `local` in the body's frame."""

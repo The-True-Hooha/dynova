@@ -79,6 +79,8 @@ PARTICLE_CASES = {
     "chain": lambda: w.particle_chain(70000, (1, 2, 3), (-1, 2, 3.5), 300, True, True, 0.025, 2, 0.75),
     "cloth": lambda: w.particle_cloth(70000, (1, 2, 3), (2, 0, 0.5), (0, 0, 3), 64, 17, 22, 0.04, 2, 0.75, 0.25),
     "soft": lambda: w.particle_soft(70000, (1, 2, 3), (0.5, 1, 2), (4, 12, 2), 0.1, 2, 0.75),
+    "fluid": lambda: w.particle_fluid(70000, (1, 2, 3), (4, 32, 2), 0.05, 0.25),
+    "sand": lambda: w.particle_sand(70000, (1, 2, 3), (4, 32, 2), 0.05, 0.75),
     "attach": lambda: w.particle_attach(70000, 123456, 9, (0.5, -1, 2)),
     "detach": lambda: w.particle_detach(5),
 }

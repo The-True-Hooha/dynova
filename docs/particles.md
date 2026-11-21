@@ -85,15 +85,24 @@ The ring command `ParticleSand` (tag 26, logged and replayed; same slot layout a
 const rope = world.createChain({ from: [0, 5, 0], to: [2, 5, 0], count: 11, pinFirst: true });   // { id, first, count }
 const cloth = world.createCloth({ origin, u, v, nu: 21, nv: 21, pins: 0b10001 });
 const block = world.createSoftBlock({ origin, size, n: [4, 4, 4] });
+const water = world.createFluid({ origin, n: [16, 12, 16], spacing: 0.05, viscosity: 0.02 });   // 2..32 a side, spacing 0.01..1 m
+const sand = world.createSand({ origin, n: [8, 8, 8], spacing: 0.05, friction: 0.6 });          // friction 0..1
 world.attachParticle(rope.first + 10, body, [0, 0.5, 0]);
 const rows = world.readParticles();   // Float32Array [x, y, z, radius] per particle, one read, one tick
 ```
 ```python
 rope = world.create_chain((0, 5, 0), (2, 5, 0), 11, pin_first=True)
+water = world.create_fluid((0, 0.05, 0), (16, 12, 16), 0.05, viscosity=0.02)
+sand = world.create_sand((3, 0.05, 0), (8, 8, 8), 0.05, friction=0.6)
 rows = world.read_particles()         # (n, 4) float32
 ```
 
 - The read is one call over a header-announced buffer (words 41 to 43, the same sequence-word pattern as joint states): rewritten after every step and seek, empty before the first particle, never one call per particle. The header grew from 41 to 44 words, so the wasm package must be rebuilt; a stale one is refused at load.
 - `first` is predicted by the host as the sum of the sizes of the groups it has made. It is wrong if an earlier particle command was refused (counted in `malformedDropped`) a seek or a `Reset` went back before one, or a world already holds 4,096 groups or 32,768 links (the core refuses those and counts them in `malformedDropped`), so read `readParticles()` after a step if in doubt. Group ids only grow.
 - Requests are checked on the host with the same bounds as the core, so a bad one throws before anything is queued. The wire bytes of every particle command are pinned in `python/tests/golden_particles_ts.json`, written by the TypeScript ring and read by the Rust and Python tests.
+- Fluid and sand share a cap of 4,096 particles a world, checked on the host too (`at most 4096 fluid and sand particles`). A refused request never reaches the ring, so it cannot shift later groups. Spacing, viscosity and friction are judged on the f32 values the core sees (the origin and counts are judged as given). The host count, like `first`, is not rewound by a `Reset` or a seek past the creation, so it can refuse a block the core would take. Python counts are plain `int`s: numpy integers and floats such as `2.0` are refused, TypeScript accepts `2.0`.
 - Particles are not part of `Batch.render` cameras (cameras image bodies only).
+
+## Budget
+
+The step is the cost: reading rows is one copy. Measured in the browser demo (`examples/fluid.ts`, `e2e/fluid.spec.ts`): a 1.2 m basin with 3,072 water particles, a floating cube and 512 sand grains, 3,584 particles in all, median step 27 ms in Chromium and 26 ms in WebKit (p95 29 and 32 ms, ticks 450 to 600) on an arm64 laptop, which is about 7.5 microseconds a particle. A 60 fps frame (16.7 ms) therefore holds about 2,000 fluid or sand particles with nothing else running, and the 4,096 cap would cost about 31 ms (extrapolated at that rate, not measured). Ropes, cloth and soft blocks are far cheaper a particle (see their sections). Firefox and x86_64 timings were not measured.

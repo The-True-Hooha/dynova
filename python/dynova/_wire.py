@@ -37,6 +37,7 @@ TAG_TELEPORT, TAG_RECORD, TAG_SEEK, TAG_PAUSE = 8, 9, 10, 11
 TAG_JOINT_CREATE, TAG_JOINT_DESTROY, TAG_JOINT_MOTOR = 12, 13, 14
 TAG_CHECKPOINT, TAG_RESET = 18, 19
 TAG_PARTICLE_CHAIN, TAG_PARTICLE_CLOTH, TAG_PARTICLE_ATTACH, TAG_PARTICLE_DETACH, TAG_PARTICLE_SOFT = 20, 21, 22, 23, 24
+TAG_PARTICLE_FLUID, TAG_PARTICLE_SAND = 25, 26
 
 SHAPE_BOX, SHAPE_SPHERE, SHAPE_CAPSULE, SHAPE_HULL = 0, 1, 2, 3
 JOINT_BALL, JOINT_HINGE, JOINT_FIXED, JOINT_SLIDER, JOINT_DISTANCE = 0, 1, 2, 3, 4
@@ -53,6 +54,8 @@ MAX_PARTICLES = 1 << 14
 MAX_CHAIN = 1024
 MAX_CLOTH_SIDE = 64
 MAX_SOFT_SIDE = 12
+MAX_FLUID_SIDE = 32
+MAX_FLUID_PARTICLES = 4096
 MAX_GROUP_ID = 1 << 24
 MAX_PARTICLE_GROUPS = 1 << 12
 
@@ -68,9 +71,10 @@ _JOINT = struct.Struct("<BIBBBII3f3f2f2fB")
 _CHAIN = struct.Struct("<BIx3f3fHB3x3f")
 _CLOTH = struct.Struct("<BIx3f3f3fHHBx4f")
 _SOFT = struct.Struct("<BIx3f3f3B3x3f")
+_LATTICE = struct.Struct("<BIx3f3B3xff")
 _ATTACH = struct.Struct("<BIB3fI")
 assert _SPAWN.size == SLOT_BYTES
-assert (_CHAIN.size, _CLOTH.size, _SOFT.size, _ATTACH.size) == (48, 64, 48, 22)
+assert (_CHAIN.size, _CLOTH.size, _SOFT.size, _ATTACH.size, _LATTICE.size) == (48, 64, 48, 22, 32)
 
 
 def _slot(packed: bytes) -> bytes:
@@ -144,6 +148,14 @@ def particle_cloth(id: int, origin: Sequence[float], u: Sequence[float], v: Sequ
 
 def particle_soft(id: int, origin: Sequence[float], size: Sequence[float], n: Sequence[int], radius: float, inv_mass: float, stiffness: float) -> bytes:
     return _slot(_SOFT.pack(TAG_PARTICLE_SOFT, id, *origin, *size, *n, radius, inv_mass, stiffness))
+
+
+def particle_fluid(id: int, origin: Sequence[float], n: Sequence[int], spacing: float, viscosity: float) -> bytes:
+    return _slot(_LATTICE.pack(TAG_PARTICLE_FLUID, id, *origin, *n, spacing, viscosity))
+
+
+def particle_sand(id: int, origin: Sequence[float], n: Sequence[int], spacing: float, friction: float) -> bytes:
+    return _slot(_LATTICE.pack(TAG_PARTICLE_SAND, id, *origin, *n, spacing, friction))
 
 
 def particle_attach(particle: int, body: int, gen: int, local: Sequence[float]) -> bytes:

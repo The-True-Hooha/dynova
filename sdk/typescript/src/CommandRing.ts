@@ -25,11 +25,15 @@ export const TAG_PARTICLE_CLOTH = 21;
 export const TAG_PARTICLE_ATTACH = 22;
 export const TAG_PARTICLE_DETACH = 23;
 export const TAG_PARTICLE_SOFT = 24;
+export const TAG_PARTICLE_FLUID = 25;
+export const TAG_PARTICLE_SAND = 26;
 export const MAX_PARTICLES = 1 << 14;
 export const MAX_PARTICLE_LINKS = 32768;
 export const MAX_CHAIN = 1024;
 export const MAX_CLOTH_SIDE = 64;
 export const MAX_SOFT_SIDE = 12;
+export const MAX_FLUID_SIDE = 32;
+export const MAX_FLUID_PARTICLES = 4096;
 export const MAX_GROUP_ID = 1 << 24;
 export const NO_ENTITY = 0xffffffff;
 export const MAX_QUERY_RANGE = 1e6;
@@ -108,6 +112,9 @@ export type V3 = readonly [number, number, number];
 export interface ChainDesc { id: number; from: V3; to: V3; count: number; pinFirst: boolean; pinLast: boolean; radius: number; invMass: number; stiffness: number }
 export interface ClothDesc { id: number; origin: V3; u: V3; v: V3; nu: number; nv: number; pins: number; radius: number; invMass: number; stiffness: number; bendStiffness: number }
 export interface SoftDesc { id: number; origin: V3; size: V3; n: readonly [number, number, number]; radius: number; invMass: number; stiffness: number }
+/** `viscosity` of a fluid block and `friction` of a sand block share one slot field. */
+export interface FluidDesc { id: number; origin: V3; n: readonly [number, number, number]; spacing: number; viscosity: number }
+export interface SandDesc { id: number; origin: V3; n: readonly [number, number, number]; spacing: number; friction: number }
 export interface AttachDesc { particle: number; body: number; gen: number; local: V3 }
 
 export interface JointCreateDesc {
@@ -412,6 +419,26 @@ export class CommandRing {
         this.view.setFloat32(off + 36, d.radius, true);
         this.view.setFloat32(off + 40, d.invMass, true);
         this.view.setFloat32(off + 44, d.stiffness, true);
+        Atomics.add(this.tail, 0, 1);
+        return true;
+    }
+
+    particleFluid(d: FluidDesc): boolean {
+        return this.particleLattice(TAG_PARTICLE_FLUID, d.id, d.origin, d.n, d.spacing, d.viscosity);
+    }
+
+    particleSand(d: SandDesc): boolean {
+        return this.particleLattice(TAG_PARTICLE_SAND, d.id, d.origin, d.n, d.spacing, d.friction);
+    }
+
+    private particleLattice(tag: number, id: number, origin: V3, n: readonly [number, number, number], spacing: number, last: number): boolean {
+        const off = this.particleSlot(tag);
+        if (off === null) return false;
+        this.view.setUint32(off + 1, id, true);
+        this.put3(off + 6, origin);
+        n.forEach((k, i) => this.view.setUint8(off + 18 + i, Math.min(k, 255)));
+        this.view.setFloat32(off + 24, spacing, true);
+        this.view.setFloat32(off + 28, last, true);
         Atomics.add(this.tail, 0, 1);
         return true;
     }

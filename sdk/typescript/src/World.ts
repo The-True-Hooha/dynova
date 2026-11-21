@@ -1,7 +1,7 @@
 import { HEADER_WORDS, QUERY_ROW_WORDS, TransformView } from './TransformView.js';
 import { positionControl, type PositionGains } from './control.js';
 import type { RecordingState } from './TransformView.js';
-import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, JOINT_DISTANCE, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc, KIN_SAMPLES_PER_SLOT, MAX_KIN_TICKS, KinematicSample, RaycastDesc, OverlapSphereDesc, NO_ENTITY, MAX_QUERY_RANGE, MAX_PARTICLES, MAX_CHAIN, MAX_CLOTH_SIDE, MAX_SOFT_SIDE, MAX_GROUP_ID, ChainDesc, ClothDesc, SoftDesc, AttachDesc } from './CommandRing.js';
+import { CommandRing, JOINT_BALL, JOINT_HINGE, JOINT_SLIDER, JOINT_DISTANCE, MAX_ANGLE_LIMIT, MAX_JOINT_ID, MAX_LINEAR_LIMIT, MAX_MOTOR_FORCE, MAX_MOTOR_SPEED, SHAPE_HULL, HULL_VERTS_PER_SLOT, MAX_CAPACITY, MAX_HULLS, MAX_HULL_COORD, MAX_HULL_VERTS, SpawnDesc, ForceDesc, DestroyDesc, TeleportDesc, JointCreateDesc, KIN_SAMPLES_PER_SLOT, MAX_KIN_TICKS, KinematicSample, RaycastDesc, OverlapSphereDesc, NO_ENTITY, MAX_QUERY_RANGE, MAX_PARTICLES, MAX_CHAIN, MAX_CLOTH_SIDE, MAX_SOFT_SIDE, MAX_FLUID_SIDE, MAX_FLUID_PARTICLES, MAX_GROUP_ID, ChainDesc, ClothDesc, SoftDesc, FluidDesc, SandDesc, AttachDesc } from './CommandRing.js';
 import { EntityIdAllocator, EntityHandle } from './EntityIdAllocator.js';
 import type { MemoryMode } from './memory.js';
 
@@ -159,6 +159,8 @@ type Queued =
     | { k: 'chain'; d: ChainDesc }
     | { k: 'cloth'; d: ClothDesc }
     | { k: 'soft'; d: SoftDesc }
+    | { k: 'fluid'; d: FluidDesc }
+    | { k: 'sand'; d: SandDesc }
     | { k: 'attach'; d: AttachDesc }
     | { k: 'detach'; particle: number }
     | { k: 'hullVerts'; hull: number; coords: number[] }
@@ -199,6 +201,8 @@ export class World {
     private nextGroup = 0;
     /** Particles the commands sent so far would make if every one is accepted: the index the next group starts at. */
     private nextParticle = 0;
+    /** Fluid and sand particles the commands sent so far would make: the core holds at most `MAX_FLUID_PARTICLES` of them. */
+    private nextGranular = 0;
     private knownSeeks = 0;
 
     private constructor(
@@ -341,6 +345,8 @@ export class World {
             case 'chain': return this.ring.particleChain(c.d);
             case 'cloth': return this.ring.particleCloth(c.d);
             case 'soft': return this.ring.particleSoft(c.d);
+            case 'fluid': return this.ring.particleFluid(c.d);
+            case 'sand': return this.ring.particleSand(c.d);
             case 'attach': return this.ring.particleAttach(c.d);
             case 'detach': return this.ring.particleDetach(c.particle);
             case 'hullVerts': return this.ring.hullVerts(c.hull, c.coords);
@@ -596,6 +602,25 @@ export class World {
         return this.queueGroup(d.n[0] * d.n[1] * d.n[2], (id) => ({ k: 'soft', d: { id, ...d } }));
     }
 
+    /**
+     * A block of `n` water particles (2..32 per axis) on a lattice of `spacing` metres (0.01..1) from `origin`, 1000 kg/m3, with XSPH `viscosity` in [0, 1].
+     * Fluid and sand share a cap of 4096 particles a world. Fluid groups do not see each other.
+     */
+    createFluid(o: { origin: readonly [number, number, number]; n: readonly [number, number, number]; spacing: number; viscosity?: number }): ParticleGroup {
+        this.assertAlive();
+        const d = { origin: o.origin, n: o.n, spacing: o.spacing, viscosity: o.viscosity ?? 0.02 };
+        this.assertLattice(d.origin, d.n, d.spacing, 'viscosity', d.viscosity);
+        return this.queueGroup(d.n[0] * d.n[1] * d.n[2], (id) => ({ k: 'fluid', d: { id, ...d } }), true);
+    }
+
+    /** A block of sand grains, `spacing` apart and as wide, 1600 kg/m3, with Coulomb `friction` in [0, 1] (a heap stands at about `atan(friction)` or steeper). */
+    createSand(o: { origin: readonly [number, number, number]; n: readonly [number, number, number]; spacing: number; friction?: number }): ParticleGroup {
+        this.assertAlive();
+        const d = { origin: o.origin, n: o.n, spacing: o.spacing, friction: o.friction ?? 0.6 };
+        this.assertLattice(d.origin, d.n, d.spacing, 'friction', d.friction);
+        return this.queueGroup(d.n[0] * d.n[1] * d.n[2], (id) => ({ k: 'sand', d: { id, ...d } }), true);
+    }
+
     /** Hold particle `particle` (an index into `readParticles()`) on `body` at `local` in the body's frame. A particle has one attachment. */
     attachParticle(particle: number, body: EntityHandle, local: readonly [number, number, number]): void {
         this.assertAlive();
@@ -626,12 +651,22 @@ export class World {
         if (!(stiffness > 0 && stiffness <= 1)) throw new RangeError(`stiffness must be within (0, 1], got ${stiffness}`);
     }
 
-    private queueGroup(count: number, make: (id: number) => Queued): ParticleGroup {
+    private assertLattice(origin: readonly number[], n: readonly number[], spacing: number, name: string, last: number): void {
+        if (n.length !== 3) throw new RangeError('n is three counts, one per axis');
+        for (const k of n) if (!Number.isInteger(k) || k < 2 || k > MAX_FLUID_SIDE) throw new RangeError(`a lattice is 2..${MAX_FLUID_SIDE} particles along each axis, got ${k}`);
+        if (origin.length !== 3 || !origin.every((v) => Number.isFinite(v) && Math.abs(v) <= MAX_TELEPORT_COORD)) throw new RangeError('the origin must be a finite 3-vector within range');
+        if (!(Math.fround(spacing) >= Math.fround(0.01) && Math.fround(spacing) <= 1)) throw new RangeError(`spacing must be within 0.01..1 m, got ${spacing}`);
+        if (!(Math.fround(last) >= 0 && Math.fround(last) <= 1)) throw new RangeError(`${name} must be within 0..1, got ${last}`);
+    }
+
+    private queueGroup(count: number, make: (id: number) => Queued, granular = false): ParticleGroup {
         if (this.nextGroup >= MAX_GROUP_ID) throw new RangeError('group id limit reached');
         if (this.nextGroup >= MAX_PARTICLE_GROUPS) throw new RangeError(`a world holds at most ${MAX_PARTICLE_GROUPS} particle groups`);
         if (this.nextParticle + count > MAX_PARTICLES) throw new RangeError(`a world holds at most ${MAX_PARTICLES} particles`);
+        if (granular && this.nextGranular + count > MAX_FLUID_PARTICLES) throw new RangeError(`a world holds at most ${MAX_FLUID_PARTICLES} fluid and sand particles`);
         const id = this.nextGroup;
         if (!this.enqueue(make(id))) throw new Error('CommandRing full');
+        if (granular) this.nextGranular += count;
         this.nextGroup++;
         const first = this.nextParticle;
         this.nextParticle += count;

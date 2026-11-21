@@ -60,6 +60,24 @@ def test_attached_rope_follows_a_body_and_detaching_frees_it_and_a_seek_republis
         assert w.malformed_dropped == 0
 
 
+def test_water_spreads_and_sand_holds_its_block_on_the_same_floor():
+    batch, w = one()
+    with batch:
+        w.spawn(0, -0.5, 0, half=(20, 0.5, 20), inv_mass=0)
+        rope = w.create_chain((0, 5, 0), (1, 5, 0), 11, pin_first=True)
+        water = w.create_fluid((-3, 0.05, 0), (6, 6, 6), 0.05)
+        sand = w.create_sand((3, 0.05, 0), (6, 6, 6), 0.05, friction=1)
+        assert [rope, water, sand] == [ParticleGroup(0, 0, 11), ParticleGroup(1, 11, 216), ParticleGroup(2, 227, 216)]
+        for _ in range(300):
+            batch.step()
+        p = w.read_particles()
+        width = lambda g: float(np.ptp(p[g.first : g.first + g.count, 0]))
+        assert abs(p[water.first, 3] - 0.025) < 1e-6
+        assert width(water) > 0.6
+        assert width(sand) < 0.5
+        assert w.malformed_dropped == 0
+
+
 def test_seek_before_the_rope_reads_no_particles_and_after_it_the_same_rows():
     batch, w = one()
     with batch:
@@ -92,6 +110,16 @@ def test_seek_before_the_rope_reads_no_particles_and_after_it_the_same_rows():
     (lambda w: w.create_cloth((0, 0, 0), (1, 0, 0), (0, 0, 1), 4, 4, bend_stiffness=2), "bend_stiffness"),
     (lambda w: w.create_soft_block((0, 0, 0), (1, 1, 1), (13, 3, 3)), "2..12"),
     (lambda w: w.create_soft_block((0, 0, 0), (0, 1, 1), (3, 3, 3)), "size"),
+    (lambda w: w.create_fluid((0, 0, 0), (33, 4, 4), 0.05), "2..32"),
+    (lambda w: w.create_fluid((0, 0, 0), (1, 4, 4), 0.05), "2..32"),
+    (lambda w: w.create_fluid((0, 0, 0), (4, 4), 0.05), "2..32"),
+    (lambda w: w.create_fluid((0, 0, 0), (4, 4, 4), 0.009), "spacing"),
+    (lambda w: w.create_sand((0, 0, 0), (4, 4, 4), 1.5), "spacing"),
+    (lambda w: w.create_fluid((0, 0, 0), (4, 4, 4), float("nan")), "spacing"),
+    (lambda w: w.create_fluid((0, 1e7, 0), (4, 4, 4), 0.05), "origin"),
+    (lambda w: w.create_fluid((0, 0, 0), (4, 4, 4), 0.05, viscosity=1.5), "viscosity"),
+    (lambda w: w.create_sand((0, 0, 0), (4, 4, 4), 0.05, friction=-0.1), "friction"),
+    (lambda w: w.create_sand((0, 0, 0), (4, 4, 4), 0.05, friction=float("nan")), "friction"),
     (lambda w: w.attach_particle(-1, w.spawn(), (0, 0, 0)), "index"),
     (lambda w: w.attach_particle(0, w.spawn(), (float("nan"), 0, 0)), "offset"),
     (lambda w: w.detach_particle(1.5), "index"),
@@ -113,3 +141,43 @@ def test_the_particle_budget_is_checked_on_the_host():
             w.create_soft_block((0, 0, 0), (1, 1, 1), (12, 12, 7))
         with pytest.raises(ValueError, match="at most 16384"):
             w.create_soft_block((0, 0, 0), (1, 1, 1), (12, 12, 12))
+
+
+def test_fluid_and_sand_share_one_cap_checked_on_the_host():
+    batch, w = one()
+    with batch:
+        assert w.create_fluid((0, 0, 0), (32, 32, 2), 0.05).count == 2048
+        assert w.create_sand((0, 0, 0), (32, 32, 2), 0.05).first == 2048
+        base = w.pending_commands
+        for make in (w.create_fluid, w.create_sand):
+            with pytest.raises(ValueError, match="at most 4096 fluid and sand"):
+                make((0, 0, 0), (2, 2, 2), 0.05)
+        assert w.pending_commands == base
+        assert w.create_chain((0, 0, 0), (1, 0, 0), 3).first == 4096
+
+
+def test_lattice_limits_are_judged_on_the_f32_values():
+    batch, w = one()
+    with batch:
+        w.create_fluid((0, 0, 0), (2, 2, 2), 0.0099999999)
+        w.create_fluid((0, 0, 0), (2, 2, 2), 1.0000000001)
+        w.create_fluid((0, 0, 0), (2, 2, 2), 0.05, viscosity=1.0000000001)
+        w.create_sand((0, 0, 0), (2, 2, 2), 0.05, friction=1.0000000001)
+        for bad in (0.00999, 1.0001):
+            with pytest.raises(ValueError, match="spacing"):
+                w.create_fluid((0, 0, 0), (2, 2, 2), bad)
+        for _ in range(2):
+            batch.step()
+        assert w.malformed_dropped == 0
+
+
+def test_the_viscosity_and_friction_given_reach_the_ring_slot_not_a_default():
+    batch, w = one()
+    with batch:
+        sent = []
+        send = w._send
+        w._send = lambda slot: (sent.append(slot), send(slot))[1]
+        w.create_sand((0, 0, 0), (2, 2, 2), 0.05, friction=0.3)
+        w.create_fluid((0, 0, 0), (2, 2, 2), 0.05, viscosity=0.7)
+        import struct
+        assert [(s[0], struct.unpack_from("<f", s, 28)[0]) for s in sent] == [(26, pytest.approx(0.3, abs=1e-6)), (25, pytest.approx(0.7, abs=1e-6))]

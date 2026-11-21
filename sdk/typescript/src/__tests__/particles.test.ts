@@ -110,9 +110,52 @@ describe('particles through the SDK on the real wasm', () => {
         expect(() => w.attachParticle(MAX_PARTICLES, box, [0, 0, 0])).toThrow(RangeError);
         expect(() => w.attachParticle(0, box, [Number.NaN, 0, 0])).toThrow(/offset/);
         expect(() => w.detachParticle(1.5)).toThrow(RangeError);
+        const lattice = { origin: [0, 0, 0], n: [4, 4, 4], spacing: 0.05 } as const;
+        expect(() => w.createFluid({ ...lattice, n: [33, 4, 4] })).toThrow(/2\.\.32/);
+        expect(() => w.createFluid({ ...lattice, n: [1, 4, 4] })).toThrow(/2\.\.32/);
+        expect(() => w.createFluid({ ...lattice, n: [4, 4] as never })).toThrow(/three counts/);
+        expect(() => w.createFluid({ ...lattice, spacing: 0.009 })).toThrow(/spacing/);
+        expect(() => w.createSand({ ...lattice, spacing: 1.5 })).toThrow(/spacing/);
+        expect(() => w.createFluid({ ...lattice, spacing: Number.NaN })).toThrow(/spacing/);
+        expect(() => w.createFluid({ ...lattice, origin: [0, 1e7, 0] })).toThrow(/origin/);
+        expect(() => w.createFluid({ ...lattice, viscosity: 1.5 })).toThrow(/viscosity/);
+        expect(() => w.createSand({ ...lattice, friction: -0.1 })).toThrow(/friction/);
+        expect(() => w.createSand({ ...lattice, friction: Number.NaN })).toThrow(/friction/);
         expect(w.pendingCommands + w.deferredCommands).toBe(1);
         expect(w.createChain(ok).first).toBe(0);
         expect(() => { for (let i = 0; i < 20; i++) w.createSoftBlock({ origin: [0, 0, 0], size: [1, 1, 1], n: [12, 12, 12] }); }).toThrow(/at most 16384 particles/);
+    });
+
+    it('water spreads and sand holds its block on the same floor, and each group reads back where the host said it would', () => {
+        const w = world();
+        floor(w);
+        const rope = w.createChain({ from: [0, 5, 0], to: [1, 5, 0], count: 11, pinFirst: true });
+        const water = w.createFluid({ origin: [-3, 0.05, 0], n: [6, 6, 6], spacing: 0.05 });
+        const sand = w.createSand({ origin: [3, 0.05, 0], n: [6, 6, 6], spacing: 0.05, friction: 1 });
+        expect([rope, water, sand]).toEqual([{ id: 0, first: 0, count: 11 }, { id: 1, first: 11, count: 216 }, { id: 2, first: 227, count: 216 }]);
+        for (let t = 0; t < 300; t++) w.step();
+        const p = w.readParticles();
+        const width = (g: { first: number; count: number }) => {
+            let lo = Infinity, hi = -Infinity;
+            for (let i = g.first; i < g.first + g.count; i++) { lo = Math.min(lo, p[i * 4]); hi = Math.max(hi, p[i * 4]); }
+            return hi - lo;
+        };
+        expect(p[water.first * 4 + 3]).toBeCloseTo(0.025, 6);
+        expect(width(water)).toBeGreaterThan(0.6);
+        expect(width(sand)).toBeLessThan(0.5);
+        expect(w.runtimeCounters.malformedDropped).toBe(0);
+    }, 30_000);
+
+    it('the viscosity and friction given to createFluid and createSand reach the ring slot, not a default', () => {
+        const rt = new glue.Runtime(config.capacity, config.ringCapacity);
+        rt.enable_physics();
+        const layout = layoutFromRuntime(rt);
+        const w = World.attachSync(config, wasm.memory, 'fallback', layout, rt);
+        w.createSand({ origin: [0, 0, 0], n: [2, 2, 2], spacing: 0.05, friction: 0.3 });
+        w.createFluid({ origin: [0, 0, 0], n: [2, 2, 2], spacing: 0.05, viscosity: 0.7 });
+        const slot = (n: number) => new DataView(wasm.memory.buffer, layout.ringSlotsByteOffset + n * SLOT_BYTES, SLOT_BYTES);
+        expect([slot(0).getUint8(0), slot(0).getFloat32(28, true)]).toEqual([26, Math.fround(0.3)]);
+        expect([slot(1).getUint8(0), slot(1).getFloat32(28, true)]).toEqual([25, Math.fround(0.7)]);
     });
 
     it('a batch renders particles per world: each world reads its own', () => {
@@ -137,6 +180,8 @@ describe('particle commands on the wire', () => {
             ['chain', () => ring.particleChain({ id: 70000, from: [1, 2, 3], to: [-1, 2, 3.5], count: 300, pinFirst: true, pinLast: true, radius: 0.025, invMass: 2, stiffness: 0.75 })],
             ['cloth', () => ring.particleCloth({ id: 70000, origin: [1, 2, 3], u: [2, 0, 0.5], v: [0, 0, 3], nu: 64, nv: 17, pins: 22, radius: 0.04, invMass: 2, stiffness: 0.75, bendStiffness: 0.25 })],
             ['soft', () => ring.particleSoft({ id: 70000, origin: [1, 2, 3], size: [0.5, 1, 2], n: [4, 12, 2], radius: 0.1, invMass: 2, stiffness: 0.75 })],
+            ['fluid', () => ring.particleFluid({ id: 70000, origin: [1, 2, 3], n: [4, 32, 2], spacing: 0.05, viscosity: 0.25 })],
+            ['sand', () => ring.particleSand({ id: 70000, origin: [1, 2, 3], n: [4, 32, 2], spacing: 0.05, friction: 0.75 })],
             ['attach', () => ring.particleAttach({ particle: 70000, body: 123456, gen: 9, local: [0.5, -1, 2] })],
             ['detach', () => ring.particleDetach(5)],
         ];
@@ -150,6 +195,31 @@ describe('particle commands on the wire', () => {
 });
 
 describe('host checks judge what the core will see', () => {
+    it('fluid and sand share one cap of 4096 particles, judged before anything is queued', () => {
+        const w = world();
+        const half = { origin: [0, 0, 0], n: [32, 32, 2], spacing: 0.05 } as const;
+        expect(w.createFluid(half).count).toBe(2048);
+        expect(w.createSand(half).first).toBe(2048);
+        const queued = w.pendingCommands;
+        expect(() => w.createFluid({ origin: [0, 0, 0], n: [2, 2, 2], spacing: 0.05 })).toThrow(/at most 4096 fluid and sand/);
+        expect(() => w.createSand({ origin: [0, 0, 0], n: [2, 2, 2], spacing: 0.05 })).toThrow(/at most 4096 fluid and sand/);
+        expect(w.pendingCommands).toBe(queued);
+        expect(w.createChain({ from: [0, 0, 0], to: [1, 0, 0], count: 3 }).first).toBe(4096);
+    });
+
+    it('judges lattice limits on the f32 values: a spacing that rounds onto a bound passes, one past it does not', () => {
+        const w = world();
+        const lattice = { origin: [0, 0, 0], n: [2, 2, 2] } as const;
+        expect(() => w.createFluid({ ...lattice, spacing: 0.0099999999 })).not.toThrow();
+        expect(() => w.createFluid({ ...lattice, spacing: 1.0000000001 })).not.toThrow();
+        expect(() => w.createFluid({ ...lattice, spacing: 0.05, viscosity: 1.0000000001 })).not.toThrow();
+        expect(() => w.createSand({ ...lattice, spacing: 0.05, friction: 1.0000000001 })).not.toThrow();
+        expect(() => w.createFluid({ ...lattice, spacing: 0.00999 })).toThrow(/spacing/);
+        expect(() => w.createFluid({ ...lattice, spacing: 1.0001 })).toThrow(/spacing/);
+        for (let t = 0; t < 2; t++) w.step();
+        expect(w.runtimeCounters.malformedDropped).toBe(0);
+    });
+
     it('refuses what rounds to nothing in f32, wrong-length vectors and a 4097th group, before queueing', () => {
         const w = world();
         expect(() => w.createChain({ from: [500000, 0, 0], to: [500000.001, 0, 0], count: 3 })).toThrow(/apart/);

@@ -1353,13 +1353,15 @@ mod tests {
             std::array::from_fn(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
         };
         let mut ring = CommandRing::new(8);
-        for name in ["chain", "cloth", "soft", "attach", "detach"] {
+        for name in ["chain", "cloth", "soft", "fluid", "sand", "attach", "detach"] {
             raw_slot(&mut ring, |b| *b = slot(name));
         }
         let want = [
             Command::ParticleChain { id: 70_000, desc: ChainDesc { from: [1.0, 2.0, 3.0], to: [-1.0, 2.0, 3.5], count: 300, pin_first: true, pin_last: true, radius: 0.025, inv_mass: 2.0, stiffness: 0.75 } },
             Command::ParticleCloth { id: 70_000, desc: ClothDesc { origin: [1.0, 2.0, 3.0], u: [2.0, 0.0, 0.5], v: [0.0, 0.0, 3.0], nu: 64, nv: 17, pins: 22, radius: 0.04, inv_mass: 2.0, stiffness: 0.75, bend_stiffness: 0.25 } },
             Command::ParticleSoft { id: 70_000, desc: SoftDesc { origin: [1.0, 2.0, 3.0], size: [0.5, 1.0, 2.0], n: [4, 12, 2], radius: 0.1, inv_mass: 2.0, stiffness: 0.75 } },
+            Command::ParticleFluid { id: 70_000, desc: FluidDesc { origin: [1.0, 2.0, 3.0], n: [4, 32, 2], spacing: 0.05, viscosity: 0.25 } },
+            Command::ParticleSand { id: 70_000, desc: SandDesc { origin: [1.0, 2.0, 3.0], n: [4, 32, 2], spacing: 0.05, friction: 0.75 } },
             Command::ParticleAttach { particle: 70_000, body: 123_456, generation: 9, local: [0.5, -1.0, 2.0] },
             Command::ParticleDetach { particle: 5 },
         ];
@@ -1368,7 +1370,7 @@ mod tests {
         for c in &want {
             let mut b = [0u8; SLOT_BYTES];
             encode_slot(c, &mut b);
-            let name = match c { Command::ParticleChain { .. } => "chain", Command::ParticleCloth { .. } => "cloth", Command::ParticleSoft { .. } => "soft", Command::ParticleAttach { .. } => "attach", _ => "detach" };
+            let name = match c { Command::ParticleChain { .. } => "chain", Command::ParticleCloth { .. } => "cloth", Command::ParticleSoft { .. } => "soft", Command::ParticleFluid { .. } => "fluid", Command::ParticleSand { .. } => "sand", Command::ParticleAttach { .. } => "attach", _ => "detach" };
             assert_eq!(b, slot(name), "Rust encodes {name} to the same bytes");
         }
     }
