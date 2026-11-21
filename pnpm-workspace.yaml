@@ -3,4 +3,5 @@ packages:
   - "renderer/three"
   - "renderer/canvas2d"
   - "inspector"
+  - "gpu"
   - "examples"

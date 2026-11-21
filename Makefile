@@ -30,6 +30,7 @@ test:
 	pnpm --filter @dynova/three test
 	pnpm --filter @dynova/canvas2d test
 	pnpm --filter @dynova/inspector test
+	pnpm --filter @dynova/gpu test
 
 # Watch mode for tests
 test-watch:
@@ -41,6 +42,7 @@ check:
 	pnpm --filter @dynova/three typecheck
 	pnpm --filter @dynova/canvas2d typecheck
 	pnpm --filter @dynova/inspector typecheck
+	pnpm --filter @dynova/gpu typecheck
 
 # Full rebuild from scratch: release WASM + install deps
 all: build-release build-st install

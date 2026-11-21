@@ -39,6 +39,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@dynova/sdk": resolve(__dirname, "../sdk/typescript/src/index.ts"),
+      "@dynova/gpu": resolve(__dirname, "../gpu/src/index.ts"),
       "@dynova/inspector": resolve(__dirname, "../inspector/src/index.ts"),
       "@dynova/canvas2d": resolve(__dirname, "../renderer/canvas2d/src/index.ts"),
       "@dynova/three/loaders": resolve(__dirname, "../renderer/three/src/loaders.ts"),
