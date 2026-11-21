@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Dynova assembly</title>
+  <style>
+    body { margin: 0; background: #11141a; color: #d8dee9; font: 13px system-ui, sans-serif; }
+    canvas { display: block; margin: 12px; background: #1b1f27; border: 1px solid #333b4a; border-radius: 6px; }
+    #note { padding: 8px 12px 0; color: #7d8799; }
+    #status { padding: 0 12px; font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <div id="note">A crank, a connecting rod and a slider built from named parts and mates (revolute, distance, slider). ?offset=500000 moves the whole model that far from the origin; ?float=0 turns the assembly's floating origin off, so the runtime sees the raw coordinates.</div>
+  <div id="status"></div>
+  <canvas id="view" width="760" height="300"></canvas>
+  <script type="module" src="./assembly.ts"></script>
+</body>
+</html>

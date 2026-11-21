@@ -6,6 +6,8 @@ export interface MemoryResult {
 }
 
 export function detectMode(): MemoryMode {
+    // Browsers hide SharedArrayBuffer on non-isolated pages, so isolation must be checked before its presence.
+    if (typeof crossOriginIsolated !== 'undefined' && !crossOriginIsolated) return 'headers-missing';
     if (typeof SharedArrayBuffer === 'undefined') return 'fallback';
     try {
         new SharedArrayBuffer(4);

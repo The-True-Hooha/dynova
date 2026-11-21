@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dynova"
+version = "0.1.0"
+description = "Dynova: a deterministic rigid-body simulation runtime, driven from Python. Runs the same WebAssembly module as the browser."
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.24", "wasmtime>=25"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["dynova", "dynova.envs"]
+
+[tool.setuptools.package-data]
+dynova = ["_data/*.wasm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -3,4 +3,15 @@ node_modules/
 */node_modules/
 dist/
 pkg/
-sdk-typescript/wasm/
+sdk/typescript/wasm/
+sdk/typescript/wasm-st/
+test-results/
+playwright-report/
+NOT_VERIFIED.txt
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+python/build/
+python/dynova/_data/
+python/dist/

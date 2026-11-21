@@ -7,7 +7,12 @@
     "build": "vite build"
   },
   "dependencies": {
-    "@dynova/sdk": "workspace:*"
+    "@dynova/sdk": "workspace:*",
+    "@dynova/three": "workspace:*",
+    "three": "^0.170.0",
+    "@dynova/canvas2d": "workspace:*",
+    "@dynova/inspector": "workspace:*",
+    "@dynova/gpu": "workspace:*"
   },
   "devDependencies": {
     "vite": "^8.1.3"

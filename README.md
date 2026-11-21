@@ -52,12 +52,17 @@ Renderer Adapter (pure function: buffer -> draw calls, no entity knowledge)
 
 ```
 dynova/
-  core/              # Rust: ECS, scheduler, broadphase, solver, buffers
-  sdk/typescript/    # World, EntityId handles, command queue, buffer views
-  renderer/three/    # v1 Three.js adapter
-  inspector/         # Developer tooling
-  examples/          # Runnable demos
+  core/              # Rust: runtime, command ring, triple buffer, broadphase, solver, collision
+  sdk/typescript/    # World, handles, command ring, buffer views, launchWorld, sim worker
+  renderer/three/    # Three.js instanced adapter and scene-to-collider helpers
+  renderer/canvas2d/ # Canvas2D adapter (second renderer, proves the adapter contract)
+  examples/          # Runnable demos and e2e pages
+  e2e/               # Playwright cross-browser tests
+  inspector/         # Inspector panel with optional editing and timeline (@dynova/inspector)
+  docs/              # Hosting notes, adapter contract (Three.js and Canvas2D), scene colliders, inspector, replay, benchmark, joints, digital twin, sensors, robotics, assemblies, assembly import
 ```
+
+The four packages build to ESM with type declarations (`make package`) and install into an app outside the repo from packed tarballs; they are not published to npm. See [docs/packaging.md](./docs/packaging.md) and the package READMEs.
 
 ---
 
@@ -75,7 +80,7 @@ dynova/
 make install
 ```
 
-**Build WASM + run examples**
+**Build WASM + run examples** (to use the packages in your own app instead, see [docs/packaging.md](./docs/packaging.md))
 
 ```bash
 make build-release
@@ -96,6 +101,8 @@ Open `http://localhost:5173`.
 | `make dev` | Start examples dev server |
 | `make test` | Run SDK unit tests |
 | `make check` | TypeScript typecheck |
+| `make build-st` | Build the single-threaded WASM used by the non-SharedArrayBuffer fallback |
+| `make e2e` | Cross-browser Playwright tests (builds both WASM variants first) |
 | `make all` | Release WASM build + install |
 | `make clean` | Wipe build artifacts |
 
@@ -114,4 +121,12 @@ Open `http://localhost:5173`.
 
 ## Status
 
-Currently in **Phase 1 — Stage 1A** (boundary mechanics). The command ring → Rust drain → transform buffer → JS read path is working. See [ROADMAP.md](./ROADMAP.md) for the full implementation plan.
+Phases 1, 2 and 3 are complete: shared-memory worker runtime with a sync fallback, lock-free triple-buffered transforms with growth, bounded command backpressure, and a physics core (spheres, boxes, capsules, convex hulls, friction, warm starting, island sleeping, swept CCD). Phase 3 Stage 3A is done (Three.js instanced adapter, scene-graph-to-collider fitting, model loading (glTF with Draco/Meshopt, multi-file `.gltf`, OBJ, STL, PLY), convex hulls); Stage 3B is done (shared decode contract in the SDK, Canvas2D adapter, runtime swap demo at `/swap.html`; see [docs/adapter-contract.md](./docs/adapter-contract.md)). Phase 5 Stage 5A is done (decision docs in [docs/decisions](./docs/decisions): no BVH, grid fixes instead; f32 determinism holds on native aarch64 and x86_64, Chromium and WebKit, so no fixed-point migration). Phase 4 is done: Stage 4A (read-only inspector, `/inspector.html`; see [docs/inspector.md](./docs/inspector.md)) and Stage 4B (drag to reposition, recording, seek and replay scrubbing; see [docs/replay.md](./docs/replay.md)). Phase 6 (joints, see [docs/joints.md](./docs/joints.md)) is done. Phase 9 (CAD): [docs/assembly-import.md](./docs/assembly-import.md) reads an assembly from a glTF file (`/assemblyImport.html`), and 9A (assemblies: mates, a distance joint and a floating origin for far-from-origin models, [docs/assemblies.md](./docs/assemblies.md), `/assembly.html`) is done. Phase 8 (robotics: sensor queries in [docs/sensors.md](./docs/sensors.md), controllers and the demos at `/robot.html` in [docs/robotics.md](./docs/robotics.md)) is done with the solver limits listed there. Phase 7 (digital twin: kinematic bodies fed by telemetry, `/telemetry.html`; see [docs/digital-twin.md](./docs/digital-twin.md)) is done (60 fps at 5000 entities with drawing and overlay, measured headless in Chromium and WebKit). Run `make dev` and open `/gltf.html` (drop your own model files on it) or `/stage3a.html?live=1`. See [ROADMAP.md](./ROADMAP.md) and [PLAN.md](./PLAN.md).
+
+Known limits: a single column of unit boxes buckles above about 20 high; dynamic-vs-dynamic CCD is not implemented; Firefox is configured in Playwright but was not verified in the development sandbox. A solver golden hash (single-threaded build) matches the native build in Chromium and WebKit; a sin/cos/atan2/sqrt probe also matches; a run on the shared (threaded) build is not done. The 30-body stress scene has no joints (bodies are contained by static walls).
+
+---
+
+## Licence and contributing
+
+MIT (see [LICENSE](./LICENSE)): use it, fork it, reproduce it, sell it. Contributions are welcome under the same licence; see [CONTRIBUTING.md](./CONTRIBUTING.md) for the setup, the checks and the house rules.

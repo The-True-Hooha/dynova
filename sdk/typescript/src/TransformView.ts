@@ -1,40 +1,320 @@
 export const FLOATS_PER_TRANSFORM = 7;
 
-export class TransformView {
-    private a: Float32Array;
-    private b: Float32Array;
-    private flag: Int32Array;
+export const H_EPOCH = 0;
+export const H_CAPACITY = 1;
+export const H_BUF0 = 2;
+export const H_STATE = 5;
+export const H_GENERATIONS = 6;
+export const H_TICKS = 7;
+export const H_STALE = 8;
+export const H_MALFORMED = 9;
+export const H_BUCKETS = 10;
+export const H_BUCKET_LEN = 11;
+export const H_RING_PENDING = 12;
+export const H_DROPPED_CONTACTS = 13;
+export const H_OVERRUNS = 14;
+export const H_CONTACTS = 15;
+export const H_INSPECT_SEQ = 16;
+export const H_INSPECT_BODIES = 17;
+export const H_INSPECT_CONTACTS = 18;
+export const H_INSPECT_CONTACT_N = 19;
+export const H_STEP_LAST_US = 20;
+export const H_STEP_TOTAL_US = 21;
+export const H_INSPECT_TICK = 22;
+export const H_INSPECT_ON = 23;
+export const H_REC_ON = 24;
+export const H_REC_START = 25;
+export const H_REC_END = 26;
+export const H_HASH_LO = 27;
+export const H_HASH_HI = 28;
+export const H_KEYFRAMES = 29;
+export const H_PAUSED = 30;
+export const H_SEEKS = 31;
+export const H_LIVE = 32;
+export const H_REC_SEQ = 33;
+export const H_INSPECT_JOINTS = 34;
+export const H_INSPECT_JOINT_N = 35;
+export const H_QUERY_ROWS = 36;
+export const H_QUERY_HEAD = 37;
+export const H_JSTATE_SEQ = 38;
+export const H_JSTATE_ROWS = 39;
+export const H_JSTATE_N = 40;
+export const H_PSTATE_SEQ = 41;
+export const H_PSTATE_ROWS = 42;
+export const H_PSTATE_N = 43;
+export const PSTATE_ROW_WORDS = 4;
+export const HEADER_WORDS = 44;
 
-    constructor(memory: WebAssembly.Memory, aByteOffset: number, bByteOffset: number, flagByteOffset: number, capacity: number) {
-        const len = capacity * FLOATS_PER_TRANSFORM;
-        this.a = new Float32Array(memory.buffer, aByteOffset, len);
-        this.b = new Float32Array(memory.buffer, bByteOffset, len);
-        this.flag = new Int32Array(memory.buffer, flagByteOffset, 1);
+export const JSTATE_ROW_WORDS = 4;
+export const QUERY_ROW_WORDS = 10;
+export const QUERY_ROWS = 4096;
+
+const MAX_SPINS = 5_000_000;
+const NEW_FLAG = 0b100;
+const READER_SHIFT = 3;
+
+/** Recording and replay state the runtime publishes while a `Record` command is active. */
+export interface RecordingState {
+    on: boolean;
+    paused: boolean;
+    /** Tick the world is at. */
+    tick: number;
+    /** First and last tick a `Seek` can reach. */
+    start: number;
+    end: number;
+    keyframes: number;
+    /** State hash of the world now (see `TransformView.recording`); equal hashes mean bit-identical simulation state. */
+    hash: bigint;
+    /** Counts successful seeks. */
+    seeks: number;
+}
+
+const RECORDING_ATTEMPTS = 8;
+
+export class TransformView {
+    private header: Int32Array;
+    private bufs: Float32Array[] = [];
+    private memory: WebAssembly.Memory;
+    private headerByteOffset: number;
+    private _epoch = -1;
+    private _capacity = 0;
+
+    constructor(memory: WebAssembly.Memory, headerByteOffset: number) {
+        this.memory = memory;
+        this.headerByteOffset = headerByteOffset;
+        this.header = new Int32Array(memory.buffer, headerByteOffset, HEADER_WORDS);
+        this.reacquire();
     }
 
+    get epoch(): number { return this._epoch; }
+    get capacity(): number { return this._capacity; }
+
+    // Any wasm allocation can grow memory and detach every view onto the old buffer, not only an explicit Grow command.
+    private live(): void {
+        if (this.header.buffer !== this.memory.buffer) this.reacquire();
+    }
+
+    /** Called by whoever owns the clock and drives `step()`; the runtime itself cannot time anything on wasm. */
+    recordStep(micros: number): void {
+        this.live();
+        const us = Number.isFinite(micros) ? Math.max(0, Math.min(0x7fffffff, Math.round(micros))) : 0;
+        Atomics.store(this.header, H_STEP_LAST_US, us);
+        Atomics.add(this.header, H_STEP_TOTAL_US, us);
+    }
+
+    stats(): { ringPending: number; droppedContacts: number; workerOverruns: number; contacts: number } {
+        this.live();
+        return {
+            ringPending: Atomics.load(this.header, H_RING_PENDING) >>> 0,
+            droppedContacts: Atomics.load(this.header, H_DROPPED_CONTACTS) >>> 0,
+            workerOverruns: Atomics.load(this.header, H_OVERRUNS) >>> 0,
+            contacts: Atomics.load(this.header, H_CONTACTS) >>> 0,
+        };
+    }
+
+    /** Copy of the occupancy histogram; the runtime frees and reallocates it when capacity grows, so a live view could go stale. */
+    bucketCounts(): Uint32Array {
+        this.live();
+        for (let spins = 0; ; spins++) {
+            if (spins > MAX_SPINS) throw new Error('layout update stuck: the runtime never finished growing its buffers');
+            const e = Atomics.load(this.header, H_EPOCH);
+            if (e & 1) continue;
+            const view = new Uint32Array(this.memory.buffer, Atomics.load(this.header, H_BUCKETS), Atomics.load(this.header, H_BUCKET_LEN));
+            const copy = view.slice();
+            if (Atomics.load(this.header, H_EPOCH) === e) return copy;
+        }
+    }
+
+    /**
+     * Recording state read under the runtime's seqlock, or null when the runtime kept rewriting it through every
+     * attempt. `hash` describes the world as it is now: a command applied while paused changes it without changing `tick`,
+     * and it equals the hash after `Seek(tick)` only while no such command is pending.
+     */
+    recording(): RecordingState | null {
+        this.live();
+        for (let attempt = 0; attempt < RECORDING_ATTEMPTS; attempt++) {
+            const seq = Atomics.load(this.header, H_REC_SEQ);
+            if (seq & 1) continue;
+            const w = (i: number) => Atomics.load(this.header, i) >>> 0;
+            const state: RecordingState = {
+                on: w(H_REC_ON) === 1,
+                paused: w(H_PAUSED) === 1,
+                tick: w(H_TICKS),
+                start: w(H_REC_START),
+                end: w(H_REC_END),
+                keyframes: w(H_KEYFRAMES),
+                hash: BigInt(w(H_HASH_LO)) | (BigInt(w(H_HASH_HI)) << 32n),
+                seeks: w(H_SEEKS),
+            };
+            if (Atomics.load(this.header, H_REC_SEQ) === seq) return state;
+        }
+        return null;
+    }
+
+    /**
+     * `[joint id, kind, coordinate, rate]` rows of every hinge, slider and distance joint as of the last tick the runtime published, copied inside the
+     * runtime's sequence word so they all belong to one tick. Empty while no hinge or slider exists.
+     */
+    jointStates(): Array<{ id: number; kind: number; position: number; velocity: number }> {
+        for (let attempt = 0; attempt < RECORDING_ATTEMPTS; attempt++) {
+            this.live();
+            const seq = Atomics.load(this.header, H_JSTATE_SEQ);
+            if (seq & 1) continue;
+            const ptr = Atomics.load(this.header, H_JSTATE_ROWS) >>> 0;
+            const n = Atomics.load(this.header, H_JSTATE_N) >>> 0;
+            if (ptr === 0 || n === 0) {
+                if (Atomics.load(this.header, H_JSTATE_SEQ) === seq) return [];
+                continue;
+            }
+            const words = new Uint32Array(this.memory.buffer, ptr, n * JSTATE_ROW_WORDS).slice();
+            if (Atomics.load(this.header, H_JSTATE_SEQ) !== seq) continue;
+            const f = new Float32Array(words.buffer);
+            const rows = [];
+            for (let r = 0; r < n; r++) rows.push({ id: words[r * 4], kind: words[r * 4 + 1], position: f[r * 4 + 2], velocity: f[r * 4 + 3] });
+            return rows;
+        }
+        throw new Error('joint states kept changing while they were read');
+    }
+
+    /**
+     * `[x, y, z, radius]` of every particle as of the last tick the runtime published, in the order the particles were made, copied inside the runtime's sequence
+     * word so they all belong to one tick. Empty while no particle exists. One call reads them all (no per-particle call).
+     */
+    particles(): Float32Array {
+        for (let attempt = 0; attempt < RECORDING_ATTEMPTS; attempt++) {
+            this.live();
+            const seq = Atomics.load(this.header, H_PSTATE_SEQ);
+            if (seq & 1) continue;
+            const ptr = Atomics.load(this.header, H_PSTATE_ROWS) >>> 0;
+            const n = Atomics.load(this.header, H_PSTATE_N) >>> 0;
+            if (ptr === 0 || n === 0) {
+                if (Atomics.load(this.header, H_PSTATE_SEQ) === seq) return new Float32Array(0);
+                continue;
+            }
+            const rows = new Float32Array(this.memory.buffer, ptr, n * PSTATE_ROW_WORDS).slice();
+            if (Atomics.load(this.header, H_PSTATE_SEQ) !== seq) continue;
+            return rows;
+        }
+        throw new Error('particle rows kept changing while they were read');
+    }
+
+    /**
+     * Rows the runtime wrote to the query result buffer since row number `from` (a running count that wraps at 2^32). Never more than
+     * `QUERY_ROWS - 1` come back (the slot the runtime writes next still holds the oldest row): when the reader fell further behind than the buffer holds, `lost` counts the rows that were overwritten.
+     */
+    queryRows(from: number): { rows: Uint32Array; next: number; lost: number } {
+        this.live();
+        for (let attempt = 0; attempt < RECORDING_ATTEMPTS; attempt++) {
+            const ptr = Atomics.load(this.header, H_QUERY_ROWS) >>> 0;
+            const head = Atomics.load(this.header, H_QUERY_HEAD) >>> 0;
+            if (ptr === 0 || head === from) return { rows: new Uint32Array(0), next: head, lost: 0 };
+            const behind = (head - from) >>> 0;
+            const lost = Math.max(0, behind - (QUERY_ROWS - 1));
+            const first = (from + lost) >>> 0;
+            const count = behind - lost;
+            const rows = new Uint32Array(count * QUERY_ROW_WORDS);
+            const view = new Uint32Array(this.memory.buffer, ptr, QUERY_ROWS * QUERY_ROW_WORDS);
+            for (let n = 0; n < count; n++) {
+                const at = ((first + n) % QUERY_ROWS) * QUERY_ROW_WORDS;
+                rows.set(view.subarray(at, at + QUERY_ROW_WORDS), n * QUERY_ROW_WORDS);
+            }
+            // The runtime writes row `after` into the slot of row `after - QUERY_ROWS` before it announces it, so that older row is
+            // already suspect: the copy is whole only if it started strictly newer.
+            const after = Atomics.load(this.header, H_QUERY_HEAD) >>> 0;
+            if (((after - first) >>> 0) < QUERY_ROWS) return { rows, next: head, lost };
+        }
+        throw new Error('query results kept being overwritten while they were read');
+    }
+
+    /**
+     * Copies of the runtime's per-slot generation and liveness bytes, for rebuilding the id allocator after a seek.
+     * Retries across a buffer growth, which moves both arrays.
+     */
+    slotTables(): { generations: Uint8Array; live: Uint8Array } {
+        this.live();
+        for (let spins = 0; ; spins++) {
+            if (spins > MAX_SPINS) throw new Error('layout update stuck: the runtime never finished growing its buffers');
+            const e = Atomics.load(this.header, H_EPOCH);
+            if (e & 1) continue;
+            const capacity = Atomics.load(this.header, H_CAPACITY);
+            const generations = new Uint8Array(this.memory.buffer, Atomics.load(this.header, H_GENERATIONS), capacity).slice();
+            const live = new Uint8Array(this.memory.buffer, Atomics.load(this.header, H_LIVE), capacity).slice();
+            if (Atomics.load(this.header, H_EPOCH) === e) return { generations, live };
+        }
+    }
+
+    /** Number of successful seeks so far; a change means the runtime rewrote which entities exist. */
+    seekCount(): number {
+        this.live();
+        return Atomics.load(this.header, H_SEEKS) >>> 0;
+    }
+
+    counters(): { ticks: number; staleDropped: number; malformedDropped: number } {
+        this.live();
+        return {
+            ticks: Atomics.load(this.header, H_TICKS) >>> 0,
+            staleDropped: Atomics.load(this.header, H_STALE) >>> 0,
+            malformedDropped: Atomics.load(this.header, H_MALFORMED) >>> 0,
+        };
+    }
+
+    /**
+     * Epoch the writer has published; differs from `epoch` when buffers were reallocated. The epoch is a
+     * seqlock: odd while the runtime rewrites the layout, even when stable. Growth number = epoch / 2.
+     */
+    peekEpoch(): number {
+        this.live();
+        return Atomics.load(this.header, H_EPOCH);
+    }
+
+    reacquire(): void {
+        for (let spins = 0; ; spins++) {
+            if (spins > MAX_SPINS) throw new Error('layout update stuck: the runtime never finished growing its buffers');
+            this.header = new Int32Array(this.memory.buffer, this.headerByteOffset, HEADER_WORDS);
+            const epoch = Atomics.load(this.header, H_EPOCH);
+            if (epoch & 1) continue;
+            const capacity = Atomics.load(this.header, H_CAPACITY);
+            const len = capacity * FLOATS_PER_TRANSFORM;
+            const bufs = [0, 1, 2].map(
+                (i) => new Float32Array(this.memory.buffer, Atomics.load(this.header, H_BUF0 + i), len),
+            );
+            if (Atomics.load(this.header, H_EPOCH) !== epoch) continue;
+            this.bufs = bufs;
+            this._epoch = epoch;
+            this._capacity = capacity;
+            return;
+        }
+    }
+
+    private acquire(): number {
+        for (;;) {
+            const cur = Atomics.load(this.header, H_STATE);
+            if ((cur & NEW_FLAG) === 0) return (cur >> READER_SHIFT) & 3;
+            const next = ((cur >> READER_SHIFT) & 3) | ((cur & 3) << READER_SHIFT);
+            if (Atomics.compareExchange(this.header, H_STATE, cur, next) === cur) return (next >> READER_SHIFT) & 3;
+        }
+    }
+
+    /**
+     * Latest published frame. Single consumer: the returned array is valid until the next `read()`,
+     * after which the writer may reuse it, and until at most two buffer growths have happened.
+     * Never returns a half-written frame to that consumer.
+     */
     read(): Float32Array {
-        const writing = Atomics.load(this.flag, 0);
-        return writing === 0 ? this.b : this.a;
+        this.live();
+        for (let spins = 0; ; spins++) {
+            if (spins > MAX_SPINS) throw new Error('layout update stuck: the runtime never finished growing its buffers');
+            const e = Atomics.load(this.header, H_EPOCH);
+            if (e & 1) continue;
+            if (e !== this._epoch) this.reacquire();
+            const idx = this.acquire();
+            if (Atomics.load(this.header, H_EPOCH) === this._epoch) return this.bufs[idx];
+        }
     }
 
     readEntity(entityId: number): { x: number; y: number; z: number; qx: number; qy: number; qz: number; qw: number } {
         const buf = this.read();
         const o = entityId * FLOATS_PER_TRANSFORM;
-        return {
-            x:  buf[o],
-            y:  buf[o + 1],
-            z:  buf[o + 2],
-            qx: buf[o + 3],
-            qy: buf[o + 4],
-            qz: buf[o + 5],
-            qw: buf[o + 6],
-        };
-    }
-
-    reacquire(memory: WebAssembly.Memory, aByteOffset: number, bByteOffset: number, flagByteOffset: number, capacity: number): void {
-        const len = capacity * FLOATS_PER_TRANSFORM;
-        this.a = new Float32Array(memory.buffer, aByteOffset, len);
-        this.b = new Float32Array(memory.buffer, bByteOffset, len);
-        this.flag = new Int32Array(memory.buffer, flagByteOffset, 1);
+        return { x: buf[o], y: buf[o + 1], z: buf[o + 2], qx: buf[o + 3], qy: buf[o + 4], qz: buf[o + 5], qw: buf[o + 6] };
     }
 }

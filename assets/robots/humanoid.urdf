@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<!-- Dynova humanoid. Authored for this repository; released under CC0 1.0. Z up, X forward, Y left. The zero pose is standing with straight legs and arms down. -->
+<robot name="humanoid">
+  <link name="pelvis"><inertial><mass value="6"/></inertial><collision><geometry><box size="0.18 0.30 0.12"/></geometry></collision></link>
+  <link name="torso"><inertial><mass value="10"/></inertial><collision><origin xyz="0 0 0.2"/><geometry><box size="0.20 0.32 0.40"/></geometry></collision></link>
+  <link name="head"><inertial><mass value="3"/></inertial><collision><origin xyz="0 0 0.1"/><geometry><sphere radius="0.10"/></geometry></collision></link>
+  <joint name="spine" type="fixed"><parent link="pelvis"/><child link="torso"/><origin xyz="0 0 0.06"/></joint>
+  <joint name="neck" type="fixed"><parent link="torso"/><child link="head"/><origin xyz="0 0 0.42"/></joint>
+  <link name="l_hip"><inertial><mass value="1"/></inertial><collision><geometry><box size="0.06 0.06 0.06"/></geometry></collision></link>
+  <link name="l_thigh"><inertial><mass value="3"/></inertial><collision><origin xyz="0 0 -0.2"/><geometry><capsule radius="0.06" length="0.40"/></geometry></collision></link>
+  <link name="l_shank"><inertial><mass value="2"/></inertial><collision><origin xyz="0 0 -0.2"/><geometry><capsule radius="0.05" length="0.40"/></geometry></collision></link>
+  <link name="l_foot"><inertial><mass value="1"/></inertial><collision><origin xyz="0.04 0 -0.025"/><geometry><box size="0.24 0.12 0.05"/></geometry></collision></link>
+  <joint name="l_hip_roll" type="revolute"><parent link="pelvis"/><child link="l_hip"/><origin xyz="0 0.1 -0.06"/><axis xyz="1 0 0"/><limit lower="-0.4" upper="0.4" effort="150" velocity="10"/></joint>
+  <joint name="l_hip_pitch" type="revolute"><parent link="l_hip"/><child link="l_thigh"/><origin xyz="0 0 -0.03"/><axis xyz="0 1 0"/><limit lower="-1.2" upper="1.2" effort="150" velocity="10"/></joint>
+  <joint name="l_knee" type="revolute"><parent link="l_thigh"/><child link="l_shank"/><origin xyz="0 0 -0.4"/><axis xyz="0 1 0"/><limit lower="-0.05" upper="2.0" effort="150" velocity="10"/></joint>
+  <joint name="l_ankle" type="revolute"><parent link="l_shank"/><child link="l_foot"/><origin xyz="0 0 -0.4"/><axis xyz="0 1 0"/><limit lower="-0.6" upper="0.6" effort="150" velocity="10"/></joint>
+  <link name="l_upper_arm"><inertial><mass value="1.2"/></inertial><collision><origin xyz="0 0 -0.15"/><geometry><capsule radius="0.045" length="0.30"/></geometry></collision></link>
+  <link name="l_forearm"><inertial><mass value="0.8"/></inertial><collision><origin xyz="0 0 -0.14"/><geometry><capsule radius="0.04" length="0.28"/></geometry></collision></link>
+  <joint name="l_shoulder" type="revolute"><parent link="torso"/><child link="l_upper_arm"/><origin xyz="0 0.22 0.34"/><axis xyz="0 1 0"/><limit lower="-1.5" upper="1.5" effort="150" velocity="10"/></joint>
+  <joint name="l_elbow" type="revolute"><parent link="l_upper_arm"/><child link="l_forearm"/><origin xyz="0 0 -0.3"/><axis xyz="0 1 0"/><limit lower="-0.05" upper="2.0" effort="150" velocity="10"/></joint>
+  <link name="r_hip"><inertial><mass value="1"/></inertial><collision><geometry><box size="0.06 0.06 0.06"/></geometry></collision></link>
+  <link name="r_thigh"><inertial><mass value="3"/></inertial><collision><origin xyz="0 0 -0.2"/><geometry><capsule radius="0.06" length="0.40"/></geometry></collision></link>
+  <link name="r_shank"><inertial><mass value="2"/></inertial><collision><origin xyz="0 0 -0.2"/><geometry><capsule radius="0.05" length="0.40"/></geometry></collision></link>
+  <link name="r_foot"><inertial><mass value="1"/></inertial><collision><origin xyz="0.04 0 -0.025"/><geometry><box size="0.24 0.12 0.05"/></geometry></collision></link>
+  <joint name="r_hip_roll" type="revolute"><parent link="pelvis"/><child link="r_hip"/><origin xyz="0 -0.1 -0.06"/><axis xyz="1 0 0"/><limit lower="-0.4" upper="0.4" effort="150" velocity="10"/></joint>
+  <joint name="r_hip_pitch" type="revolute"><parent link="r_hip"/><child link="r_thigh"/><origin xyz="0 0 -0.03"/><axis xyz="0 1 0"/><limit lower="-1.2" upper="1.2" effort="150" velocity="10"/></joint>
+  <joint name="r_knee" type="revolute"><parent link="r_thigh"/><child link="r_shank"/><origin xyz="0 0 -0.4"/><axis xyz="0 1 0"/><limit lower="-0.05" upper="2.0" effort="150" velocity="10"/></joint>
+  <joint name="r_ankle" type="revolute"><parent link="r_shank"/><child link="r_foot"/><origin xyz="0 0 -0.4"/><axis xyz="0 1 0"/><limit lower="-0.6" upper="0.6" effort="150" velocity="10"/></joint>
+  <link name="r_upper_arm"><inertial><mass value="1.2"/></inertial><collision><origin xyz="0 0 -0.15"/><geometry><capsule radius="0.045" length="0.30"/></geometry></collision></link>
+  <link name="r_forearm"><inertial><mass value="0.8"/></inertial><collision><origin xyz="0 0 -0.14"/><geometry><capsule radius="0.04" length="0.28"/></geometry></collision></link>
+  <joint name="r_shoulder" type="revolute"><parent link="torso"/><child link="r_upper_arm"/><origin xyz="0 -0.22 0.34"/><axis xyz="0 1 0"/><limit lower="-1.5" upper="1.5" effort="150" velocity="10"/></joint>
+  <joint name="r_elbow" type="revolute"><parent link="r_upper_arm"/><child link="r_forearm"/><origin xyz="0 0 -0.3"/><axis xyz="0 1 0"/><limit lower="-0.05" upper="2.0" effort="150" velocity="10"/></joint>
+</robot>

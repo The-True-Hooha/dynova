@@ -1,7 +1,6 @@
 {
   "name": "@dynova/sdk",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -9,10 +8,43 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "build": "node scripts/build.mjs",
+    "prepack": "node ../../scripts/check-dist.mjs"
   },
   "devDependencies": {
     "typescript": "^7.0",
     "vitest": "^4.0"
+  },
+  "description": "Dynova SDK: a shared-memory simulation runtime for the web. Rust owns the world; JavaScript reads it.",
+  "license": "MIT",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js",
+        "default": "./dist/index.js"
+      },
+      "./web": {
+        "types": "./dist/web.d.ts",
+        "import": "./dist/web.js",
+        "default": "./dist/web.js"
+      },
+      "./worker": {
+        "import": "./dist/sim.worker.js",
+        "default": "./dist/sim.worker.js"
+      },
+      "./batch-worker": {
+        "import": "./dist/batch.worker.js",
+        "default": "./dist/batch.worker.js"
+      },
+      "./package.json": "./package.json"
+    }
   }
 }

@@ -1,0 +1,57 @@
+{
+  "name": "@dynova/three",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./loaders": "./src/loaders.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "prepack": "node ../../scripts/check-dist.mjs"
+  },
+  "dependencies": {
+    "@dynova/sdk": "workspace:^"
+  },
+  "peerDependencies": {
+    "three": ">=0.160",
+    "@types/three": ">=0.160"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/three": "^0.170.0",
+    "three": "^0.170.0",
+    "typescript": "^7.0",
+    "vitest": "^4.0"
+  },
+  "description": "Dynova Three.js adapter: instanced rendering of a world, glTF and model loading, and scene meshes to colliders and assemblies.",
+  "license": "MIT",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js",
+        "default": "./dist/index.js"
+      },
+      "./loaders": {
+        "types": "./dist/loaders.d.ts",
+        "import": "./dist/loaders.js",
+        "default": "./dist/loaders.js"
+      },
+      "./package.json": "./package.json"
+    }
+  },
+  "peerDependenciesMeta": {
+    "@types/three": {
+      "optional": true
+    }
+  }
+}

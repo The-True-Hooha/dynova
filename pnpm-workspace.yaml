@@ -1,5 +1,7 @@
-packages:                                                                                                                                  
-    - "sdk/typescript"
-    - "renderer/three"                                                                                                                       
-    - "inspector"                                                                                                                          
-    - "examples"
+packages:
+  - "sdk/typescript"
+  - "renderer/three"
+  - "renderer/canvas2d"
+  - "inspector"
+  - "gpu"
+  - "examples"
