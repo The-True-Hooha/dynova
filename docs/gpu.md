@@ -31,7 +31,7 @@ gpu.destroy();
 
 ## Tolerance
 
-The GPU is held to these bounds against the CPU worlds (`e2e/gpu.spec.ts`: a driven arm, an arm driven into its limits and a skewed arm with an off-origin pivot, tilted axis, bent gravity, heavier link and asymmetric limits; 64 worlds, 200 ticks, checked at ticks 1, 10, 50, 100 and 200):
+The GPU is held to these bounds against the CPU worlds (`e2e/gpu.spec.ts`: a driven arm, an arm driven into its limits, an arm kicked at 100 times and driven at 30 rad/s, and a skewed arm with an off-origin pivot, tilted axis, bent gravity, heavier link and asymmetric limits; 64 worlds, 200 ticks, checked at ticks 1, 10, 50, 100 and 200):
 
 | Quantity | Bound | Measured at tick 200 |
 | --- | --- | --- |
@@ -51,5 +51,5 @@ Chromium here reaches WebGPU only through SwiftShader, a CPU rasteriser (it also
 ## Limits and what is not verified
 
 - Firefox, x86_64 and GPUs other than the M3 Pro were not run.
-- Five solver behaviours are not reached by any test scene, so a change to them would not fail the suite: the hinge-axis position correction, the motor warm-start reset, the solver early exit, the 4 m/s joint bias clamp and the bias on a penetrated limit.
+- Four solver behaviours have effects below the tolerance in every scene tried, so a change to them would not fail the suite: the hinge-axis position correction (largest effect 4.8e-5 rad), the motor warm-start reset, the solver early exit and the bias on a penetrated limit. The 4 m/s joint bias clamp is checked by the kicked scene (`kick=100`), whose anchor errors reach it.
 - Results are not bit-identical across GPUs; do not put a GPU state in a hash, a recording or a snapshot.

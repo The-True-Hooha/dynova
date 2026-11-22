@@ -9,12 +9,13 @@ const CHECKS = [1, 10, 50, 100, 200];
 const TICKS = CHECKS[CHECKS.length - 1];
 
 // Part of the kick is along the hinge axis, so the link starts tilting out of its plane and the hinge has to pull it back.
-const kick = (i: number): [number, number, number] => [0, (((i * 37) % 81) - 40) / 10, (((i * 13) % 21) - 10) / 20];
+const kick = (i: number): [number, number, number] => [0, KICK * (((i * 37) % 81) - 40) / 10, KICK * (((i * 13) % 21) - 10) / 20];
 // `skew` moves the pivot off the origin, tilts the hinge axis, bends gravity, and changes mass and limits: what the origin scene's symmetry hides.
 const SCENE: ReacherScene = params.get('scene') === 'skew'
     ? { ...REACHER, pivot: [0.5, 0.3, 0.2], link: [1, 0.3, 0.2], anchor: [0.6, 0.3, 0.2], axis: [0.3, 0.5, 0.8], gravity: [1, -9.81, 2], invMass: 3, limits: [-1, 0.7] }
     : REACHER;
 const AMP = Number(params.get('amp') ?? 3);
+const KICK = Number(params.get('kick') ?? 1);
 const motor = (i: number, t: number) => AMP * Math.sin(0.05 * t + i * 0.3);
 
 // What a caller can get wrong on the host side: each must be refused or serialised, never run on bad data.
