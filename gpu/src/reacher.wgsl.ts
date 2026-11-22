@@ -1,7 +1,7 @@
 /**
- * The arm scene on the GPU: one static pivot, one dynamic link on a hinge with a motor and limits, gravity, per-step damping. One invocation steps one world.
+ * The arm scene on the GPU: one static pivot, one dynamic link on a hinge or a slider with a motor and limits, gravity, per-step damping. One invocation steps one world.
  * The structure follows the CPU solver in `core/src/physics.rs` and `core/src/physics/joints.rs` (sequential impulses, warm start, split-impulse
- * correction of the hinge axis), minus everything the scene never uses: contacts, sleep, the swept test against statics.
+ * correction of the angular rows: the hinge axis, or a slider's orientation), minus everything the scene never uses: contacts, sleep, the swept test against statics.
  */
 export const REACHER_WGSL = /* wgsl */ `
 struct Params {
@@ -20,6 +20,7 @@ struct Params {
     ref_a: vec4<f32>,
     ref_b: vec4<f32>,
     qa: vec4<f32>,
+    // pivot position, joint kind (0 hinge, 1 slider)
     pa: vec4<f32>,
 }
 
@@ -94,13 +95,16 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
     let p2 = cross(aa, p1);
     let ua = rot(P.qa, P.ref_a.xyz);
     let max_iters = u32(P.s.y);
+    let slider = P.pa.w != 0.0;
+    let nlin = select(3u, 2u, slider);
 
     for (var sub_i = 0u; sub_i < substeps; sub_i++) {
         v += P.g.xyz * dt;
         v *= P.lim.z;
         w *= P.lim.w;
 
-        // Prepare: one row per constraint, in the CPU's order. Rows 0..2 point, 3..4 hinge axis, 5 motor, 6 lower limit, 7 upper limit.
+        // Prepare: one row per constraint, in the CPU's order. A hinge has 0..2 point rows, 3..4 axis rows; a slider 0..1 point rows (across its axis) and 2..4 rows that
+        // hold its orientation. Either way 5 is the motor and 6, 7 the lower and upper limit; on a slider all of those act along the axis as forces, on a hinge as torques.
         let rb = rot(q, P.lb.xyz);
         let anchor_err = (P.pa.xyz + ra) - (pos + rb);
         var dir: array<vec3<f32>, 8>;
@@ -109,34 +113,53 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
         var lo: array<f32, 8>;
         var hi: array<f32, 8>;
         var slot: array<u32, 8>;
-        for (var i = 0u; i < 3u; i++) {
-            dir[i] = axes[i];
-            want_v[i] = -clamp(k_bias * dot(anchor_err, axes[i]), -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL);
-            corr[i] = 0.0; lo[i] = -BIG; hi[i] = BIG; slot[i] = i;
+        var is_lin: array<bool, 8>;
+        for (var i = 0u; i < 5u; i++) {
+            lo[i] = -BIG; hi[i] = BIG; slot[i] = i; corr[i] = 0.0; is_lin[i] = i < nlin;
         }
+        // The pivot is unrotated, and so is the link at the start, so the rest rotation is the identity and the orientation error is the link's own rotation.
+        var e_q = q;
+        if (e_q.w < 0.0) { e_q = -e_q; }
         let e = cross(rot(q, P.axis_b.xyz), aa);
-        dir[3] = p1;
-        want_v[3] = -clamp(k_bias * dot(e, p1), -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL);
-        corr[3] = want_v[3]; lo[3] = -BIG; hi[3] = BIG; slot[3] = 3u;
-        dir[4] = p2;
-        want_v[4] = -clamp(k_bias * dot(e, p2), -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL);
-        corr[4] = want_v[4]; lo[4] = -BIG; hi[4] = BIG; slot[4] = 4u;
+        if (slider) {
+            dir[0] = p1;
+            dir[1] = p2;
+            want_v[0] = -clamp(k_bias * dot(anchor_err, p1), -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL);
+            want_v[1] = -clamp(k_bias * dot(anchor_err, p2), -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL);
+            for (var i = 0u; i < 3u; i++) {
+                dir[i + 2u] = axes[i];
+                want_v[i + 2u] = clamp(k_bias * 2.0 * e_q[i], -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL);
+                corr[i + 2u] = want_v[i + 2u];
+                slot[i + 2u] = i + 3u;
+            }
+        } else {
+            for (var i = 0u; i < 3u; i++) {
+                dir[i] = axes[i];
+                want_v[i] = -clamp(k_bias * dot(anchor_err, axes[i]), -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL);
+            }
+            dir[3] = p1;
+            want_v[3] = -clamp(k_bias * dot(e, p1), -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL);
+            corr[3] = want_v[3];
+            dir[4] = p2;
+            want_v[4] = -clamp(k_bias * dot(e, p2), -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL);
+            corr[4] = want_v[4];
+        }
         dir[5] = -aa;
-        want_v[5] = motor_vel; corr[5] = 0.0; lo[5] = -cap; hi[5] = cap; slot[5] = 6u;
+        want_v[5] = motor_vel; corr[5] = 0.0; lo[5] = -cap; hi[5] = cap; slot[5] = 6u; is_lin[5] = slider;
         let ub = rot(q, P.ref_b.xyz);
-        let coord = atan2_det(dot(cross(ua, ub), aa), dot(ua, ub));
+        let coord = select(atan2_det(dot(cross(ua, ub), aa), dot(ua, ub)), -dot(anchor_err, aa), slider);
         let gap_lo = coord - P.lim.x;
         let gap_hi = P.lim.y - coord;
         dir[6] = -aa;
         want_v[6] = select(-clamp(k_bias * gap_lo, -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL), -gap_lo / dt, gap_lo >= 0.0);
-        corr[6] = 0.0; lo[6] = 0.0; hi[6] = BIG; slot[6] = 7u;
+        corr[6] = 0.0; lo[6] = 0.0; hi[6] = BIG; slot[6] = 7u; is_lin[6] = slider;
         dir[7] = aa;
         want_v[7] = select(-clamp(k_bias * gap_hi, -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL), -gap_hi / dt, gap_hi >= 0.0);
-        corr[7] = 0.0; lo[7] = 0.0; hi[7] = BIG; slot[7] = 8u;
+        corr[7] = 0.0; lo[7] = 0.0; hi[7] = BIG; slot[7] = 8u; is_lin[7] = slider;
 
         var denom: array<f32, 8>;
         for (var i = 0u; i < ROWS; i++) {
-            if (i < 3u) {
+            if (is_lin[i]) {
                 let t = cross(rb, dir[i]);
                 denom[i] = im + ii * dot(t, t);
             } else {
@@ -147,7 +170,7 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
         // Warm start from the last step's impulses.
         for (var i = 0u; i < ROWS; i++) {
             let d = dir[i] * acc[slot[i]];
-            if (i < 3u) {
+            if (is_lin[i]) {
                 v -= d * im;
                 w -= cross(rb, d) * ii;
             } else {
@@ -160,12 +183,12 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
             for (var i = 0u; i < ROWS; i++) {
                 if (denom[i] < 1e-10) { continue; }
                 var rel: f32;
-                if (i < 3u) { rel = -dot(v + cross(w, rb), dir[i]); } else { rel = -dot(w, dir[i]); }
+                if (is_lin[i]) { rel = -dot(v + cross(w, rb), dir[i]); } else { rel = -dot(w, dir[i]); }
                 let old = acc[slot[i]];
                 let want = old + (want_v[i] - corr[i] - rel) / denom[i];
                 let nxt = min(max(want, lo[i]), hi[i]);
                 let d = dir[i] * (nxt - old);
-                if (i < 3u) {
+                if (is_lin[i]) {
                     v -= d * im;
                     w -= cross(rb, d) * ii;
                 } else {
@@ -177,11 +200,11 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
             if (residual < CONVERGED) { break; }
         }
 
-        // Position correction of the hinge axis, into a turn that moves the pose and is then discarded.
+        // Position correction of the angular rows (a hinge's axis, a slider's orientation), into a turn that moves the pose and is then discarded.
         var pw = vec3<f32>(0.0);
         var pseudo: array<f32, 8>;
         for (var c = 0u; c < CORRECTION_ITERS; c++) {
-            for (var i = 3u; i < 5u; i++) {
+            for (var i = 0u; i < 5u; i++) {
                 if (corr[i] == 0.0 || denom[i] < 1e-10) { continue; }
                 let rel = -dot(pw, dir[i]);
                 let nxt = min(max(pseudo[i] + (corr[i] - rel) / denom[i], lo[i]), hi[i]);
@@ -200,7 +223,9 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
     state[base + 10u] = w.x; state[base + 11u] = w.y; state[base + 12u] = w.z;
     for (var i = 0u; i < 9u; i++) { state[base + 13u + i] = acc[i]; }
     let ub_end = rot(q, P.ref_b.xyz);
-    obs[world * 2u] = atan2_det(dot(cross(ua, ub_end), aa), dot(ua, ub_end));
-    obs[world * 2u + 1u] = dot(w, aa);
+    let rb_end = rot(q, P.lb.xyz);
+    let err_end = (P.pa.xyz + ra) - (pos + rb_end);
+    obs[world * 2u] = select(atan2_det(dot(cross(ua, ub_end), aa), dot(ua, ub_end)), -dot(err_end, aa), slider);
+    obs[world * 2u + 1u] = select(dot(w, aa), dot(v + cross(w, rb_end), aa), slider);
 }
 `;

@@ -65,3 +65,22 @@ describe('a batch is refused before it touches the device', () => {
         await expect(GpuReacher.create({} as GPUDevice, n)).rejects.toThrow(RangeError);
     });
 });
+
+describe('the joint kind', () => {
+    it('is a hinge unless the scene says slider, and the kernel reads it from the last float of the pivot vec4', () => {
+        expect(reacherParams(REACHER)[47]).toBe(0);
+        expect(reacherParams({ ...REACHER, kind: 'hinge' })[47]).toBe(0);
+        expect(reacherParams({ ...REACHER, kind: 'slider' })[47]).toBe(1);
+    });
+
+    it('bounds limits by metres for a slider and radians for a hinge, as the core does', () => {
+        expect(() => reacherParams({ ...REACHER, limits: [-5, 5] })).toThrow(RangeError);
+        expect(() => reacherParams({ ...REACHER, kind: 'slider', limits: [-5, 5] })).not.toThrow();
+        expect(() => reacherParams({ ...REACHER, kind: 'slider', limits: [-2e4, 1] })).toThrow(RangeError);
+        expect(() => reacherParams({ ...REACHER, kind: 'slider', limits: [0.1, 1] })).toThrow(RangeError);
+    });
+
+    it('refuses an unknown kind', () => {
+        expect(() => reacherParams({ ...REACHER, kind: 'ball' as 'hinge' })).toThrow(/kind/);
+    });
+});

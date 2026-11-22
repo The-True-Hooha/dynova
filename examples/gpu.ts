@@ -1,5 +1,5 @@
 import { WorldBatch } from '@dynova/sdk';
-import { JOINT_HINGE } from '@dynova/sdk';
+import { JOINT_HINGE, JOINT_SLIDER } from '@dynova/sdk';
 import { GpuReacher, REACHER, STATE_FLOATS, type ReacherScene } from '@dynova/gpu';
 
 const config = { capacity: 8, ringCapacity: 128 };
@@ -11,9 +11,15 @@ const TICKS = CHECKS[CHECKS.length - 1];
 // Part of the kick is along the hinge axis, so the link starts tilting out of its plane and the hinge has to pull it back.
 const kick = (i: number): [number, number, number] => [0, KICK * (((i * 37) % 81) - 40) / 10, KICK * (((i * 13) % 21) - 10) / 20];
 // `skew` moves the pivot off the origin, tilts the hinge axis, bends gravity, and changes mass and limits: what the origin scene's symmetry hides.
-const SCENE: ReacherScene = params.get('scene') === 'skew'
-    ? { ...REACHER, pivot: [0.5, 0.3, 0.2], link: [1, 0.3, 0.2], anchor: [0.6, 0.3, 0.2], axis: [0.3, 0.5, 0.8], gravity: [1, -9.81, 2], invMass: 3, limits: [-1, 0.7] }
-    : REACHER;
+const SKEW = params.get('scene') === 'skew';
+// `joint=slider` swaps the hinge for a slider: the same bodies, the limits and the motor now act on the offset along the axis in metres.
+const SLIDER = params.get('joint') === 'slider';
+const SCENE: ReacherScene = {
+    ...(SKEW ? { ...REACHER, pivot: [0.5, 0.3, 0.2], link: [1, 0.3, 0.2], anchor: [0.6, 0.3, 0.2], axis: [0.3, 0.5, 0.8], gravity: [1, -9.81, 2], invMass: 3, limits: [-1, 0.7] } : REACHER),
+    // `lever=1` puts the anchor off the link's centre in y and z, so a push has a lever about every axis the slider must hold.
+    ...(params.get('lever') === '1' ? { anchor: [0.1, 0.2, 0.1] } : {}),
+    ...(SLIDER ? { kind: 'slider', limits: SKEW ? [-0.4, 0.3] : [-0.5, 0.3], axis: SKEW ? [0.3, 0.5, 0.8] : [0, 1, 0] } : {}),
+} as ReacherScene;
 const AMP = Number(params.get('amp') ?? 3);
 const KICK = Number(params.get('kick') ?? 1);
 const motor = (i: number, t: number) => AMP * Math.sin(0.05 * t + i * 0.3);
@@ -58,7 +64,7 @@ async function run() {
         w.setGravity(...SCENE.gravity);
         const pivot = w.spawn({ x: SCENE.pivot[0], y: SCENE.pivot[1], z: SCENE.pivot[2], hx: 0.1, hy: 0.1, hz: 0.1, invMass: 0 });
         const link = w.spawn({ x: SCENE.link[0], y: SCENE.link[1], z: SCENE.link[2], hx: SCENE.linkHalf[0], hy: SCENE.linkHalf[1], hz: SCENE.linkHalf[2], invMass: SCENE.invMass, friction: 0 });
-        const joint = w.createJoint({ kind: JOINT_HINGE, a: pivot, b: link, anchor: SCENE.anchor, axis: SCENE.axis, limits: SCENE.limits, motor: { velocity: 0, maxForce: SCENE.motorMax } });
+        const joint = w.createJoint({ kind: SLIDER ? JOINT_SLIDER : JOINT_HINGE, a: pivot, b: link, anchor: SCENE.anchor, axis: SCENE.axis, limits: SCENE.limits, motor: { velocity: 0, maxForce: SCENE.motorMax } });
         return { link, joint };
     });
     set.worlds.forEach((w, i) => w.force(ctx[i].link, ...kick(i)));
@@ -84,7 +90,7 @@ async function run() {
             for (let k = 0; k < 3; k++) position = Math.max(position, Math.abs(body[7 + k] - state[at + k]));
             for (let k = 0; k < 4; k++) rotation = Math.max(rotation, Math.abs(body[7 + 3 + k] - state[at + 3 + k]));
             widest = Math.max(widest, Math.abs(joint.position));
-            if (Math.abs(joint.position) > 2.45) atLimit++;
+            if (Math.abs(joint.position - SCENE.limits[0]) < 0.05 || Math.abs(joint.position - SCENE.limits[1]) < 0.05) atLimit++;
         });
         checks.push({ tick: t, angle, velocity, position, rotation });
     }

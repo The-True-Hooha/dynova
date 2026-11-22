@@ -8,10 +8,12 @@ export const MAX_WORLDS = 1 << 20;
 type V3 = readonly [number, number, number];
 
 /**
- * The arm scene: a static pivot box and a dynamic link on a hinge, as built by `examples/reacherEnv.ts`. Bodies start unrotated. `reacherParams` refuses what the CPU core
+ * The arm scene: a static pivot box and a dynamic link on a hinge, as built by `examples/reacherEnv.ts`. Bodies start unrotated, which the slider relies on (its orientation rows hold the start rotation, taken as the identity). A motor force of 0 is not what the CPU runs: it sleeps a jointed body with no motor, and the GPU never sleeps. The nine warm-start slots follow the core's: a hinge uses 0-2 for the anchor and 3-4 for the axis, a slider 0-1 and 3-5, both 6 for the motor and 7-8 for the limits. `reacherParams` refuses what the CPU core
  * refuses for such a joint. The kernel has no swept test against the pivot: a link that starts within a substep's travel of the pivot's box is not what the CPU runs.
  */
 export interface ReacherScene {
+    /** What joins the link to the pivot; a hinge when absent. A slider limits and drives the offset along `axis` in metres, a hinge the angle about it in radians. */
+    kind?: 'hinge' | 'slider';
     pivot: V3;
     link: V3;
     linkHalf: V3;
@@ -58,6 +60,7 @@ function perpendicular(axis: V3): V3 {
 
 const MAX_COORD = 1e6;
 const MAX_ANGLE_LIMIT = 3.1;
+const MAX_LINEAR_LIMIT = 1e4;
 export const MAX_MOTOR_SPEED = 1e3;
 const MAX_MOTOR_FORCE = 1e6;
 
@@ -73,9 +76,11 @@ function validate(s: ReacherScene): void {
     check(s.invMass > 0 && s.invMass <= 1e6, `invMass must be within (0, 1e6], got ${s.invMass}: a link with no inverse mass is static`);
     check(Number.isFinite(s.dt) && s.dt > 0 && s.dt <= 1, `dt must be within (0, 1], got ${s.dt}`);
     check(s.motorMax >= 0 && s.motorMax <= MAX_MOTOR_FORCE, `motorMax must be within 0..${MAX_MOTOR_FORCE}, got ${s.motorMax}`);
-    check(finite3(s.axis, MAX_COORD) && f(f(s.axis[0] * s.axis[0]) + f(s.axis[1] * s.axis[1]) + f(s.axis[2] * s.axis[2])) > 1e-12 && Number.isFinite(f(s.axis[0] * s.axis[0]) + f(s.axis[1] * s.axis[1]) + f(s.axis[2] * s.axis[2])), 'the hinge axis must be a finite vector of usable length');
+    check(finite3(s.axis, MAX_COORD) && f(f(s.axis[0] * s.axis[0]) + f(s.axis[1] * s.axis[1]) + f(s.axis[2] * s.axis[2])) > 1e-12 && Number.isFinite(f(s.axis[0] * s.axis[0]) + f(s.axis[1] * s.axis[1]) + f(s.axis[2] * s.axis[2])), 'the joint axis must be a finite vector of usable length');
+    check(s.kind === undefined || s.kind === 'hinge' || s.kind === 'slider', `kind must be 'hinge' or 'slider', got ${s.kind}`);
     const [lo, hi] = s.limits;
-    check(Number.isFinite(lo) && Number.isFinite(hi) && lo <= 0 && hi >= 0 && Math.abs(lo) <= MAX_ANGLE_LIMIT && Math.abs(hi) <= MAX_ANGLE_LIMIT, `limits must bracket zero within +-${MAX_ANGLE_LIMIT} rad, got [${lo}, ${hi}]`);
+    const bound = s.kind === 'slider' ? MAX_LINEAR_LIMIT : MAX_ANGLE_LIMIT;
+    check(Number.isFinite(lo) && Number.isFinite(hi) && lo <= 0 && hi >= 0 && Math.abs(lo) <= bound && Math.abs(hi) <= bound, `limits must bracket zero within +-${bound}, got [${lo}, ${hi}]`);
 }
 
 export function reacherParams(s: ReacherScene): Float32Array {
@@ -95,13 +100,13 @@ export function reacherParams(s: ReacherScene): Float32Array {
     p.set([...sub(s.anchor, s.link), 0], 20);
     p.set([...axis, 0, ...axis, 0, ...ref, 0, ...ref, 0], 24);
     p.set([0, 0, 0, 1], 40);
-    p.set([...s.pivot, 0], 44);
+    p.set([...s.pivot, s.kind === 'slider' ? 1 : 0], 44);
     return p;
 }
 
 /**
  * `worlds` copies of the arm scene stepped by one compute dispatch a tick. One invocation owns one world: the state is a row of `STATE_FLOATS` in one storage
- * buffer, the motor command a float in another, the observation `[angle, angular velocity]` a pair in a third.
+ * buffer, the motor command a float in another, the observation a pair in a third: `[angle, angular velocity]` of a hinge, `[offset, speed]` along the axis of a slider.
  */
 export class GpuReacher {
     private destroyed = false;
@@ -183,7 +188,7 @@ export class GpuReacher {
         return { state: all.subarray(0, this.worlds * STATE_FLOATS), obs: all.subarray(this.worlds * STATE_FLOATS) };
     }
 
-    /** Only the observation pairs `[angle, angular velocity]`: what a control loop reads each tick, 2 floats a world instead of 26. */
+    /** Only the observation pairs (`[coordinate, rate]`, see the class): what a control loop reads each tick, 2 floats a world instead of 26. */
     readObs(): Promise<Float32Array> {
         this.assertAlive();
         return this.copyOut(false);

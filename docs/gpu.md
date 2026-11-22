@@ -1,12 +1,14 @@
 # GPU backend (optional)
 
-Phase 18 adds `@dynova/gpu`: a WebGPU compute path that steps many copies of one scene, the arm (a static pivot, a dynamic link on a hinge with limits and a motor). It is opt-in and separate from the core. The CPU path stays the deterministic reference and none of its hashes or pins changed; the GPU path is not bit-identical to it, across GPUs or to the CPU, and is held to a tolerance instead.
+Phase 18 adds `@dynova/gpu`: a WebGPU compute path that steps many copies of one scene, the arm (a static pivot, a dynamic link on a hinge or a slider, with limits and a motor). It is opt-in and separate from the core. The CPU path stays the deterministic reference and none of its hashes or pins changed; the GPU path is not bit-identical to it, across GPUs or to the CPU, and is held to a tolerance instead.
 
 ## What it runs
 
 One compute invocation steps one world. Per tick, in 4 substeps: gravity, damping, the hinge rows (three for the anchor point, two for the axis, a motor row, a lower and an upper limit row), warm start, up to 32 solver sweeps with an early exit when the residual is small, a position correction for the axis, then integration. It is a port of the CPU solver for exactly this scene, so it is not a general engine.
 
-Not in the GPU path: contacts and collision, sleep, particles, other joint kinds, more than one link, and the CPU's swept test against the pivot (a link that starts within one substep's travel of the pivot's box is not what the CPU runs).
+`ReacherScene.kind` picks the joint: `'hinge'` (the default; angle in radians) or `'slider'` (offset along the axis in metres; two rows across the axis and three holding the orientation). The slider assumes the bodies start unrotated. A motor force of 0 is not what the CPU runs, because the CPU sleeps a jointed body with no motor.
+
+Not in the GPU path: contacts and collision, sleep, particles, ball, fixed and distance joints, more than one link, and the CPU's swept test against the pivot (a link that starts within one substep's travel of the pivot's box is not what the CPU runs).
 
 ## API
 
@@ -51,5 +53,6 @@ Chromium here reaches WebGPU only through SwiftShader, a CPU rasteriser (it also
 ## Limits and what is not verified
 
 - Firefox, x86_64 and GPUs other than the M3 Pro were not run.
+- The slider's orientation correction (position correction of its angular rows) and its quaternion sign flip have effects below the tolerance in every scene tried. The slider scenes (`joint=slider`, a skewed one, one with the anchor off the link centre) match the CPU to about 1e-6.
 - Four solver behaviours have effects below the tolerance in every scene tried, so a change to them would not fail the suite: the hinge-axis position correction (largest effect 4.8e-5 rad), the motor warm-start reset, the solver early exit and the bias on a penetrated limit. The 4 m/s joint bias clamp is checked by the kicked scene (`kick=100`), whose anchor errors reach it.
 - Results are not bit-identical across GPUs; do not put a GPU state in a hash, a recording or a snapshot.
