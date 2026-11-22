@@ -1,7 +1,7 @@
 import { REACHER_WGSL } from './reacher.wgsl.js';
 
-/** Floats per world in the state buffer: position 3, rotation 4, velocity 3, angular velocity 3, nine warm-start impulses, the sleep timer in seconds, and the phase (0 fresh, 1 awake, 2 asleep). */
-export const STATE_FLOATS = 24;
+/** Floats per world in the state buffer: position 3, rotation 4, velocity 3, angular velocity 3, nine warm-start impulses, the sleep timer in seconds, the phase (0 fresh, 1 awake, 2 asleep), whether a deep contact held the link in its last tick, and four contact slots of nine (normal impulse, two friction impulses, point, normal). */
+export const STATE_FLOATS = 61;
 export const OBS_FLOATS = 2;
 export const MAX_WORLDS = 1 << 20;
 
@@ -25,6 +25,20 @@ export interface ReacherScene {
     motorMax: number;
     /** Ticks are `dt` seconds; the CPU core runs `substeps` steps inside each. */
     dt: number;
+    /** A static box the link collides with in every world; none when absent. */
+    floor?: FloorBox;
+    /** Friction and restitution of the link as `World.spawn` takes them (0.5 and 0 by default, as the core's). They only matter with a `floor`. */
+    linkFriction?: number;
+    linkRestitution?: number;
+}
+
+/** A static box, unrotated unless `rot` (`[x, y, z, w]`, unit length) says otherwise. */
+export interface FloorBox {
+    pos: V3;
+    half: V3;
+    rot?: readonly [number, number, number, number];
+    friction?: number;
+    restitution?: number;
 }
 
 export const REACHER: ReacherScene = {
@@ -58,6 +72,7 @@ function perpendicular(axis: V3): V3 {
     return unit(cross(axis, pick));
 }
 
+const PARAM_FLOATS = 68;
 const MAX_COORD = 1e6;
 const MAX_ANGLE_LIMIT = 3.1;
 const MAX_LINEAR_LIMIT = 1e4;
@@ -76,6 +91,19 @@ function validate(s: ReacherScene): void {
     check(s.invMass > 0 && s.invMass <= 1e6, `invMass must be within (0, 1e6], got ${s.invMass}: a link with no inverse mass is static`);
     check(Number.isFinite(s.dt) && s.dt > 0 && s.dt <= 1, `dt must be within (0, 1], got ${s.dt}`);
     check(s.motorMax >= 0 && s.motorMax <= MAX_MOTOR_FORCE, `motorMax must be within 0..${MAX_MOTOR_FORCE}, got ${s.motorMax}`);
+    if (s.floor) {
+        const fl = s.floor, rotQ = fl.rot ?? [0, 0, 0, 1];
+        check(finite3(fl.pos, MAX_COORD), 'the floor position must be a finite 3-vector within range');
+        check(fl.half.length === 3 && fl.half.every((h) => h >= 1e-3 && h <= 1e4), 'floor half sizes must be within 0.001..10000');
+        const len = rotQ.reduce((a, c) => a + c * c, 0);
+        check(rotQ.length === 4 && rotQ.every(Number.isFinite) && Math.abs(len - 1) < 1e-3, 'the floor rotation must be a unit quaternion');
+        for (const [name, v] of [['friction', fl.friction ?? 0.5], ['restitution', fl.restitution ?? 0]] as const) {
+            check(Number.isFinite(v) && v >= 0 && v <= (name === 'friction' ? 2 : 1), `floor ${name} out of range: ${v}`);
+        }
+    }
+    for (const [name, v] of [['linkFriction', s.linkFriction ?? 0.5], ['linkRestitution', s.linkRestitution ?? 0]] as const) {
+        check(Number.isFinite(v) && v >= 0 && v <= (name === 'linkFriction' ? 2 : 1), `${name} out of range: ${v}`);
+    }
     check(finite3(s.axis, MAX_COORD) && f(f(s.axis[0] * s.axis[0]) + f(s.axis[1] * s.axis[1]) + f(s.axis[2] * s.axis[2])) > 1e-12 && Number.isFinite(f(s.axis[0] * s.axis[0]) + f(s.axis[1] * s.axis[1]) + f(s.axis[2] * s.axis[2])), 'the joint axis must be a finite vector of usable length');
     check(s.kind === undefined || s.kind === 'hinge' || s.kind === 'slider', `kind must be 'hinge' or 'slider', got ${s.kind}`);
     const [lo, hi] = s.limits;
@@ -91,7 +119,7 @@ export function reacherParams(s: ReacherScene): Float32Array {
     const ref = perpendicular(axis);
     const sub = (a: V3, b: V3): V3 => [f(a[0] - b[0]), f(a[1] - b[1]), f(a[2] - b[2])];
     const bias = f(1 - perStep(0.8, SUBSTEPS));
-    const p = new Float32Array(48);
+    const p = new Float32Array(PARAM_FLOATS);
     p.set([s.dt, s.invMass, f(1 / inertia), s.motorMax], 0);
     p.set([...s.gravity, 0], 4);
     p.set([s.limits[0], s.limits[1], perStep(0.99, SUBSTEPS), perStep(0.97, SUBSTEPS)], 8);
@@ -101,6 +129,17 @@ export function reacherParams(s: ReacherScene): Float32Array {
     p.set([...axis, 0, ...axis, 0, ...ref, 0, ...ref, 0], 24);
     p.set([0, 0, 0, 1], 40);
     p.set([...s.pivot, s.kind === 'slider' ? 1 : 0], 44);
+    if (s.floor) {
+        const fl = s.floor, q = fl.rot ?? [0, 0, 0, 1];
+        const ql = f(Math.sqrt(f(f(q[0] * q[0]) + f(q[1] * q[1]) + f(q[2] * q[2]) + f(q[3] * q[3]))));
+        p.set([...fl.pos, 1], 48);
+        p.set([...fl.half, fl.friction ?? 0.5], 52);
+        p.set([f(q[0] / ql), f(q[1] / ql), f(q[2] / ql), f(q[3] / ql)], 56);
+    } else {
+        p.set([0, 0, 0, 0, 0.5, 0.5, 0.5, 0.5, 0, 0, 0, 1], 48);
+    }
+    p.set([...s.linkHalf, s.linkFriction ?? 0.5], 60);
+    p.set([s.linkRestitution ?? 0, s.floor?.restitution ?? 0, 0, 0], 64);
     return p;
 }
 
@@ -130,7 +169,7 @@ export class GpuReacher {
         const errors = info.messages.filter((m) => m.type === 'error');
         if (errors.length) throw new Error(`the reacher shader did not compile: ${errors.map((m) => `${m.lineNum}: ${m.message}`).join('; ')}`);
         const pipeline = await device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'step_world' } });
-        const params = device.createBuffer({ size: 48 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        const params = device.createBuffer({ size: PARAM_FLOATS * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         device.queue.writeBuffer(params, 0, reacherParams(scene));
         const state = device.createBuffer({ size: worlds * STATE_FLOATS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
         const motors = device.createBuffer({ size: worlds * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
@@ -195,7 +234,7 @@ export class GpuReacher {
         return { state: all.subarray(0, this.worlds * STATE_FLOATS), obs: all.subarray(this.worlds * STATE_FLOATS) };
     }
 
-    /** Only the observation pairs (`[coordinate, rate]`, see the class): what a control loop reads each tick, 2 floats a world instead of 26. */
+    /** Only the observation pairs (`[coordinate, rate]`, see the class): what a control loop reads each tick, 2 floats a world instead of the state's 61 more. */
     readObs(): Promise<Float32Array> {
         this.assertAlive();
         return this.copyOut(false);

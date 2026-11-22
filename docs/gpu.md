@@ -10,7 +10,9 @@ One compute invocation steps one world. Per tick, in 4 substeps: the sleep check
 
 Sleep follows the core's rules for a lone jointed body, judged at the start of each substep: a link that stays under 0.3 m/s (and 0.3 rad/s) and is not still gaining speed for 0.2 s falls asleep, and a motor force above 0 keeps it awake. A sleeper is left untouched and costs almost nothing; only `reset` wakes it. The CPU also wakes a body on every `setJointMotor`, even with a force of 0, so a loop that commands a motor every tick keeps a CPU link awake and not a GPU one; in a scene with `motorMax` 0 send no motor commands to the CPU if you compare them.
 
-Not in the GPU path: contacts and collision, particles, ball, fixed and distance joints, more than one link, and the CPU's swept test against the pivot (a link that starts within one substep's travel of the pivot's box is not what the CPU runs).
+Contacts: a scene may carry one static box (`ReacherScene.floor`, with `linkFriction` and `linkRestitution`) that the link collides with in every world. The kernel is a port of the core's contact path for that pair: the box-box manifold (face clipping to at most four points, or one edge-edge point), friction on a disc, restitution above 2 m/s, split-impulse recovery of penetration past the 0.01 m slop, the solve order (lowest point first, alternating), warm starting by where a contact point is, the swept test against the box, and the rule that a deep contact (past 0.02 m) keeps the link awake. The floor can be rotated. It must not overlap the pivot or the link's start: a body spawned inside the floor is not what the CPU runs either.
+
+Not in the GPU path: more than one contact body, contacts between links, spheres, capsules and hulls, particles, ball, fixed and distance joints, more than one link, and the CPU's swept test against the pivot (a link that starts within one substep's travel of the pivot's box is not what the CPU runs).
 
 ## API
 
@@ -24,7 +26,7 @@ gpu.reset(kick);        // optional Float32Array, 3 floats a world: the impulse 
 gpu.setMotors(speeds);  // Float32Array, one speed a world, finite and within +-1000
 gpu.step(1);            // queues that many ticks
 const obs = await gpu.readObs();         // [angle, angular velocity] per world
-const { state, obs } = await gpu.read(); // plus 24 floats a world: position, rotation, velocities, warm start
+const { state, obs } = await gpu.read(); // plus 61 floats a world: position, rotation, velocities, warm start, sleep, contact cache
 gpu.destroy();
 ```
 
@@ -59,3 +61,4 @@ Chromium here reaches WebGPU only through SwiftShader, a CPU rasteriser (it also
 - Sleep: the spin the previous substep's position correction adds (and ignoring it in a tick's first substep) is below the tolerance in every scene tried. A sleep decision can flip a substep for a world within 1e-6 of a threshold (0.3 m/s, 0.2 s, 0.5 m/s squared a second), which moves its pose by up to 1e-3.
 - Four solver behaviours have effects below the tolerance in every scene tried, so a change to them would not fail the suite: the hinge-axis position correction (largest effect 4.8e-5 rad), the motor warm-start reset, the solver early exit and the bias on a penetrated limit. The 4 m/s joint bias clamp is checked by the kicked scene (`kick=100`), whose anchor errors reach it.
 - Results are not bit-identical across GPUs; do not put a GPU state in a hash, a recording or a snapshot.
+- Contacts: the floor scenes (`floor=tip`, `flat`, `slope`, a post, with bounce, sleep and kicks to 40 m/s) match the CPU to about 1e-5. Without the contact warm start a resting slider differed by 7e-4 m, so the warm start is what keeps it inside the bound. Impacts at 120 m/s (`kick=30`) differ by 3e-3 in velocity on the first tick: past about 40 m/s the sweep and the solver sit on discrete decisions that f32 resolves differently. A link resting on a narrow post with penetration near the slop sleeps a substep apart from the CPU in SwiftShader (angle 3e-4 after sleep), so no such scene is in the suite. Mutants caught: no swept test, no restitution, no friction, no penetration recovery, no warm start, the solve order, the deep-contact sleep gate. A mutant that leaves the pseudo-velocity out of the sleep speed survives (it stays below the tolerance). The edge-edge manifold and the more-than-four-points reduction are ported but no scene reaches them (the hinge axis and every floor tilt in the hinge scenes keep the cross axes on face axes). The swept test covers the floor only; the core also sweeps the pivot box. Not checked: more than one floor, a floor the link starts inside.

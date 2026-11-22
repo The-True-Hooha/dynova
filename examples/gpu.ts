@@ -1,6 +1,6 @@
 import { WorldBatch } from '@dynova/sdk';
 import { JOINT_HINGE, JOINT_SLIDER } from '@dynova/sdk';
-import { GpuReacher, REACHER, STATE_FLOATS, type ReacherScene } from '@dynova/gpu';
+import { GpuReacher, REACHER, STATE_FLOATS, type FloorBox, type ReacherScene } from '@dynova/gpu';
 
 const config = { capacity: 8, ringCapacity: 128 };
 const params = new URLSearchParams(location.search);
@@ -18,6 +18,24 @@ const kick = (i: number): [number, number, number] => COAST ? [((i % 8) + 1) * 0
 const SKEW = params.get('scene') === 'skew';
 // `joint=slider` swaps the hinge for a slider: the same bodies, the limits and the motor now act on the offset along the axis in metres.
 const SLIDER = params.get('joint') === 'slider' || params.get('coast') === '1';
+// `floor=<name>` adds a static box the link collides with. The tops sit where the swinging or falling link reaches them within the run.
+const tilt = (a: number): [number, number, number, number] => [0, 0, Math.sin(a / 2), Math.cos(a / 2)];
+const FLOORS: Record<string, FloorBox> = {
+    // below the arm's tip: it meets the floor at an angle, an edge of the link's end against the face
+    tip: { pos: [0, -1.1, 0], half: [3, 0.5, 3], friction: 0.5 },
+    // under a slider falling along y: the link's flat face lands on the floor face, four contact points
+    flat: { pos: [0, -0.85, 0], half: [3, 0.5, 3], friction: 0.6 },
+    // a floor thinner than a substep's travel at 40 m/s under a slider: only the swept test keeps the link from passing through it
+    thin: { pos: [0, -0.43, 0], half: [3, 0.02, 3], friction: 0.5 },
+    // tilted about x and y, for the skewed scene: the contact normal and the ordering direction are off every axis
+    twist: { pos: [1, -0.6, 0.2], half: [3, 0.5, 3], rot: [0.1, 0.2, 0.05, Math.sqrt(1 - 0.01 - 0.04 - 0.0025)], friction: 0.6 },
+    // tilted 0.3 rad about z so the normal and the friction tangents leave the axes, and a bouncy surface
+    slope: { pos: [0.4, -1.0, 0], half: [3, 0.5, 3], rot: tilt(0.3), friction: 0.8, restitution: 0.7 },
+    // a post narrower than the link's end under a hanging link: the patch is the post's top, clipped by its edges, and a hanging link rests 0.015 into it
+    block: { pos: [0, -1.085, 0], half: [0.04, 0.1, 0.15], friction: 0.5 },
+};
+const FLOOR = params.get('floor');
+if (FLOOR && !FLOORS[FLOOR]) throw new Error(`unknown floor ${FLOOR}`);
 const SCENE: ReacherScene = {
     ...(SKEW ? { ...REACHER, pivot: [0.5, 0.3, 0.2], link: [1, 0.3, 0.2], anchor: [0.6, 0.3, 0.2], axis: [0.3, 0.5, 0.8], gravity: [1, -9.81, 2], invMass: 3, limits: [-1, 0.7] } : REACHER),
     // `sleep=1` has no motor, so a link that comes to rest falls asleep as on the CPU.
@@ -26,6 +44,7 @@ const SCENE: ReacherScene = {
     ...(params.get('lever') === '1' ? { anchor: [0.1, 0.2, 0.1] } : {}),
     ...(SLIDER ? { kind: 'slider', limits: SKEW ? [-0.4, 0.3] : [-0.5, 0.3], axis: SKEW ? [0.3, 0.5, 0.8] : [0, 1, 0] } : {}),
     ...(COAST ? { kind: 'slider', axis: [1, 0, 0], limits: [-3, 3] } : {}),
+    ...(FLOOR ? { floor: FLOORS[FLOOR], linkFriction: 0.5, linkRestitution: params.get('bounce') === '1' ? 0.9 : 0 } : {}),
 } as ReacherScene;
 const AMP = Number(params.get('amp') ?? 3);
 const KICK = Number(params.get('kick') ?? 1);
@@ -45,7 +64,7 @@ async function probe(device: GPUDevice) {
     const [snap, late] = await Promise.all([early, g.readObs()]);
     const refused = (f: () => void) => { try { f(); return false; } catch (e) { return e instanceof RangeError; } };
     const out = {
-        concurrentReadsAgree: Array.from(a.state).join() === Array.from(b.state).join() && a.state.length === 48,
+        concurrentReadsAgree: Array.from(a.state).join() === Array.from(b.state).join() && a.state.length === 2 * STATE_FLOATS,
         readIsASnapshot: [0, 1, 2, 3].some((k) => Math.abs(snap[k] - late[k]) > 1e-3),
         nanMotor: refused(() => g.setMotors(Float32Array.from([0, Number.NaN]))),
         hugeMotor: refused(() => g.setMotors(Float32Array.from([0, 1e4]))),
@@ -73,7 +92,11 @@ async function run() {
     const ctx = set.worlds.map((w) => {
         w.setGravity(...SCENE.gravity);
         const pivot = w.spawn({ x: SCENE.pivot[0], y: SCENE.pivot[1], z: SCENE.pivot[2], hx: 0.1, hy: 0.1, hz: 0.1, invMass: 0 });
-        const link = w.spawn({ x: SCENE.link[0], y: SCENE.link[1], z: SCENE.link[2], hx: SCENE.linkHalf[0], hy: SCENE.linkHalf[1], hz: SCENE.linkHalf[2], invMass: SCENE.invMass, friction: 0 });
+        const link = w.spawn({ x: SCENE.link[0], y: SCENE.link[1], z: SCENE.link[2], hx: SCENE.linkHalf[0], hy: SCENE.linkHalf[1], hz: SCENE.linkHalf[2], invMass: SCENE.invMass, friction: SCENE.linkFriction ?? 0, restitution: SCENE.linkRestitution ?? 0 });
+        if (SCENE.floor) {
+            const [qx, qy, qz, qw] = SCENE.floor.rot ?? [0, 0, 0, 1];
+            w.spawn({ x: SCENE.floor.pos[0], y: SCENE.floor.pos[1], z: SCENE.floor.pos[2], qx, qy, qz, qw, hx: SCENE.floor.half[0], hy: SCENE.floor.half[1], hz: SCENE.floor.half[2], invMass: 0, friction: SCENE.floor.friction ?? 0.5, restitution: SCENE.floor.restitution ?? 0 });
+        }
         const joint = w.createJoint({ kind: SLIDER ? JOINT_SLIDER : JOINT_HINGE, a: pivot, b: link, anchor: SCENE.anchor, axis: SCENE.axis, limits: SCENE.limits, motor: { velocity: 0, maxForce: SCENE.motorMax } });
         return { link, joint };
     });
@@ -90,6 +113,23 @@ async function run() {
     let lastPose: Float32Array[] = set.worlds.map((w) => w.readTransforms().slice(7, 10));
     let before: { cpu: Float32Array[]; phase: number[] } | null = null;
     let widest = 0, atLimit = 0;
+    // Worlds whose link had a corner inside the floor (grown by a hair) at the end of some tick: proof the scene reaches the contact path at all.
+    const touched = new Array<boolean>(WORLDS).fill(false);
+    const touchesFloor = (body: Float32Array) => {
+        const fl = SCENE.floor!, fq = fl.rot ?? [0, 0, 0, 1];
+        const rotate = (q: readonly number[], v: number[]) => {
+            const [ux, uy, uz] = q, qw = q[3];
+            const tx = 2 * (uy * v[2] - uz * v[1]), ty = 2 * (uz * v[0] - ux * v[2]), tz = 2 * (ux * v[1] - uy * v[0]);
+            return [v[0] + qw * tx + (uy * tz - uz * ty), v[1] + qw * ty + (uz * tx - ux * tz), v[2] + qw * tz + (ux * ty - uy * tx)];
+        };
+        const lq = [body[10], body[11], body[12], body[13]];
+        for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) {
+            const c = rotate(lq, [sx * SCENE.linkHalf[0], sy * SCENE.linkHalf[1], sz * SCENE.linkHalf[2]]);
+            const local = rotate([-fq[0], -fq[1], -fq[2], fq[3]], [body[7] + c[0] - fl.pos[0], body[8] + c[1] - fl.pos[1], body[9] + c[2] - fl.pos[2]]);
+            if ([0, 1, 2].every((k) => Math.abs(local[k]) <= fl.half[k] + 0.01)) return true;
+        }
+        return false;
+    };
     for (let t = 1; t <= TICKS; t++) {
         // The CPU wakes a body on every motor command, so a world meant to sleep gets none.
         if (SCENE.motorMax > 0) set.worlds.forEach((w, i) => w.setJointMotor(ctx[i].joint, motor(i, t), SCENE.motorMax));
@@ -97,6 +137,7 @@ async function run() {
         gpu.setMotors(Float32Array.from({ length: WORLDS }, (_, i) => (SCENE.motorMax > 0 ? motor(i, t) : 0)));
         set.step();
         gpu.step();
+        if (SCENE.floor) set.worlds.forEach((w, i) => { if (!touched[i] && touchesFloor(w.readTransforms())) touched[i] = true; });
         if (SCENE.motorMax === 0) {
             const { state: now } = await gpu.read();
             set.worlds.forEach((w, i) => {
@@ -139,7 +180,7 @@ async function run() {
     // A link parked against a limit stands exactly still awake until its quiet time is up, so its pose says nothing about when it should sleep: those are left out.
     const parked = set.worlds.map((w) => SCENE.limits.some((l) => Math.abs(w.readJointStates()[0].position - l) < 1e-3));
     const sleepTickMisses = SCENE.motorMax === 0 ? asleepAt.filter((g, i) => !parked[i] && (g < 0 || ![0, 1].includes(g - lastMoved[i]))).length : 0;
-    return { guards, sleepTickMisses, worlds: WORLDS, checks, widest, atLimit, adapter: `${info.vendor} ${info.architecture}`, userAgent: navigator.userAgent };
+    return { guards, sleepTickMisses, touched: touched.filter(Boolean).length, worlds: WORLDS, checks, widest, atLimit, adapter: `${info.vendor} ${info.architecture}`, userAgent: navigator.userAgent };
 }
 
 run().then(

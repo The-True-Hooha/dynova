@@ -7,7 +7,7 @@ describe('the constants the kernel reads', () => {
     const p = reacherParams(REACHER);
 
     it('are laid out as the shader declares them, one vec4 at a time', () => {
-        expect(p.length).toBe(48);
+        expect(p.length).toBe(68);
         expect(Array.from(p.subarray(0, 2))).toEqual([f(1 / 60), 1]);
         expect(p[3]).toBe(20);
         expect(Array.from(p.subarray(4, 7))).toEqual([0, f(-9.81), 0]);
@@ -82,5 +82,46 @@ describe('the joint kind', () => {
 
     it('refuses an unknown kind', () => {
         expect(() => reacherParams({ ...REACHER, kind: 'ball' as 'hinge' })).toThrow(/kind/);
+    });
+});
+
+describe('the floor constants', () => {
+    const floor = { pos: [0, -1, 0] as const, half: [4, 0.5, 4] as const };
+
+    it('say there is no floor unless the scene has one', () => {
+        expect(reacherParams(REACHER)[51]).toBe(0);
+        expect(Array.from(reacherParams(REACHER).subarray(52, 60))).toEqual([0.5, 0.5, 0.5, 0.5, 0, 0, 0, 1]);
+        const p = reacherParams({ ...REACHER, floor });
+        expect(Array.from(p.subarray(48, 52))).toEqual([0, -1, 0, 1]);
+        expect(Array.from(p.subarray(52, 56))).toEqual([4, 0.5, 4, 0.5]);
+        expect(Array.from(p.subarray(56, 60))).toEqual([0, 0, 0, 1]);
+    });
+
+    it('carry the link half sizes, both frictions and both restitutions', () => {
+        const p = reacherParams({ ...REACHER, floor: { ...floor, friction: 0.2, restitution: 0.6 }, linkFriction: 0.9, linkRestitution: 0.3 });
+        expect(Array.from(p.subarray(60, 64))).toEqual([...REACHER.linkHalf.map(f), f(0.9)]);
+        expect(p[55]).toBe(f(0.2));
+        expect(p[64]).toBe(f(0.3));
+        expect(p[65]).toBe(f(0.6));
+    });
+
+    it('normalise a rotation that is unit within tolerance', () => {
+        const h = Math.sin(0.15), c = Math.cos(0.15);
+        const p = reacherParams({ ...REACHER, floor: { ...floor, rot: [0, 0, h, c] } });
+        expect(Math.hypot(...Array.from(p.subarray(56, 60)))).toBeCloseTo(1, 6);
+    });
+
+    it('refuse what the core refuses for a body', () => {
+        for (const bad of [
+            { ...floor, pos: [Number.NaN, 0, 0] as const },
+            { ...floor, half: [0, 1, 1] as const },
+            { ...floor, rot: [0, 0, 0, 2] as const },
+            { ...floor, rot: [0, 0, Number.NaN, 1] as const },
+            { ...floor, half: [1e5, 1, 1] as const },
+            { ...floor, friction: 3 },
+            { ...floor, restitution: -0.1 },
+        ]) expect(() => reacherParams({ ...REACHER, floor: bad })).toThrow(RangeError);
+        expect(() => reacherParams({ ...REACHER, linkFriction: 5 })).toThrow(RangeError);
+        expect(() => reacherParams({ ...REACHER, linkRestitution: 2 })).toThrow(RangeError);
     });
 });
