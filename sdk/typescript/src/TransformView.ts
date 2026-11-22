@@ -198,6 +198,18 @@ export class TransformView {
         throw new Error('particle rows kept changing while they were read');
     }
 
+    /** The number of particles in the last published tick, without copying the rows. */
+    particleCount(): number {
+        for (let attempt = 0; attempt < RECORDING_ATTEMPTS; attempt++) {
+            this.live();
+            const seq = Atomics.load(this.header, H_PSTATE_SEQ);
+            if (seq & 1) continue;
+            const n = Atomics.load(this.header, H_PSTATE_N) >>> 0;
+            if (Atomics.load(this.header, H_PSTATE_SEQ) === seq) return n;
+        }
+        throw new Error('the particle count kept changing while it was read');
+    }
+
     /**
      * Rows the runtime wrote to the query result buffer since row number `from` (a running count that wraps at 2^32). Never more than
      * `QUERY_ROWS - 1` come back (the slot the runtime writes next still holds the oldest row): when the reader fell further behind than the buffer holds, `lost` counts the rows that were overwritten.

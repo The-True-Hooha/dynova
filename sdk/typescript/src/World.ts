@@ -201,7 +201,10 @@ export class World {
     private nextGroup = 0;
     /** Particles the commands sent so far would make if every one is accepted: the index the next group starts at. */
     private nextParticle = 0;
-    /** Fluid and sand particles the commands sent so far would make: the core holds at most `MAX_FLUID_PARTICLES` of them. */
+    /** Fluid and sand groups the commands sent so far would make, as `[first, count]`: the core holds at most `MAX_FLUID_PARTICLES` particles of them. */
+    private granular: Array<readonly [first: number, count: number, afterSeeks: number]> = [];
+    /** Seeks and resets queued so far: a group stamped with the current value was queued after the last of them, so the core's reset or seek cannot have dropped it. */
+    private seeksQueued = 0;
     private nextGranular = 0;
     private knownSeeks = 0;
 
@@ -284,6 +287,7 @@ export class World {
             this.knownSeeks = seeks;
             const { generations, live } = this.transforms.slotTables();
             this.ids.resync(generations, live);
+            this.resyncParticles(this.transforms.particleCount());
         }
         const peek = this.transforms.peekEpoch();
         if ((peek & 1) === 0 && peek !== this.knownEpoch) {
@@ -659,6 +663,13 @@ export class World {
         if (!(Math.fround(last) >= 0 && Math.fround(last) <= 1)) throw new RangeError(`${name} must be within 0..1, got ${last}`);
     }
 
+    /** After a seek or a reset the core's particle count is the truth: groups that start at or past it are gone, whatever refusals or rewinds happened since they were queued. */
+    private resyncParticles(n: number): void {
+        this.nextParticle = n;
+        this.granular = this.granular.filter(([first, count, afterSeeks]) => afterSeeks === this.seeksQueued || first + count <= n);
+        this.nextGranular = this.granular.reduce((sum, [, count]) => sum + count, 0);
+    }
+
     private queueGroup(count: number, make: (id: number) => Queued, granular = false): ParticleGroup {
         if (this.nextGroup >= MAX_GROUP_ID) throw new RangeError('group id limit reached');
         if (this.nextGroup >= MAX_PARTICLE_GROUPS) throw new RangeError(`a world holds at most ${MAX_PARTICLE_GROUPS} particle groups`);
@@ -666,9 +677,12 @@ export class World {
         if (granular && this.nextGranular + count > MAX_FLUID_PARTICLES) throw new RangeError(`a world holds at most ${MAX_FLUID_PARTICLES} fluid and sand particles`);
         const id = this.nextGroup;
         if (!this.enqueue(make(id))) throw new Error('CommandRing full');
-        if (granular) this.nextGranular += count;
         this.nextGroup++;
         const first = this.nextParticle;
+        if (granular) {
+            this.granular.push([first, count, this.seeksQueued]);
+            this.nextGranular += count;
+        }
         this.nextParticle += count;
         return { id, first, count };
     }
@@ -745,6 +759,7 @@ export class World {
     reset(): void {
         this.assertAlive();
         if (!this.enqueue({ k: 'reset' })) throw new Error('CommandRing full');
+        this.seeksQueued++;
     }
 
     /**
@@ -759,6 +774,7 @@ export class World {
         this.assertAlive();
         if (!Number.isInteger(tick) || tick < 0 || tick > 0xffffffff) throw new RangeError(`tick must be an integer in [0, 2^32), got ${tick}`);
         if (!this.enqueue({ k: 'seek', tick })) throw new Error('CommandRing full');
+        this.seeksQueued++;
     }
 
     /** Recording range, paused flag, tick and state hash; `null` if the runtime kept rewriting them through every read attempt. */

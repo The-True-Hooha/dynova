@@ -207,6 +207,60 @@ describe('host checks judge what the core will see', () => {
         expect(w.createChain({ from: [0, 0, 0], to: [1, 0, 0], count: 3 }).first).toBe(4096);
     });
 
+    it('a reset or a seek back past a group gives its particles and its share of the fluid cap back, so the next group starts where the core will put it', () => {
+        const w = world();
+        w.checkpoint();
+        w.step();
+        const half = { origin: [0, 0, 0], n: [32, 32, 2], spacing: 0.05 } as const;
+        w.createFluid(half);
+        expect(w.createSand(half).first).toBe(2048);
+        w.step();
+        expect(w.readParticles().length).toBe(4096 * 4);
+        w.reset();
+        w.step();
+        expect(w.readParticles().length).toBe(0);
+        const again = w.createFluid(half);
+        expect(again.first).toBe(0);
+        w.step();
+        expect(w.readParticles().length).toBe(2048 * 4);
+
+        // Made in the same frame as the reset: the core keeps it, so it still counts against the cap.
+        const x = world();
+        x.checkpoint();
+        x.step();
+        x.createChain({ from: [0, 5, 0], to: [1, 5, 0], count: 100 });
+        x.step();
+        x.reset();
+        x.createFluid(half);
+        x.step();
+        expect(x.readParticles().length).toBe(2048 * 4);
+        expect(x.createSand(half).first).toBe(2048);
+        expect(() => x.createFluid({ origin: [0, 0, 0], n: [2, 2, 2], spacing: 0.05 })).toThrow(/at most 4096 fluid and sand/);
+
+        // A group that ends exactly where the core's count now stands survives the reset and keeps its share of the cap.
+        const u = world();
+        u.createFluid(half);
+        u.checkpoint();
+        u.step();
+        u.createSand(half);
+        u.step();
+        u.reset();
+        u.step();
+        expect(u.createSand(half).first).toBe(2048);
+        expect(() => u.createFluid({ origin: [0, 0, 0], n: [2, 2, 2], spacing: 0.05 })).toThrow(/at most 4096 fluid and sand/);
+
+        const v = world();
+        v.record(true);
+        v.step();
+        for (let t = 0; t < 30; t++) {
+            if (t === 20) v.createChain({ from: [0, 5, 0], to: [1, 5, 0], count: 5, pinFirst: true });
+            v.step();
+        }
+        v.seek(10);
+        v.step();
+        expect(v.createChain({ from: [0, 3, 0], to: [1, 3, 0], count: 3 }).first).toBe(0);
+    });
+
     it('judges lattice limits on the f32 values: a spacing that rounds onto a bound passes, one past it does not', () => {
         const w = world();
         const lattice = { origin: [0, 0, 0], n: [2, 2, 2] } as const;

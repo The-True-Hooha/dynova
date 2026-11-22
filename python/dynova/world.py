@@ -88,6 +88,9 @@ class World:
         self._next_group = 0
         self._next_particle = 0
         self._next_granular = 0
+        self._granular: List[Tuple[int, int, int]] = []
+        # Seeks and resets queued so far: a group stamped with this value was queued after the last of them, so the core's reset or seek cannot have dropped it.
+        self._seeks_queued = 0
         self._known_seeks = 0
         self._fatal: Optional[str] = None
 
@@ -169,6 +172,7 @@ class World:
         if seeks != self._known_seeks and self.pending_commands == 0:
             self._known_seeks = seeks
             self._resync(header)
+            self._resync_particles(int(header[w.H_PSTATE_N]))
 
     def _resync(self, header: np.ndarray) -> None:
         capacity = int(header[w.H_CAPACITY])
@@ -265,6 +269,7 @@ class World:
         if not isinstance(tick, (int, np.integer)) or not 0 <= tick <= 0xFFFFFFFF:
             raise ValueError(f"tick must be an integer in [0, 2^32), got {tick!r}")
         self._send(w.seek(tick))
+        self._seeks_queued += 1
 
     def checkpoint(self) -> None:
         """Remember the world as it is when the runtime reaches this command; `reset` returns to it."""
@@ -275,6 +280,7 @@ class World:
         """Return to the checkpoint without advancing; refused (counted in `malformed_dropped`) with no checkpoint or while recording."""
         self._alive()
         self._send(w.reset())
+        self._seeks_queued += 1
 
     # ----- joints ---------------------------------------------------------------------------------------------------------------
 
@@ -367,6 +373,12 @@ class World:
         view = self._inst.mem()[at : at + capacity * w.FLOATS_PER_TRANSFORM * 4].view(np.float32).reshape(capacity, w.FLOATS_PER_TRANSFORM)
         return view.copy() if copy else self._inst.owned(view)
 
+    def _resync_particles(self, n: int) -> None:
+        # After a seek or a reset the core's particle count is the truth: groups that start at or past it are gone, whatever refusals or rewinds happened since.
+        self._next_particle = n
+        self._granular = [(first, count, after) for first, count, after in self._granular if after == self._seeks_queued or first + count <= n]
+        self._next_granular = sum(count for _, count, _ in self._granular)
+
     def _group(self, count: int, send, granular: bool = False) -> "ParticleGroup":
         if self._next_group >= w.MAX_GROUP_ID:
             raise ValueError("group id limit reached")
@@ -378,6 +390,7 @@ class World:
             raise ValueError(f"a world holds at most {w.MAX_FLUID_PARTICLES} fluid and sand particles")
         send(self._next_group)
         if granular:
+            self._granular.append((self._next_particle, count, self._seeks_queued))
             self._next_granular += count
         group = ParticleGroup(self._next_group, self._next_particle, count)
         self._next_group += 1

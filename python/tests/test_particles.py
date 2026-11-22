@@ -195,3 +195,59 @@ def test_numpy_integers_are_accepted_wherever_a_count_is_and_a_float_count_is_no
         assert w.read_particles().shape == (23, 4)
         with pytest.raises(ValueError):
             w.create_chain((0, 5, 0), (2, 5, 0), 6.0)
+
+
+def test_a_reset_or_a_seek_back_past_a_group_gives_its_particles_and_fluid_cap_back():
+    batch, w = one()
+    with batch:
+        w.checkpoint()
+        batch.step()
+        w.create_fluid((0, 0, 0), (32, 32, 2), 0.05)
+        assert w.create_sand((0, 0, 0), (32, 32, 2), 0.05).first == 2048
+        batch.step()
+        assert w.read_particles().shape == (4096, 4)
+        w.reset()
+        batch.step()
+        assert w.read_particles().shape == (0, 4)
+        assert w.create_fluid((0, 0, 0), (32, 32, 2), 0.05).first == 0
+        batch.step()
+        assert w.read_particles().shape == (2048, 4)
+
+    batch, w = one()
+    with batch:
+        w.checkpoint()
+        batch.step()
+        w.create_chain((0, 5, 0), (1, 5, 0), 100)
+        batch.step()
+        w.reset()
+        w.create_fluid((0, 0, 0), (32, 32, 2), 0.05)
+        batch.step()
+        assert w.read_particles().shape == (2048, 4)
+        assert w.create_sand((0, 0, 0), (32, 32, 2), 0.05).first == 2048
+        with pytest.raises(ValueError, match="at most 4096 fluid and sand"):
+            w.create_fluid((0, 0, 0), (2, 2, 2), 0.05)
+
+    batch, w = one()
+    with batch:
+        w.create_fluid((0, 0, 0), (32, 32, 2), 0.05)
+        w.checkpoint()
+        batch.step()
+        w.create_sand((0, 0, 0), (32, 32, 2), 0.05)
+        batch.step()
+        w.reset()
+        batch.step()
+        assert w.create_sand((0, 0, 0), (32, 32, 2), 0.05).first == 2048
+        with pytest.raises(ValueError, match="at most 4096 fluid and sand"):
+            w.create_fluid((0, 0, 0), (2, 2, 2), 0.05)
+
+    batch, w = one()
+    with batch:
+        w.record(True)
+        batch.step()
+        for t in range(30):
+            if t == 20:
+                w.create_chain((0, 5, 0), (1, 5, 0), 5)
+            batch.step()
+        w.seek(10)
+        batch.step()
+        assert w.create_chain((0, 3, 0), (1, 3, 0), 3).first == 0
