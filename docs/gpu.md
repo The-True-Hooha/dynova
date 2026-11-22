@@ -4,11 +4,13 @@ Phase 18 adds `@dynova/gpu`: a WebGPU compute path that steps many copies of one
 
 ## What it runs
 
-One compute invocation steps one world. Per tick, in 4 substeps: gravity, damping, the hinge rows (three for the anchor point, two for the axis, a motor row, a lower and an upper limit row), warm start, up to 32 solver sweeps with an early exit when the residual is small, a position correction for the axis, then integration. It is a port of the CPU solver for exactly this scene, so it is not a general engine.
+One compute invocation steps one world. Per tick, in 4 substeps: the sleep check, gravity, damping, the hinge rows (three for the anchor point, two for the axis, a motor row, a lower and an upper limit row), warm start, up to 32 solver sweeps with an early exit when the residual is small, a position correction for the axis, then integration. It is a port of the CPU solver for exactly this scene, so it is not a general engine.
 
-`ReacherScene.kind` picks the joint: `'hinge'` (the default; angle in radians) or `'slider'` (offset along the axis in metres; two rows across the axis and three holding the orientation). The slider assumes the bodies start unrotated. A motor force of 0 is not what the CPU runs, because the CPU sleeps a jointed body with no motor.
+`ReacherScene.kind` picks the joint: `'hinge'` (the default; angle in radians) or `'slider'` (offset along the axis in metres; two rows across the axis and three holding the orientation). The slider assumes the bodies start unrotated.
 
-Not in the GPU path: contacts and collision, sleep, particles, ball, fixed and distance joints, more than one link, and the CPU's swept test against the pivot (a link that starts within one substep's travel of the pivot's box is not what the CPU runs).
+Sleep follows the core's rules for a lone jointed body, judged at the start of each substep: a link that stays under 0.3 m/s (and 0.3 rad/s) and is not still gaining speed for 0.2 s falls asleep, and a motor force above 0 keeps it awake. A sleeper is left untouched and costs almost nothing; only `reset` wakes it. The CPU also wakes a body on every `setJointMotor`, even with a force of 0, so a loop that commands a motor every tick keeps a CPU link awake and not a GPU one; in a scene with `motorMax` 0 send no motor commands to the CPU if you compare them.
+
+Not in the GPU path: contacts and collision, particles, ball, fixed and distance joints, more than one link, and the CPU's swept test against the pivot (a link that starts within one substep's travel of the pivot's box is not what the CPU runs).
 
 ## API
 
@@ -54,5 +56,6 @@ Chromium here reaches WebGPU only through SwiftShader, a CPU rasteriser (it also
 
 - Firefox, x86_64 and GPUs other than the M3 Pro were not run.
 - The slider's orientation correction (position correction of its angular rows) and its quaternion sign flip have effects below the tolerance in every scene tried. The slider scenes (`joint=slider`, a skewed one, one with the anchor off the link centre) match the CPU to about 1e-6.
+- Sleep: the spin the previous substep's position correction adds (and ignoring it in a tick's first substep) is below the tolerance in every scene tried. A sleep decision can flip a substep for a world within 1e-6 of a threshold (0.3 m/s, 0.2 s, 0.5 m/s squared a second), which moves its pose by up to 1e-3.
 - Four solver behaviours have effects below the tolerance in every scene tried, so a change to them would not fail the suite: the hinge-axis position correction (largest effect 4.8e-5 rad), the motor warm-start reset, the solver early exit and the bias on a penetrated limit. The 4 m/s joint bias clamp is checked by the kicked scene (`kick=100`), whose anchor errors reach it.
 - Results are not bit-identical across GPUs; do not put a GPU state in a hash, a recording or a snapshot.

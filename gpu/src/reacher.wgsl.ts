@@ -1,7 +1,8 @@
 /**
  * The arm scene on the GPU: one static pivot, one dynamic link on a hinge or a slider with a motor and limits, gravity, per-step damping. One invocation steps one world.
  * The structure follows the CPU solver in `core/src/physics.rs` and `core/src/physics/joints.rs` (sequential impulses, warm start, split-impulse
- * correction of the angular rows: the hinge axis, or a slider's orientation), minus everything the scene never uses: contacts, sleep, the swept test against statics.
+ * correction of the angular rows: the hinge axis, or a slider's orientation), minus everything the scene never uses: contacts, the swept test against statics.
+ * Sleep follows the CPU's rules for a lone jointed body (see `SLEEP_*`), judged at the start of each substep.
  */
 export const REACHER_WGSL = /* wgsl */ `
 struct Params {
@@ -31,6 +32,10 @@ const CONVERGED: f32 = 1e-4;
 const CORRECTION_ITERS: u32 = 4u;
 const ROWS: u32 = 8u;
 const PI: f32 = 3.14159265358979;
+// The core's sleep constants: speed squared below which a body is quiet, seconds of quiet before it sleeps, and the velocity change per second past which it is not at rest.
+const SLEEP_VEL_SQ: f32 = 0.09;
+const SLEEP_TIME: f32 = 0.2;
+const REST_ACCEL: f32 = 0.5;
 
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read_write> state: array<f32>;
@@ -78,6 +83,11 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
     var w = vec3<f32>(state[base + 10u], state[base + 11u], state[base + 12u]);
     var acc: array<f32, 9>;
     for (var i = 0u; i < 9u; i++) { acc[i] = state[base + 13u + i]; }
+    // Phase: 0 no step has run since the reset (the core has not yet marked the body as held by its joint), 1 awake, 2 asleep. A sleeper is left as it is.
+    var phase = u32(state[base + 23u]);
+    if (phase == 2u) { return; }
+    var timer = state[base + 22u];
+    var pw_last = vec3<f32>(0.0);
 
     let im = P.a.y;
     let ii = P.a.z;
@@ -99,6 +109,18 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
     let nlin = select(3u, 2u, slider);
 
     for (var sub_i = 0u; sub_i < substeps; sub_i++) {
+        // The correction turn of the step before counts as spin, except in a tick's first substep: what is left from the last tick is in no snapshot.
+        let held = phase != 0u || sub_i > 0u;
+        let ws = select(w, w + pw_last, sub_i > 0u);
+        let spinning = P.a.w > 0.0 || ws.x * ws.x + ws.y * ws.y + ws.z * ws.z >= SLEEP_VEL_SQ;
+        if (v.x * v.x + v.y * v.y + v.z * v.z < SLEEP_VEL_SQ && !spinning && held) { timer += dt; } else { timer = 0.0; }
+        if (timer >= SLEEP_TIME) {
+            v = vec3<f32>(0.0);
+            w = vec3<f32>(0.0);
+            phase = 2u;
+            break;
+        }
+        let v_before = v;
         v += P.g.xyz * dt;
         v *= P.lim.z;
         w *= P.lim.w;
@@ -213,6 +235,11 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
 
+        // A body still gaining speed is not at rest, however slow it is.
+        let dv = v - v_before;
+        if (dv.x * dv.x + dv.y * dv.y + dv.z * dv.z > (REST_ACCEL * dt) * (REST_ACCEL * dt)) { timer = 0.0; }
+        pw_last = pw;
+        phase = max(phase, 1u);
         pos += v * dt;
         q = integrate(q, w + pw, dt);
     }
@@ -222,6 +249,8 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
     state[base + 7u] = v.x; state[base + 8u] = v.y; state[base + 9u] = v.z;
     state[base + 10u] = w.x; state[base + 11u] = w.y; state[base + 12u] = w.z;
     for (var i = 0u; i < 9u; i++) { state[base + 13u + i] = acc[i]; }
+    state[base + 22u] = timer;
+    state[base + 23u] = f32(phase);
     let ub_end = rot(q, P.ref_b.xyz);
     let rb_end = rot(q, P.lb.xyz);
     let err_end = (P.pa.xyz + ra) - (pos + rb_end);

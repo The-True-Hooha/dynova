@@ -1,6 +1,6 @@
 import { REACHER_WGSL } from './reacher.wgsl.js';
 
-/** Floats per world in the state buffer: position 3, rotation 4, velocity 3, angular velocity 3, nine warm-start impulses, two spare. */
+/** Floats per world in the state buffer: position 3, rotation 4, velocity 3, angular velocity 3, nine warm-start impulses, the sleep timer in seconds, and the phase (0 fresh, 1 awake, 2 asleep). */
 export const STATE_FLOATS = 24;
 export const OBS_FLOATS = 2;
 export const MAX_WORLDS = 1 << 20;
@@ -8,7 +8,7 @@ export const MAX_WORLDS = 1 << 20;
 type V3 = readonly [number, number, number];
 
 /**
- * The arm scene: a static pivot box and a dynamic link on a hinge, as built by `examples/reacherEnv.ts`. Bodies start unrotated, which the slider relies on (its orientation rows hold the start rotation, taken as the identity). A motor force of 0 is not what the CPU runs: it sleeps a jointed body with no motor, and the GPU never sleeps. The nine warm-start slots follow the core's: a hinge uses 0-2 for the anchor and 3-4 for the axis, a slider 0-1 and 3-5, both 6 for the motor and 7-8 for the limits. `reacherParams` refuses what the CPU core
+ * The arm scene: a static pivot box and a dynamic link on a hinge, as built by `examples/reacherEnv.ts`. Bodies start unrotated, which the slider relies on (its orientation rows hold the start rotation, taken as the identity). A link sleeps by the core's rules for a lone jointed body: a motor force above 0 keeps it awake, a motor force of 0 lets it sleep after 0.2 s of rest, and only `reset` wakes it. The CPU also wakes a body on every `setJointMotor`, even with a force of 0; the GPU ignores motor commands to a sleeper, so a loop that commands every tick keeps the CPU link awake and not the GPU one. The nine warm-start slots follow the core's: a hinge uses 0-2 for the anchor and 3-4 for the axis, a slider 0-1 and 3-5, both 6 for the motor and 7-8 for the limits. `reacherParams` refuses what the CPU core
  * refuses for such a joint. The kernel has no swept test against the pivot: a link that starts within a substep's travel of the pivot's box is not what the CPU runs.
  */
 export interface ReacherScene {
@@ -134,7 +134,7 @@ export class GpuReacher {
         device.queue.writeBuffer(params, 0, reacherParams(scene));
         const state = device.createBuffer({ size: worlds * STATE_FLOATS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
         const motors = device.createBuffer({ size: worlds * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-        const obs = device.createBuffer({ size: worlds * OBS_FLOATS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const obs = device.createBuffer({ size: worlds * OBS_FLOATS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
         const bind = device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
             entries: [params, state, motors, obs].map((buffer, binding) => ({ binding, resource: { buffer } })),
@@ -156,6 +156,13 @@ export class GpuReacher {
         }
         this.device.queue.writeBuffer(this.state, 0, rows);
         this.device.queue.writeBuffer(this.motors, 0, new Float32Array(this.worlds));
+        // The observation of the start pose, so a read before the next step does not return the pair from before the reset (a sleeper never rewrites it).
+        const axis = unit(s.axis);
+        const observed = new Float32Array(this.worlds * OBS_FLOATS);
+        if (s.kind === 'slider') {
+            for (let i = 0; i < this.worlds; i++) observed[i * OBS_FLOATS + 1] = f(f(rows[i * STATE_FLOATS + 7] * axis[0]) + f(rows[i * STATE_FLOATS + 8] * axis[1]) + f(rows[i * STATE_FLOATS + 9] * axis[2]));
+        }
+        this.device.queue.writeBuffer(this.obs, 0, observed);
     }
 
     /** The motor speed of each world for the ticks that follow. Each tick it is treated as a fresh command, so its warm start restarts, as a `setJointMotor` every tick does on the CPU. */
