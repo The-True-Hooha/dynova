@@ -2,7 +2,7 @@
  * The arm scene on the GPU: one static pivot, one dynamic link on a hinge, a slider or a distance joint, with a motor and limits (a distance joint has no motor), gravity, per-step damping. One invocation steps one world.
  * The structure follows the CPU solver in `core/src/physics.rs` and `core/src/physics/joints.rs` (sequential impulses, warm start, split-impulse
  * correction of the angular rows: the hinge axis, or a slider's orientation), minus everything the scene never uses.
- * An optional static floor box adds the core's contact between the link and it: the box_box manifold, friction on a disc, restitution, split-impulse recovery of
+ * Up to two static floor boxes add the core's contact between the link and each: the box_box manifold, friction on a disc, restitution, split-impulse recovery of
  * penetration and the swept test against it. The contacts are warm-started by position as the core's are.
  * Sleep follows the CPU's rules for a lone jointed body (see `SLEEP_*`), judged at the start of each substep.
  */
@@ -31,9 +31,14 @@ struct Params {
     fq: vec4<f32>,
     lh: vec4<f32>,
     rs: vec4<f32>,
+    // second floor box: position and whether there is one, half extents and friction, rotation; its restitution is rs.z
+    fp2: vec4<f32>,
+    fh2: vec4<f32>,
+    fq2: vec4<f32>,
 }
 
-const STRIDE: u32 = 61u;
+const STRIDE: u32 = 97u;
+const MAX_CONTACTS: u32 = 8u;
 const SLOP: f32 = 0.01;
 const MAX_BIAS_VEL: f32 = 2.0;
 const BOUNCE_THRESHOLD: f32 = 2.0;
@@ -329,6 +334,13 @@ fn box_box(pa: vec3<f32>, ha_in: vec3<f32>, qa: vec4<f32>, pb: vec3<f32>, hb_in:
     return true;
 }
 
+fn fl_on(f: u32) -> bool { return select(P.fp.w, P.fp2.w, f == 1u) != 0.0; }
+fn fl_pos(f: u32) -> vec3<f32> { return select(P.fp.xyz, P.fp2.xyz, f == 1u); }
+fn fl_half(f: u32) -> vec3<f32> { return select(P.fh.xyz, P.fh2.xyz, f == 1u); }
+fn fl_q(f: u32) -> vec4<f32> { return select(P.fq, P.fq2, f == 1u); }
+fn fl_friction(f: u32) -> f32 { return select(P.fh.w, P.fh2.w, f == 1u); }
+fn fl_restitution(f: u32) -> f32 { return select(P.rs.y, P.rs.z, f == 1u); }
+
 fn tangent_pair(n: vec3<f32>) -> array<vec3<f32>, 2> {
     let axis = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.x) < 0.57);
     let t = cross(n, axis);
@@ -357,14 +369,9 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
     var pen_prev = state[base + 24u] != 0.0;
     var pen_acc = false;
     // What the contacts carried at the end of the last substep, by slot: normal impulse, two friction impulses, the point and the normal. A slot of zeros is empty.
-    var cw: array<f32, 36>;
-    for (var i = 0u; i < 36u; i++) { cw[i] = state[base + 25u + i]; }
-    let match_radius = 0.3 * min(length(P.lh.xyz), length(P.fh.xyz));
-    let has_floor = P.fp.w != 0.0;
-    let floor_pos = P.fp.xyz;
+    var cw: array<f32, 72>;
+    for (var i = 0u; i < 72u; i++) { cw[i] = state[base + 25u + i]; }
     let link_half = P.lh.xyz;
-    let mu = sqrt(P.lh.w * P.fh.w);
-    let restitution = min(P.rs.x, P.rs.y);
     let g_len = length(P.g.xyz);
     let up = select(vec3<f32>(0.0, 1.0, 0.0), -P.g.xyz / g_len, g_len > 1e-6);
 
@@ -398,69 +405,81 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
         let vs = select(v, v + pv_last, sub_i > 0u);
         if (vs.x * vs.x + vs.y * vs.y + vs.z * vs.z < SLEEP_VEL_SQ && !spinning && held && !pen_prev) { timer += dt; } else { timer = 0.0; }
         if (timer >= SLEEP_TIME) {
-            for (var i = 0u; i < 36u; i++) { cw[i] = 0.0; }
+            for (var i = 0u; i < 72u; i++) { cw[i] = 0.0; }
             v = vec3<f32>(0.0);
             w = vec3<f32>(0.0);
             phase = 2u;
             break;
         }
-        // The link's contacts with the floor, found where the link is at the start of the substep.
+        // The link's contacts with each floor, found where the link is at the start of the substep. A floor's contacts are cached in its own four slots.
         var nc = 0u;
-        var c_n = vec3<f32>(0.0);
-        var c_ra: array<vec3<f32>, 4>;
-        var c_depth: array<f32, 4>;
-        var c_lam: array<f32, 4>;
-        var c_lt1: array<f32, 4>;
-        var c_lt2: array<f32, 4>;
-        var c_target: array<f32, 4>;
-        var c_bias: array<f32, 4>;
-        var c_pen: array<f32, 4>;
-        var order: array<u32, 4>;
+        var c_n: array<vec3<f32>, 8>;
+        var c_ra: array<vec3<f32>, 8>;
+        var c_depth: array<f32, 8>;
+        var c_lam: array<f32, 8>;
+        var c_lt1: array<f32, 8>;
+        var c_lt2: array<f32, 8>;
+        var c_target: array<f32, 8>;
+        var c_bias: array<f32, 8>;
+        var c_pen: array<f32, 8>;
+        var c_mu: array<f32, 8>;
+        var c_rest: array<f32, 8>;
+        var c_slot: array<u32, 8>;
+        var order: array<u32, 8>;
         var pen_sub = false;
-        var used = 0u;
-        if (has_floor && box_box(pos, link_half, q, floor_pos, P.fh.xyz, P.fq)) {
-            nc = m_len;
-            c_n = m_n;
-            for (var i = 0u; i < nc; i++) {
-                c_ra[i] = m_pt[i] - pos;
-                c_depth[i] = m_depth[i];
+        for (var fl = 0u; fl < 2u; fl++) {
+            if (!fl_on(fl) || !box_box(pos, link_half, q, fl_pos(fl), fl_half(fl), fl_q(fl))) { continue; }
+            let match_radius = 0.3 * min(length(P.lh.xyz), length(fl_half(fl)));
+            let n_here = m_n;
+            let mu_here = sqrt(P.lh.w * fl_friction(fl));
+            let rest_here = min(P.rs.x, fl_restitution(fl));
+            var used = 0u;
+            for (var k = 0u; k < m_len; k++) {
+                let i = nc;
+                nc++;
+                c_n[i] = n_here;
+                c_mu[i] = mu_here;
+                c_rest[i] = rest_here;
+                c_slot[i] = fl * 4u + k;
+                c_ra[i] = m_pt[k] - pos;
+                c_depth[i] = m_depth[k];
                 order[i] = i;
-                if (m_depth[i] > 2.0 * SLOP) { pen_sub = true; }
-                // Warm start: the nearest unused cached contact within the matching radius, its friction turned from its old tangents onto the new ones.
+                if (m_depth[k] > 2.0 * SLOP) { pen_sub = true; }
+                // Warm start: the nearest unused cached contact of this floor within the matching radius, its friction turned from its old tangents onto the new ones.
                 var best = 4u;
                 var best_d = BIG;
                 for (var slot = 0u; slot < 4u; slot++) {
-                    let e = slot * 9u;
+                    let e = (fl * 4u + slot) * 9u;
                     if ((used & (1u << slot)) != 0u || (cw[e] == 0.0 && cw[e + 1u] == 0.0 && cw[e + 2u] == 0.0)) { continue; }
-                    let off = vec3<f32>(cw[e + 3u], cw[e + 4u], cw[e + 5u]) - m_pt[i];
+                    let off = vec3<f32>(cw[e + 3u], cw[e + 4u], cw[e + 5u]) - m_pt[k];
                     let dd = dot(off, off);
                     if (dd <= match_radius * match_radius && (best == 4u || dd < best_d)) { best = slot; best_d = dd; }
                 }
                 if (best < 4u) {
                     used |= 1u << best;
-                    let e = best * 9u;
+                    let e = (fl * 4u + best) * 9u;
                     let old_t = tangent_pair(vec3<f32>(cw[e + 6u], cw[e + 7u], cw[e + 8u]));
                     let f = old_t[0] * cw[e + 1u] + old_t[1] * cw[e + 2u];
-                    let new_t = tangent_pair(m_n);
+                    let new_t = tangent_pair(n_here);
                     c_lam[i] = cw[e];
                     c_lt1[i] = dot(f, new_t[0]);
                     c_lt2[i] = dot(f, new_t[1]);
                 }
             }
-            // Lowest first by the point's height against gravity, ties by manifold order, as the core sorts them.
-            for (var i = 1u; i < nc; i++) {
-                let key = order[i];
-                let hk = dot(pos + c_ra[key], up);
-                var j = i;
-                while (j > 0u) {
-                    let prev = order[j - 1u];
-                    let hp = dot(pos + c_ra[prev], up);
-                    if (hp < hk || (hp == hk && prev < key)) { break; }
-                    order[j] = prev;
-                    j--;
-                }
-                order[j] = key;
+        }
+        // Lowest first by the point's height against gravity, ties by contact order, as the core sorts them.
+        for (var i = 1u; i < nc; i++) {
+            let key = order[i];
+            let hk = dot(pos + c_ra[key], up);
+            var j = i;
+            while (j > 0u) {
+                let prev = order[j - 1u];
+                let hp = dot(pos + c_ra[prev], up);
+                if (hp < hk || (hp == hk && prev < key)) { break; }
+                order[j] = prev;
+                j--;
             }
+            order[j] = key;
         }
 
         let v_before = v;
@@ -469,8 +488,8 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
         w *= P.lim.w;
 
         for (var i = 0u; i < nc; i++) {
-            let vn = dot(v + cross(w, c_ra[i]), c_n);
-            c_target[i] = select(0.0, -restitution * vn, vn < -BOUNCE_THRESHOLD);
+            let vn = dot(v + cross(w, c_ra[i]), c_n[i]);
+            c_target[i] = select(0.0, -c_rest[i] * vn, vn < -BOUNCE_THRESHOLD);
             c_bias[i] = min(k_bias * max(c_depth[i] - SLOP, 0.0), MAX_BIAS_VEL);
         }
 
@@ -561,8 +580,8 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
         // Contacts first, then the joint rows, as the core does.
         for (var i = 0u; i < nc; i++) {
             if (c_lam[i] == 0.0 && c_lt1[i] == 0.0 && c_lt2[i] == 0.0) { continue; }
-            let tw = tangent_pair(c_n);
-            let imp = c_n * c_lam[i] + tw[0] * c_lt1[i] + tw[1] * c_lt2[i];
+            let tw = tangent_pair(c_n[i]);
+            let imp = c_n[i] * c_lam[i] + tw[0] * c_lt1[i] + tw[1] * c_lt2[i];
             v += imp * im;
             w += cross(c_ra[i], imp) * ii;
         }
@@ -598,16 +617,16 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             // The contacts, lowest to highest on one sweep and back down on the next. Friction is one constraint on a disc, then the normal.
             if (nc > 0u) {
-                let tn = tangent_pair(c_n);
                 for (var kk = 0u; kk < nc; kk++) {
                     let ci = select(order[nc - 1u - kk], order[kk], iter % 2u == 0u);
+                    let tn = tangent_pair(c_n[ci]);
                     let r = c_ra[ci];
                     let rt1 = cross(r, tn[0]);
                     let rt2 = cross(r, tn[1]);
                     let d1 = im + ii * dot(rt1, rt1);
                     let d2 = im + ii * dot(rt2, rt2);
                     let dm = max(d1, d2);
-                    let limit = mu * c_lam[ci];
+                    let limit = c_mu[ci] * c_lam[ci];
                     if (dm >= 1e-10) {
                         let v1 = dot(v + cross(w, r), tn[0]);
                         let v2 = dot(v + cross(w, r), tn[1]);
@@ -625,14 +644,14 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
                         c_lt2[ci] = new2;
                         residual = max(residual, max(abs(step1 * d1), abs(step2 * d2)));
                     }
-                    let rn = cross(r, c_n);
+                    let rn = cross(r, c_n[ci]);
                     let dn = im + ii * dot(rn, rn);
                     if (dn >= 1e-10) {
-                        let vn = dot(v + cross(w, r), c_n);
+                        let vn = dot(v + cross(w, r), c_n[ci]);
                         let lam = max(c_lam[ci] + (c_target[ci] - vn) / dn, 0.0);
                         let moved = lam - c_lam[ci];
-                        v += c_n * (moved * im);
-                        w += cross(r, c_n * moved) * ii;
+                        v += c_n[ci] * (moved * im);
+                        w += cross(r, c_n[ci] * moved) * ii;
                         residual = max(residual, abs(moved * dn));
                         c_lam[ci] = lam;
                     }
@@ -658,13 +677,13 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
                 let want_pen = c_bias[ci];
                 if (want_pen <= 0.0) { continue; }
                 let r = c_ra[ci];
-                let rn = cross(r, c_n);
+                let rn = cross(r, c_n[ci]);
                 let dn = im + ii * dot(rn, rn);
                 if (dn < 1e-10) { continue; }
-                let lam = max(c_pen[ci] + (want_pen - dot(pv + cross(pw, r), c_n)) / dn, 0.0);
+                let lam = max(c_pen[ci] + (want_pen - dot(pv + cross(pw, r), c_n[ci])) / dn, 0.0);
                 let moved = lam - c_pen[ci];
-                pv += c_n * (moved * im);
-                pw += cross(r, c_n * moved) * ii;
+                pv += c_n[ci] * (moved * im);
+                pw += cross(r, c_n[ci] * moved) * ii;
                 c_pen[ci] = lam;
             }
         }
@@ -676,53 +695,61 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
         pv_last = pv;
         phase = max(phase, 1u);
         var d = (v + pv) * dt;
-        // The swept test against the floor (the core also sweeps the pivot box, which this kernel does not): a link that would cross it in this substep stops short of it, and loses the speed into it.
+        // The swept test against each floor (the core also sweeps the pivot box, which this kernel does not): a link that would cross one in this substep stops short of the nearest, and loses the speed into it.
         let r_core = min(link_half.x, min(link_half.y, link_half.z));
         let reach = length(d);
-        if (has_floor && reach > max(r_core, 1e-4) * 0.5) {
-            let o = inv_rot(P.fq, pos - floor_pos);
-            let dl = inv_rot(P.fq, d);
-            let h = P.fh.xyz + vec3<f32>(r_core);
-            var t_min = 0.0;
-            var t_max = 1.0;
-            var enter_k = 3u;
-            var enter_sign = 0.0;
-            var miss = false;
-            for (var k = 0u; k < 3u; k++) {
-                if (abs(dl[k]) < 1e-9) {
-                    if (abs(o[k]) > h[k]) { miss = true; break; }
-                    continue;
+        if (reach > max(r_core, 1e-4) * 0.5) {
+            var best_t = 2.0;
+            var best_n = vec3<f32>(0.0);
+            for (var fl = 0u; fl < 2u; fl++) {
+                if (!fl_on(fl)) { continue; }
+                let o = inv_rot(fl_q(fl), pos - fl_pos(fl));
+                let dl = inv_rot(fl_q(fl), d);
+                let h = fl_half(fl) + vec3<f32>(r_core);
+                var t_min = 0.0;
+                var t_max = 1.0;
+                var enter_k = 3u;
+                var enter_sign = 0.0;
+                var miss = false;
+                for (var k = 0u; k < 3u; k++) {
+                    if (abs(dl[k]) < 1e-9) {
+                        if (abs(o[k]) > h[k]) { miss = true; break; }
+                        continue;
+                    }
+                    var t1 = (-h[k] - o[k]) / dl[k];
+                    var t2 = (h[k] - o[k]) / dl[k];
+                    if (t1 > t2) { let tmp = t1; t1 = t2; t2 = tmp; }
+                    if (t1 > t_min) { t_min = t1; enter_k = k; enter_sign = -signum(dl[k]); }
+                    t_max = min(t_max, t2);
+                    if (t_min > t_max) { miss = true; break; }
                 }
-                var t1 = (-h[k] - o[k]) / dl[k];
-                var t2 = (h[k] - o[k]) / dl[k];
-                if (t1 > t2) { let tmp = t1; t1 = t2; t2 = tmp; }
-                if (t1 > t_min) { t_min = t1; enter_k = k; enter_sign = -signum(dl[k]); }
-                t_max = min(t_max, t2);
-                if (t_min > t_max) { miss = true; break; }
+                if (!miss && enter_k < 3u && t_min > 0.0 && t_min < 1.0 && t_min < best_t) {
+                    var nl = vec3<f32>(0.0);
+                    nl[enter_k] = enter_sign;
+                    best_t = t_min;
+                    best_n = rot(fl_q(fl), nl);
+                }
             }
-            if (!miss && enter_k < 3u && t_min > 0.0 && t_min < 1.0) {
-                var nl = vec3<f32>(0.0);
-                nl[enter_k] = enter_sign;
-                let n_hit = rot(P.fq, nl);
-                d = d * max((t_min * reach - CCD_MARGIN) / reach, 0.0);
-                let vn = dot(v, n_hit);
-                if (vn < 0.0) { v -= n_hit * vn; }
+            if (best_t < 1.0) {
+                d = d * max((best_t * reach - CCD_MARGIN) / reach, 0.0);
+                let vn = dot(v, best_n);
+                if (vn < 0.0) { v -= best_n * vn; }
             }
         }
         pen_prev = pen_sub;
         pen_acc = pen_acc || pen_sub;
         pos += d;
         q = integrate(q, w + pw, dt);
-        // Keep the contacts that carried an impulse, by manifold index.
-        for (var i = 0u; i < 4u; i++) {
-            let e = i * 9u;
-            let live = i < nc && (abs(c_lam[i]) > 1e-6 || abs(c_lt1[i]) > 1e-6 || abs(c_lt2[i]) > 1e-6);
-            let pt = pos + c_ra[i];
-            cw[e] = select(0.0, c_lam[i], live);
-            cw[e + 1u] = select(0.0, c_lt1[i], live);
-            cw[e + 2u] = select(0.0, c_lt2[i], live);
-            cw[e + 3u] = select(0.0, pt.x, live); cw[e + 4u] = select(0.0, pt.y, live); cw[e + 5u] = select(0.0, pt.z, live);
-            cw[e + 6u] = select(0.0, c_n.x, live); cw[e + 7u] = select(0.0, c_n.y, live); cw[e + 8u] = select(0.0, c_n.z, live);
+        // Keep the contacts that carried an impulse, in the slot of their floor and manifold index.
+        for (var i = 0u; i < 72u; i++) { cw[i] = 0.0; }
+        for (var i = 0u; i < nc; i++) {
+            if (abs(c_lam[i]) > 1e-6 || abs(c_lt1[i]) > 1e-6 || abs(c_lt2[i]) > 1e-6) {
+                let e = c_slot[i] * 9u;
+                let pt = pos + c_ra[i];
+                cw[e] = c_lam[i]; cw[e + 1u] = c_lt1[i]; cw[e + 2u] = c_lt2[i];
+                cw[e + 3u] = pt.x; cw[e + 4u] = pt.y; cw[e + 5u] = pt.z;
+                cw[e + 6u] = c_n[i].x; cw[e + 7u] = c_n[i].y; cw[e + 8u] = c_n[i].z;
+            }
         }
     }
 
@@ -734,7 +761,7 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
     state[base + 22u] = timer;
     state[base + 23u] = f32(phase);
     state[base + 24u] = select(0.0, 1.0, pen_acc);
-    for (var i = 0u; i < 36u; i++) { state[base + 25u + i] = cw[i]; }
+    for (var i = 0u; i < 72u; i++) { state[base + 25u + i] = cw[i]; }
     let ub_end = rot(q, P.ref_b.xyz);
     let rb_end = rot(q, P.lb.xyz);
     let err_end = (P.pa.xyz + ra) - (pos + rb_end);

@@ -7,7 +7,7 @@ describe('the constants the kernel reads', () => {
     const p = reacherParams(REACHER);
 
     it('are laid out as the shader declares them, one vec4 at a time', () => {
-        expect(p.length).toBe(68);
+        expect(p.length).toBe(80);
         expect(Array.from(p.subarray(0, 2))).toEqual([f(1 / 60), 1]);
         expect(p[3]).toBe(20);
         expect(Array.from(p.subarray(4, 7))).toEqual([0, f(-9.81), 0]);
@@ -82,6 +82,31 @@ describe('the joint kind', () => {
 
     it('refuses an unknown kind', () => {
         expect(() => reacherParams({ ...REACHER, kind: 'ball' as 'hinge' })).toThrow(/kind/);
+    });
+});
+
+describe('two floors', () => {
+    const a = { pos: [0, -1, 0] as const, half: [4, 0.5, 4] as const, friction: 0.3, restitution: 0.2 };
+    const b = { pos: [0, 1, 0] as const, half: [3, 0.25, 2] as const, rot: [0, 0, 0.6, 0.8] as const, friction: 0.9, restitution: 0.6 };
+
+    it('put the second box after the first, with its own friction, rotation and restitution', () => {
+        const p = reacherParams({ ...REACHER, floors: [a, b] });
+        expect(Array.from(p.subarray(48, 52))).toEqual([0, -1, 0, 1]);
+        expect(Array.from(p.subarray(68, 72))).toEqual([0, 1, 0, 1]);
+        expect(Array.from(p.subarray(72, 76))).toEqual([3, 0.25, 2, f(0.9)]);
+        expect(Array.from(p.subarray(76, 80))).toEqual([0, 0, f(0.6), f(0.8)]);
+        expect(Array.from(p.subarray(64, 67))).toEqual([0, f(0.2), f(0.6)]);
+    });
+
+    it('make `floor` the same as a list of one, and leave the second slot empty', () => {
+        expect(reacherParams({ ...REACHER, floors: [a] })).toEqual(reacherParams({ ...REACHER, floor: a }));
+        expect(reacherParams({ ...REACHER, floors: [a] })[71]).toBe(0);
+    });
+
+    it('refuse a third box, both spellings at once, and a bad second box', () => {
+        expect(() => reacherParams({ ...REACHER, floors: [a, a, a] })).toThrow(RangeError);
+        expect(() => reacherParams({ ...REACHER, floor: a, floors: [a] })).toThrow(RangeError);
+        expect(() => reacherParams({ ...REACHER, floors: [a, { ...b, half: [0, 1, 1] }] })).toThrow(RangeError);
     });
 });
 

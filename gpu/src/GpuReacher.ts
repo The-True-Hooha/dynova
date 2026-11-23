@@ -1,7 +1,7 @@
 import { REACHER_WGSL } from './reacher.wgsl.js';
 
-/** Floats per world in the state buffer: position 3, rotation 4, velocity 3, angular velocity 3, nine warm-start impulses, the sleep timer in seconds, the phase (0 fresh, 1 awake, 2 asleep), whether a deep contact held the link in its last tick, and four contact slots of nine (normal impulse, two friction impulses, point, normal). */
-export const STATE_FLOATS = 61;
+/** Floats per world in the state buffer: position 3, rotation 4, velocity 3, angular velocity 3, nine warm-start impulses, the sleep timer in seconds, the phase (0 fresh, 1 awake, 2 asleep), whether a deep contact held the link in its last tick, and eight contact slots of nine, four a box (normal impulse, two friction impulses, point, normal). */
+export const STATE_FLOATS = 97;
 export const OBS_FLOATS = 2;
 export const MAX_WORLDS = 1 << 20;
 
@@ -31,7 +31,9 @@ export interface ReacherScene {
     dt: number;
     /** A static box the link collides with in every world; none when absent. */
     floor?: FloorBox;
-    /** Friction and restitution of the link as `World.spawn` takes them (0.5 and 0 by default, as the core's). They only matter with a `floor`. */
+    /** Up to `MAX_FLOORS` static boxes, in place of `floor`. Contacts are sorted by height across all of them, ties in the order given. */
+    floors?: readonly FloorBox[];
+    /** Friction and restitution of the link as `World.spawn` takes them (0.5 and 0 by default, as the core's). They only matter with a `floor` or `floors`. */
     linkFriction?: number;
     linkRestitution?: number;
 }
@@ -80,7 +82,8 @@ function perpendicular(axis: V3): V3 {
     return unit(cross(axis, pick));
 }
 
-const PARAM_FLOATS = 68;
+const PARAM_FLOATS = 80;
+export const MAX_FLOORS = 2;
 const MAX_COORD = 1e6;
 const MAX_ANGLE_LIMIT = 3.1;
 const MAX_LINEAR_LIMIT = 1e4;
@@ -93,6 +96,10 @@ function check(ok: boolean, what: string): void {
     if (!ok) throw new RangeError(what);
 }
 
+function floorsOf(s: ReacherScene): readonly FloorBox[] {
+    return s.floors ?? (s.floor ? [s.floor] : []);
+}
+
 function validate(s: ReacherScene): void {
     const finite3 = (v: V3, bound: number) => v.length === 3 && v.every((c) => Number.isFinite(c) && Math.abs(c) <= bound);
     check(finite3(s.pivot, MAX_COORD) && finite3(s.link, MAX_COORD) && finite3(s.anchor, MAX_COORD), 'pivot, link and anchor must be finite 3-vectors within range');
@@ -101,8 +108,10 @@ function validate(s: ReacherScene): void {
     check(s.invMass > 0 && s.invMass <= 1e6, `invMass must be within (0, 1e6], got ${s.invMass}: a link with no inverse mass is static`);
     check(Number.isFinite(s.dt) && s.dt > 0 && s.dt <= 1, `dt must be within (0, 1], got ${s.dt}`);
     check(s.motorMax >= 0 && s.motorMax <= MAX_MOTOR_FORCE, `motorMax must be within 0..${MAX_MOTOR_FORCE}, got ${s.motorMax}`);
-    if (s.floor) {
-        const fl = s.floor, rotQ = fl.rot ?? [0, 0, 0, 1];
+    check(!(s.floor && s.floors), 'give `floor` or `floors`, not both');
+    check(!s.floors || s.floors.length <= MAX_FLOORS, `at most ${MAX_FLOORS} floors, got ${s.floors?.length}`);
+    for (const fl of floorsOf(s)) {
+        const rotQ = fl.rot ?? [0, 0, 0, 1];
         check(finite3(fl.pos, MAX_COORD), 'the floor position must be a finite 3-vector within range');
         check(fl.half.length === 3 && fl.half.every((h) => h >= 1e-3 && h <= 1e4), 'floor half sizes must be within 0.001..10000');
         const len = rotQ.reduce((a, c) => a + c * c, 0);
@@ -149,17 +158,18 @@ export function reacherParams(s: ReacherScene): Float32Array {
     p.set([...axis, distance ? f(Math.sqrt(f(f(gap[0] * gap[0]) + f(gap[1] * gap[1]) + f(gap[2] * gap[2])))) : 0, ...axis, distance && s.limits ? 1 : 0, ...ref, 0, ...ref, 0], 24);
     p.set([0, 0, 0, 1], 40);
     p.set([...s.pivot, KIND[s.kind ?? 'hinge']], 44);
-    if (s.floor) {
-        const fl = s.floor, q = fl.rot ?? [0, 0, 0, 1];
+    const floors = floorsOf(s);
+    for (let n = 0; n < MAX_FLOORS; n++) {
+        const fl = floors[n], at = n === 0 ? 48 : 68;
+        if (!fl) { p.set([0, 0, 0, 0, 0.5, 0.5, 0.5, 0.5, 0, 0, 0, 1], at); continue; }
+        const q = fl.rot ?? [0, 0, 0, 1];
         const ql = f(Math.sqrt(f(f(q[0] * q[0]) + f(q[1] * q[1]) + f(q[2] * q[2]) + f(q[3] * q[3]))));
-        p.set([...fl.pos, 1], 48);
-        p.set([...fl.half, fl.friction ?? 0.5], 52);
-        p.set([f(q[0] / ql), f(q[1] / ql), f(q[2] / ql), f(q[3] / ql)], 56);
-    } else {
-        p.set([0, 0, 0, 0, 0.5, 0.5, 0.5, 0.5, 0, 0, 0, 1], 48);
+        p.set([...fl.pos, 1], at);
+        p.set([...fl.half, fl.friction ?? 0.5], at + 4);
+        p.set([f(q[0] / ql), f(q[1] / ql), f(q[2] / ql), f(q[3] / ql)], at + 8);
     }
     p.set([...s.linkHalf, s.linkFriction ?? 0.5], 60);
-    p.set([s.linkRestitution ?? 0, s.floor?.restitution ?? 0, 0, 0], 64);
+    p.set([s.linkRestitution ?? 0, floors[0]?.restitution ?? 0, floors[1]?.restitution ?? 0, 0], 64);
     return p;
 }
 
@@ -258,7 +268,7 @@ export class GpuReacher {
         return { state: all.subarray(0, this.worlds * STATE_FLOATS), obs: all.subarray(this.worlds * STATE_FLOATS) };
     }
 
-    /** Only the observation pairs (`[coordinate, rate]`, see the class): what a control loop reads each tick, 2 floats a world instead of the state's 61 more. */
+    /** Only the observation pairs (`[coordinate, rate]`, see the class): what a control loop reads each tick, 2 floats a world instead of the state's 97 more. */
     readObs(): Promise<Float32Array> {
         this.assertAlive();
         return this.copyOut(false);

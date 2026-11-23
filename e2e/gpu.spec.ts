@@ -17,6 +17,12 @@ for (const [name, query] of [['a driven arm', 'n=64&amp=3'], ['an arm driven int
     ['an arm that comes to rest on a floor and sleeps', 'n=64&floor=tip&sleep=1&ticks=600&kick=1'],
     ['an arm that comes to rest on a tilted floor and sleeps', 'n=64&floor=slope&sleep=1&ticks=600&kick=2'],
     ['an arm driven against a post', 'n=64&floor=block&amp=3'],
+    ['a driven arm whose tip meets a floor and a ceiling (two static boxes)', 'n=64&floor=tip,ceil&amp=3'],
+    ['a slider driven at up to 40 m/s at a thin floor listed second, with a thicker floor behind it (the nearest sweep wins)', 'n=64&floor=behind,thin&joint=slider&amp=3&kick=10'],
+    ['the same slider with the thin floor listed first', 'n=64&floor=thin,behind&joint=slider&amp=3&kick=10'],
+    ['a driven arm squeezed by two boxes at once in every substep', 'n=64&floor=slo,shi&amp=3&kick=0.5'],
+    ['a driven arm wedged between two boxes (contacts on both at once)', 'n=64&floor=lo,hi&amp=3&kick=0.5'],
+    ['an arm kicked into a floor and a ceiling, bouncing between them', 'n=64&floor=tip,ceil&amp=3&kick=3&bounce=1'],
     ['a rod from the pivot to a point off the link centre, kicked so the link spins and swings', 'n=64&joint=rod&kick=2'],
     ['a rope that goes slack, hits its short stop and snaps taut', 'n=64&joint=rope&kick=1'],
     ['a rod whose link turns about its anchor point and dips a corner into a floor', 'n=64&joint=rod&floor=deck&kick=2'],
@@ -33,6 +39,8 @@ for (const [name, query] of [['a driven arm', 'n=64&amp=3'], ['an arm driven int
         const floored = query.includes('floor=');
         // The floor scenes have to reach the contact path: a link corner inside the floor in some world.
         if (floored) expect(r.touched, 'worlds that touched the floor').toBeGreaterThan(16);
+        // With several boxes every one must be reached, except one that only a link that tunnels through its neighbour would reach.
+        if (floored && !query.includes('behind')) for (const n of r.touchedEach) expect(n, 'worlds that touched this box').toBeGreaterThan(16);
         expect(r.checks.length).toBe(sleeps ? 6 : 5);
         for (const c of r.checks) {
             for (const key of ['angle', 'velocity', 'position', 'rotation'] as const) expect(c[key], `${key} at tick ${c.tick}`).toBeLessThan(TOLERANCE[key]);

@@ -34,13 +34,24 @@ const FLOORS: Record<string, FloorBox> = {
     twist: { pos: [1, -0.6, 0.2], half: [3, 0.5, 3], rot: [0.1, 0.2, 0.05, Math.sqrt(1 - 0.01 - 0.04 - 0.0025)], friction: 0.6 },
     // tilted 0.3 rad about z so the normal and the friction tangents leave the axes, and a bouncy surface
     slope: { pos: [0.4, -1.0, 0], half: [3, 0.5, 3], rot: tilt(0.3), friction: 0.8, restitution: 0.7 },
-    // a post narrower than the link's end under a hanging link: the patch is the post's top, clipped by its edges, and a hanging link rests 0.015 into it
     // just under a hanging rod's link (its underside is at -1.25): a link that turns about its anchor point dips a corner into it
     deck: { pos: [0, -1.8, 0], half: [3, 0.5, 3], friction: 0.5 },
+    // a post narrower than the link's end under a hanging link: the patch is the post's top, clipped by its edges, and a hanging link rests 0.015 into it
     block: { pos: [0, -1.085, 0], half: [0.04, 0.1, 0.15], friction: 0.5 },
+    // two boxes 0.11 apart around the level arm (its thickness is 0.1): the link wedges between them, with contacts on both at once and the motor pushing it into each in turn
+    lo: { pos: [0.6, -0.555, 0], half: [0.5, 0.5, 3], friction: 0.4 },
+    hi: { pos: [0.6, 0.555, 0], half: [0.5, 0.5, 3], friction: 0.7 },
+    // the same pair 0.09 apart: the 0.1 thick link is squeezed 0.005 by each, so both contacts exist in every substep
+    slo: { pos: [0.6, -0.545, 0], half: [0.5, 0.5, 3], friction: 0.4 },
+    shi: { pos: [0.6, 0.545, 0], half: [0.5, 0.5, 3], friction: 0.7 },
+    // behind a thin floor that is listed before it: reached only by a link that tunnels through the thin one
+    behind: { pos: [0, -1.0, 0], half: [3, 0.55, 3], friction: 0.5 },
+    // the mirror of `tip` above the arm: a link that swings up meets its underside, a normal pointing down, while the floor's points up
+    ceil: { pos: [0, 1.1, 0], half: [3, 0.5, 3], friction: 0.3, restitution: 0.7 },
 };
+// `floor=a,b` puts two boxes in the scene, in that order.
 const FLOOR = params.get('floor');
-if (FLOOR && !FLOORS[FLOOR]) throw new Error(`unknown floor ${FLOOR}`);
+const FLOOR_LIST = (FLOOR ?? '').split(',').filter(Boolean).map((n) => { if (!FLOORS[n]) throw new Error(`unknown floor ${n}`); return FLOORS[n]; });
 const SCENE: ReacherScene = {
     ...(SKEW ? { ...REACHER, pivot: [0.5, 0.3, 0.2], link: [1, 0.3, 0.2], anchor: [0.6, 0.3, 0.2], axis: [0.3, 0.5, 0.8], gravity: [1, -9.81, 2], invMass: 3, limits: [-1, 0.7] } : REACHER),
     // `sleep=1` has no motor, so a link that comes to rest falls asleep as on the CPU.
@@ -50,7 +61,7 @@ const SCENE: ReacherScene = {
     ...(SLIDER ? { kind: 'slider', limits: SKEW ? [-0.4, 0.3] : [-0.5, 0.3], axis: SKEW ? [0.3, 0.5, 0.8] : [0, 1, 0] } : {}),
     ...(ROD || ROPE ? { kind: 'distance', pivot: [0, 0, 0], link: [0.3, -1.2, 0.1], anchor: [0, -0.1, 0], axis: [0, -1.15, 0.15], limits: ROPE ? [-0.4, 0] : null, motorMax: 0 } : {}),
     ...(COAST ? { kind: 'slider', axis: [1, 0, 0], limits: [-3, 3] } : {}),
-    ...(FLOOR ? { floor: FLOORS[FLOOR], linkFriction: 0.5, linkRestitution: params.get('bounce') === '1' ? 0.9 : 0 } : {}),
+    ...(FLOOR ? { floors: FLOOR_LIST, linkFriction: 0.5, linkRestitution: params.get('bounce') === '1' ? 0.9 : 0 } : {}),
 } as ReacherScene;
 const AMP = Number(params.get('amp') ?? 3);
 const KICK = Number(params.get('kick') ?? 1);
@@ -99,9 +110,9 @@ async function run() {
         w.setGravity(...SCENE.gravity);
         const pivot = w.spawn({ x: SCENE.pivot[0], y: SCENE.pivot[1], z: SCENE.pivot[2], hx: 0.1, hy: 0.1, hz: 0.1, invMass: 0 });
         const link = w.spawn({ x: SCENE.link[0], y: SCENE.link[1], z: SCENE.link[2], hx: SCENE.linkHalf[0], hy: SCENE.linkHalf[1], hz: SCENE.linkHalf[2], invMass: SCENE.invMass, friction: SCENE.linkFriction ?? 0, restitution: SCENE.linkRestitution ?? 0 });
-        if (SCENE.floor) {
-            const [qx, qy, qz, qw] = SCENE.floor.rot ?? [0, 0, 0, 1];
-            w.spawn({ x: SCENE.floor.pos[0], y: SCENE.floor.pos[1], z: SCENE.floor.pos[2], qx, qy, qz, qw, hx: SCENE.floor.half[0], hy: SCENE.floor.half[1], hz: SCENE.floor.half[2], invMass: 0, friction: SCENE.floor.friction ?? 0.5, restitution: SCENE.floor.restitution ?? 0 });
+        for (const fl of FLOOR_LIST) {
+            const [qx, qy, qz, qw] = fl.rot ?? [0, 0, 0, 1];
+            w.spawn({ x: fl.pos[0], y: fl.pos[1], z: fl.pos[2], qx, qy, qz, qw, hx: fl.half[0], hy: fl.half[1], hz: fl.half[2], invMass: 0, friction: fl.friction ?? 0.5, restitution: fl.restitution ?? 0 });
         }
         const joint = w.createJoint({ kind: ROD || ROPE ? JOINT_DISTANCE : SLIDER ? JOINT_SLIDER : JOINT_HINGE, a: pivot, b: link, anchor: SCENE.anchor, ...(ROD || ROPE ? { anchorB: SCENE.axis } : { axis: SCENE.axis }), limits: SCENE.limits ?? undefined, ...(ROD || ROPE ? {} : { motor: { velocity: 0, maxForce: SCENE.motorMax } }) });
         return { link, joint };
@@ -120,9 +131,9 @@ async function run() {
     let before: { cpu: Float32Array[]; phase: number[] } | null = null;
     let widest = 0, atLimit = 0;
     // Worlds whose link had a corner inside the floor (grown by a hair) at the end of some tick: proof the scene reaches the contact path at all.
-    const touched = new Array<boolean>(WORLDS).fill(false);
-    const touchesFloor = (body: Float32Array) => {
-        const fl = SCENE.floor!, fq = fl.rot ?? [0, 0, 0, 1];
+    const touched = FLOOR_LIST.map(() => new Array<boolean>(WORLDS).fill(false));
+    const touchesFloor = (body: Float32Array, fl: FloorBox) => {
+        const fq = fl.rot ?? [0, 0, 0, 1];
         const rotate = (q: readonly number[], v: number[]) => {
             const [ux, uy, uz] = q, qw = q[3];
             const tx = 2 * (uy * v[2] - uz * v[1]), ty = 2 * (uz * v[0] - ux * v[2]), tz = 2 * (ux * v[1] - uy * v[0]);
@@ -143,7 +154,7 @@ async function run() {
         gpu.setMotors(Float32Array.from({ length: WORLDS }, (_, i) => (SCENE.motorMax > 0 ? motor(i, t) : 0)));
         set.step();
         gpu.step();
-        if (SCENE.floor) set.worlds.forEach((w, i) => { if (!touched[i] && touchesFloor(w.readTransforms())) touched[i] = true; });
+        FLOOR_LIST.forEach((fl, n) => set.worlds.forEach((w, i) => { if (!touched[n][i] && touchesFloor(w.readTransforms(), fl)) touched[n][i] = true; }));
         if (SCENE.motorMax === 0) {
             const { state: now } = await gpu.read();
             set.worlds.forEach((w, i) => {
@@ -186,7 +197,7 @@ async function run() {
     // A link parked against a limit stands exactly still awake until its quiet time is up, so its pose says nothing about when it should sleep: those are left out.
     const parked = set.worlds.map((w) => (SCENE.limits ?? []).some((l) => Math.abs(w.readJointStates()[0].position - l) < 1e-3));
     const sleepTickMisses = SCENE.motorMax === 0 ? asleepAt.filter((g, i) => !parked[i] && (g < 0 || ![0, 1].includes(g - lastMoved[i]))).length : 0;
-    return { guards, sleepTickMisses, touched: touched.filter(Boolean).length, worlds: WORLDS, checks, widest, atLimit, adapter: `${info.vendor} ${info.architecture}`, userAgent: navigator.userAgent };
+    return { guards, sleepTickMisses, touched: Math.max(...touched.map((t) => t.filter(Boolean).length), 0), touchedEach: touched.map((t) => t.filter(Boolean).length), worlds: WORLDS, checks, widest, atLimit, adapter: `${info.vendor} ${info.architecture}`, userAgent: navigator.userAgent };
 }
 
 run().then(
