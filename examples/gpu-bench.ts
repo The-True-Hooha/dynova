@@ -25,7 +25,7 @@ async function run() {
         w.setGravity(...REACHER.gravity);
         const pivot = w.spawn({ x: REACHER.pivot[0], y: REACHER.pivot[1], z: REACHER.pivot[2], hx: 0.1, hy: 0.1, hz: 0.1, invMass: 0 });
         const link = w.spawn({ x: REACHER.link[0], y: REACHER.link[1], z: REACHER.link[2], hx: REACHER.linkHalf[0], hy: REACHER.linkHalf[1], hz: REACHER.linkHalf[2], invMass: REACHER.invMass, friction: 0 });
-        return w.createJoint({ kind: JOINT_HINGE, a: pivot, b: link, anchor: REACHER.anchor, axis: REACHER.axis, limits: REACHER.limits, motor: { velocity: 0, maxForce: REACHER.motorMax } });
+        return w.createJoint({ kind: JOINT_HINGE, a: pivot, b: link, anchor: REACHER.anchor, axis: REACHER.axis, limits: REACHER.limits ?? undefined, motor: { velocity: 0, maxForce: REACHER.motorMax } });
     });
     const gpu = await GpuReacher.create(device, WORLDS);
     const speeds = new Float32Array(WORLDS);

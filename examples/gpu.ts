@@ -1,5 +1,5 @@
 import { WorldBatch } from '@dynova/sdk';
-import { JOINT_HINGE, JOINT_SLIDER } from '@dynova/sdk';
+import { JOINT_DISTANCE, JOINT_HINGE, JOINT_SLIDER } from '@dynova/sdk';
 import { GpuReacher, REACHER, STATE_FLOATS, type FloorBox, type ReacherScene } from '@dynova/gpu';
 
 const config = { capacity: 8, ringCapacity: 128 };
@@ -18,6 +18,9 @@ const kick = (i: number): [number, number, number] => COAST ? [((i % 8) + 1) * 0
 const SKEW = params.get('scene') === 'skew';
 // `joint=slider` swaps the hinge for a slider: the same bodies, the limits and the motor now act on the offset along the axis in metres.
 const SLIDER = params.get('joint') === 'slider' || params.get('coast') === '1';
+// `joint=rod` holds a corner-side point of the link at a fixed distance from the pivot's underside; `joint=rope` lets that distance shrink by 0.4 m but not grow. The link hangs clear of the pivot box,
+// which the CPU would otherwise collide it with (a distance joint does not switch the pair's contact off).
+const ROD = params.get('joint') === 'rod', ROPE = params.get('joint') === 'rope';
 // `floor=<name>` adds a static box the link collides with. The tops sit where the swinging or falling link reaches them within the run.
 const tilt = (a: number): [number, number, number, number] => [0, 0, Math.sin(a / 2), Math.cos(a / 2)];
 const FLOORS: Record<string, FloorBox> = {
@@ -32,6 +35,8 @@ const FLOORS: Record<string, FloorBox> = {
     // tilted 0.3 rad about z so the normal and the friction tangents leave the axes, and a bouncy surface
     slope: { pos: [0.4, -1.0, 0], half: [3, 0.5, 3], rot: tilt(0.3), friction: 0.8, restitution: 0.7 },
     // a post narrower than the link's end under a hanging link: the patch is the post's top, clipped by its edges, and a hanging link rests 0.015 into it
+    // just under a hanging rod's link (its underside is at -1.25): a link that turns about its anchor point dips a corner into it
+    deck: { pos: [0, -1.8, 0], half: [3, 0.5, 3], friction: 0.5 },
     block: { pos: [0, -1.085, 0], half: [0.04, 0.1, 0.15], friction: 0.5 },
 };
 const FLOOR = params.get('floor');
@@ -43,6 +48,7 @@ const SCENE: ReacherScene = {
     // `lever=1` puts the anchor off the link's centre in y and z, so a push has a lever about every axis the slider must hold.
     ...(params.get('lever') === '1' ? { anchor: [0.1, 0.2, 0.1] } : {}),
     ...(SLIDER ? { kind: 'slider', limits: SKEW ? [-0.4, 0.3] : [-0.5, 0.3], axis: SKEW ? [0.3, 0.5, 0.8] : [0, 1, 0] } : {}),
+    ...(ROD || ROPE ? { kind: 'distance', pivot: [0, 0, 0], link: [0.3, -1.2, 0.1], anchor: [0, -0.1, 0], axis: [0, -1.15, 0.15], limits: ROPE ? [-0.4, 0] : null, motorMax: 0 } : {}),
     ...(COAST ? { kind: 'slider', axis: [1, 0, 0], limits: [-3, 3] } : {}),
     ...(FLOOR ? { floor: FLOORS[FLOOR], linkFriction: 0.5, linkRestitution: params.get('bounce') === '1' ? 0.9 : 0 } : {}),
 } as ReacherScene;
@@ -97,7 +103,7 @@ async function run() {
             const [qx, qy, qz, qw] = SCENE.floor.rot ?? [0, 0, 0, 1];
             w.spawn({ x: SCENE.floor.pos[0], y: SCENE.floor.pos[1], z: SCENE.floor.pos[2], qx, qy, qz, qw, hx: SCENE.floor.half[0], hy: SCENE.floor.half[1], hz: SCENE.floor.half[2], invMass: 0, friction: SCENE.floor.friction ?? 0.5, restitution: SCENE.floor.restitution ?? 0 });
         }
-        const joint = w.createJoint({ kind: SLIDER ? JOINT_SLIDER : JOINT_HINGE, a: pivot, b: link, anchor: SCENE.anchor, axis: SCENE.axis, limits: SCENE.limits, motor: { velocity: 0, maxForce: SCENE.motorMax } });
+        const joint = w.createJoint({ kind: ROD || ROPE ? JOINT_DISTANCE : SLIDER ? JOINT_SLIDER : JOINT_HINGE, a: pivot, b: link, anchor: SCENE.anchor, ...(ROD || ROPE ? { anchorB: SCENE.axis } : { axis: SCENE.axis }), limits: SCENE.limits ?? undefined, ...(ROD || ROPE ? {} : { motor: { velocity: 0, maxForce: SCENE.motorMax } }) });
         return { link, joint };
     });
     set.worlds.forEach((w, i) => w.force(ctx[i].link, ...kick(i)));
@@ -170,7 +176,7 @@ async function run() {
                 if (frozen && before.phase[i] !== 2) cpuFrozenGpuAwake++;
             }
             widest = Math.max(widest, Math.abs(joint.position));
-            if (Math.abs(joint.position - SCENE.limits[0]) < 0.05 || Math.abs(joint.position - SCENE.limits[1]) < 0.05) atLimit++;
+            if (SCENE.limits?.some((l) => Math.abs(joint.position - l) < 0.05)) atLimit++;
         });
         checks.push({ tick: t, angle, velocity, position, rotation, asleep, gpuAsleepCpuMoving, cpuFrozenGpuAwake });
         before = null;
@@ -178,7 +184,7 @@ async function run() {
     const guards = await probe(device);
     const info = adapter.info;
     // A link parked against a limit stands exactly still awake until its quiet time is up, so its pose says nothing about when it should sleep: those are left out.
-    const parked = set.worlds.map((w) => SCENE.limits.some((l) => Math.abs(w.readJointStates()[0].position - l) < 1e-3));
+    const parked = set.worlds.map((w) => (SCENE.limits ?? []).some((l) => Math.abs(w.readJointStates()[0].position - l) < 1e-3));
     const sleepTickMisses = SCENE.motorMax === 0 ? asleepAt.filter((g, i) => !parked[i] && (g < 0 || ![0, 1].includes(g - lastMoved[i]))).length : 0;
     return { guards, sleepTickMisses, touched: touched.filter(Boolean).length, worlds: WORLDS, checks, widest, atLimit, adapter: `${info.vendor} ${info.architecture}`, userAgent: navigator.userAgent };
 }

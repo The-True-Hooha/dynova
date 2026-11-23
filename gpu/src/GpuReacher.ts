@@ -8,12 +8,16 @@ export const MAX_WORLDS = 1 << 20;
 type V3 = readonly [number, number, number];
 
 /**
- * The arm scene: a static pivot box and a dynamic link on a hinge, as built by `examples/reacherEnv.ts`. Bodies start unrotated, which the slider relies on (its orientation rows hold the start rotation, taken as the identity). A link sleeps by the core's rules for a lone jointed body: a motor force above 0 keeps it awake, a motor force of 0 lets it sleep after 0.2 s of rest, and only `reset` wakes it. The CPU also wakes a body on every `setJointMotor`, even with a force of 0; the GPU ignores motor commands to a sleeper, so a loop that commands every tick keeps the CPU link awake and not the GPU one. The nine warm-start slots follow the core's: a hinge uses 0-2 for the anchor and 3-4 for the axis, a slider 0-1 and 3-5, both 6 for the motor and 7-8 for the limits. `reacherParams` refuses what the CPU core
+ * The arm scene: a static pivot box and a dynamic link on a hinge (or a slider or distance joint), as built by `examples/reacherEnv.ts`. Bodies start unrotated, which the slider relies on (its orientation rows hold the start rotation, taken as the identity). A link sleeps by the core's rules for a lone jointed body: a motor force above 0 keeps it awake, a motor force of 0 lets it sleep after 0.2 s of rest, and only `reset` wakes it. The CPU also wakes a body on every `setJointMotor`, even with a force of 0; the GPU ignores motor commands to a sleeper, so a loop that commands every tick keeps the CPU link awake and not the GPU one. The nine warm-start slots follow the core's: a hinge uses 0-2 for the anchor and 3-4 for the axis, a slider 0-1 and 3-5, both 6 for the motor and 7-8 for the limits. `reacherParams` refuses what the CPU core
  * refuses for such a joint. The kernel has no swept test against the pivot: a link that starts within a substep's travel of the pivot's box is not what the CPU runs.
  */
 export interface ReacherScene {
-    /** What joins the link to the pivot; a hinge when absent. A slider limits and drives the offset along `axis` in metres, a hinge the angle about it in radians. */
-    kind?: 'hinge' | 'slider';
+    /**
+     * What joins the link to the pivot; a hinge when absent. A slider limits and drives the offset along `axis` in metres, a hinge the angle about it in radians. A `distance`
+     * joint holds `anchor` (a point of the pivot) and `axis` (a point of the link, in world space, the second point as the core's descriptor carries it) at the distance they start
+     * at: a rod when `limits` is null, otherwise a rope or slot whose distance may change by `limits` (metres, bracketing zero). The link turns freely about its anchor point and has no motor.
+     */
+    kind?: 'hinge' | 'slider' | 'distance';
     pivot: V3;
     link: V3;
     linkHalf: V3;
@@ -21,7 +25,7 @@ export interface ReacherScene {
     gravity: V3;
     anchor: V3;
     axis: V3;
-    limits: readonly [number, number];
+    limits: readonly [number, number] | null;
     motorMax: number;
     /** Ticks are `dt` seconds; the CPU core runs `substeps` steps inside each. */
     dt: number;
@@ -62,6 +66,10 @@ function unit(v: V3): V3 {
     return [f(v[0] * inv), f(v[1] * inv), f(v[2] * inv)];
 }
 
+function sub(a: V3, b: V3): V3 {
+    return [f(a[0] - b[0]), f(a[1] - b[1]), f(a[2] - b[2])];
+}
+
 function cross(a: V3, b: V3): V3 {
     return [f(f(a[1] * b[2]) - f(a[2] * b[1])), f(f(a[2] * b[0]) - f(a[0] * b[2])), f(f(a[0] * b[1]) - f(a[1] * b[0]))];
 }
@@ -78,6 +86,8 @@ const MAX_ANGLE_LIMIT = 3.1;
 const MAX_LINEAR_LIMIT = 1e4;
 export const MAX_MOTOR_SPEED = 1e3;
 const MAX_MOTOR_FORCE = 1e6;
+const MIN_ROD_LENGTH = 1e-3;
+const KIND = { hinge: 0, slider: 1, distance: 2 } as const;
 
 function check(ok: boolean, what: string): void {
     if (!ok) throw new RangeError(what);
@@ -104,10 +114,19 @@ function validate(s: ReacherScene): void {
     for (const [name, v] of [['linkFriction', s.linkFriction ?? 0.5], ['linkRestitution', s.linkRestitution ?? 0]] as const) {
         check(Number.isFinite(v) && v >= 0 && v <= (name === 'linkFriction' ? 2 : 1), `${name} out of range: ${v}`);
     }
-    check(finite3(s.axis, MAX_COORD) && f(f(s.axis[0] * s.axis[0]) + f(s.axis[1] * s.axis[1]) + f(s.axis[2] * s.axis[2])) > 1e-12 && Number.isFinite(f(s.axis[0] * s.axis[0]) + f(s.axis[1] * s.axis[1]) + f(s.axis[2] * s.axis[2])), 'the joint axis must be a finite vector of usable length');
-    check(s.kind === undefined || s.kind === 'hinge' || s.kind === 'slider', `kind must be 'hinge' or 'slider', got ${s.kind}`);
+    check(s.kind === undefined || s.kind === 'hinge' || s.kind === 'slider' || s.kind === 'distance', `kind must be 'hinge', 'slider' or 'distance', got ${s.kind}`);
+    if (s.kind === 'distance') {
+        check(finite3(s.axis, MAX_COORD), 'the second point of a distance joint must be a finite 3-vector within range');
+        const gap = sub(s.anchor, s.axis);
+        check(f(f(gap[0] * gap[0]) + f(gap[1] * gap[1]) + f(gap[2] * gap[2])) >= f(MIN_ROD_LENGTH * MIN_ROD_LENGTH), `the two points of a distance joint must be at least ${MIN_ROD_LENGTH} apart`);
+        check(s.motorMax === 0, 'a distance joint has no motor');
+    } else {
+        check(finite3(s.axis, MAX_COORD) && f(f(s.axis[0] * s.axis[0]) + f(s.axis[1] * s.axis[1]) + f(s.axis[2] * s.axis[2])) > 1e-12 && Number.isFinite(f(s.axis[0] * s.axis[0]) + f(s.axis[1] * s.axis[1]) + f(s.axis[2] * s.axis[2])), 'the joint axis must be a finite vector of usable length');
+        check(s.limits !== null, `only a distance joint may go without limits`);
+    }
+    if (s.limits === null) return;
     const [lo, hi] = s.limits;
-    const bound = s.kind === 'slider' ? MAX_LINEAR_LIMIT : MAX_ANGLE_LIMIT;
+    const bound = s.kind === 'hinge' || s.kind === undefined ? MAX_ANGLE_LIMIT : MAX_LINEAR_LIMIT;
     check(Number.isFinite(lo) && Number.isFinite(hi) && lo <= 0 && hi >= 0 && Math.abs(lo) <= bound && Math.abs(hi) <= bound, `limits must bracket zero within +-${bound}, got [${lo}, ${hi}]`);
 }
 
@@ -115,20 +134,21 @@ export function reacherParams(s: ReacherScene): Float32Array {
     validate(s);
     const [hx, hy, hz] = s.linkHalf;
     const inertia = f(f(1 / s.invMass) * f(f(2 / 9) * f(f(hx * hx) + f(hy * hy) + f(hz * hz))));
-    const axis = unit(s.axis);
+    const distance = s.kind === 'distance';
+    const gap = sub(s.anchor, s.axis);
+    const axis = distance ? ([1, 0, 0] as V3) : unit(s.axis);
     const ref = perpendicular(axis);
-    const sub = (a: V3, b: V3): V3 => [f(a[0] - b[0]), f(a[1] - b[1]), f(a[2] - b[2])];
     const bias = f(1 - perStep(0.8, SUBSTEPS));
     const p = new Float32Array(PARAM_FLOATS);
     p.set([s.dt, s.invMass, f(1 / inertia), s.motorMax], 0);
     p.set([...s.gravity, 0], 4);
-    p.set([s.limits[0], s.limits[1], perStep(0.99, SUBSTEPS), perStep(0.97, SUBSTEPS)], 8);
+    p.set([s.limits?.[0] ?? 0, s.limits?.[1] ?? 0, perStep(0.99, SUBSTEPS), perStep(0.97, SUBSTEPS)], 8);
     p.set([bias, SOLVER_ITERS, SUBSTEPS, 1], 12);
     p.set([...sub(s.anchor, s.pivot), 0], 16);
-    p.set([...sub(s.anchor, s.link), 0], 20);
-    p.set([...axis, 0, ...axis, 0, ...ref, 0, ...ref, 0], 24);
+    p.set([...sub(distance ? s.axis : s.anchor, s.link), 0], 20);
+    p.set([...axis, distance ? f(Math.sqrt(f(f(gap[0] * gap[0]) + f(gap[1] * gap[1]) + f(gap[2] * gap[2])))) : 0, ...axis, distance && s.limits ? 1 : 0, ...ref, 0, ...ref, 0], 24);
     p.set([0, 0, 0, 1], 40);
-    p.set([...s.pivot, s.kind === 'slider' ? 1 : 0], 44);
+    p.set([...s.pivot, KIND[s.kind ?? 'hinge']], 44);
     if (s.floor) {
         const fl = s.floor, q = fl.rot ?? [0, 0, 0, 1];
         const ql = f(Math.sqrt(f(f(q[0] * q[0]) + f(q[1] * q[1]) + f(q[2] * q[2]) + f(q[3] * q[3]))));
@@ -196,9 +216,13 @@ export class GpuReacher {
         this.device.queue.writeBuffer(this.state, 0, rows);
         this.device.queue.writeBuffer(this.motors, 0, new Float32Array(this.worlds));
         // The observation of the start pose, so a read before the next step does not return the pair from before the reset (a sleeper never rewrites it).
-        const axis = unit(s.axis);
         const observed = new Float32Array(this.worlds * OBS_FLOATS);
+        if (s.kind === 'distance') {
+            const n = unit(sub(s.anchor, s.axis));
+            for (let i = 0; i < this.worlds; i++) observed[i * OBS_FLOATS + 1] = f(-f(f(rows[i * STATE_FLOATS + 7] * n[0]) + f(rows[i * STATE_FLOATS + 8] * n[1]) + f(rows[i * STATE_FLOATS + 9] * n[2])));
+        }
         if (s.kind === 'slider') {
+            const axis = unit(s.axis);
             for (let i = 0; i < this.worlds; i++) observed[i * OBS_FLOATS + 1] = f(f(rows[i * STATE_FLOATS + 7] * axis[0]) + f(rows[i * STATE_FLOATS + 8] * axis[1]) + f(rows[i * STATE_FLOATS + 9] * axis[2]));
         }
         this.device.queue.writeBuffer(this.obs, 0, observed);

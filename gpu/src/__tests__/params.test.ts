@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { GpuReacher, REACHER, reacherParams } from '../GpuReacher.js';
+import { GpuReacher, REACHER, reacherParams, type ReacherScene } from '../GpuReacher.js';
 
 const f = Math.fround;
 
@@ -82,6 +82,39 @@ describe('the joint kind', () => {
 
     it('refuses an unknown kind', () => {
         expect(() => reacherParams({ ...REACHER, kind: 'ball' as 'hinge' })).toThrow(/kind/);
+    });
+});
+
+describe('a distance joint', () => {
+    const rod: ReacherScene = { ...REACHER, kind: 'distance', pivot: [0, 0, 0], link: [0.3, -1.2, 0.1], anchor: [0, -0.1, 0], axis: [0, -1.15, 0.15], limits: null, motorMax: 0 };
+
+    it('carries its kind, the rest length, the anchor offsets of both bodies and whether it has limits', () => {
+        const p = reacherParams(rod);
+        expect(p[47]).toBe(2);
+        expect(p[27]).toBeCloseTo(Math.hypot(0, 1.05, 0.15), 6);
+        expect(Array.from(p.subarray(16, 19))).toEqual([0, f(-0.1), 0]);
+        expect(Array.from(p.subarray(20, 23))).toEqual([f(-0.3), f(0.05), f(0.05)]);
+        expect(p[31]).toBe(0);
+        expect(reacherParams({ ...REACHER, kind: 'slider' })[31]).toBe(0);
+        expect(reacherParams(REACHER)[27]).toBe(0);
+        const rope = reacherParams({ ...rod, limits: [-0.4, 0] });
+        expect(rope[31]).toBe(1);
+        expect(Array.from(rope.subarray(8, 10))).toEqual([f(-0.4), 0]);
+    });
+
+    it.each<[string, Partial<ReacherScene>]>([
+        ['two points less than a millimetre apart', { axis: [0, -0.1, 0.0005] }],
+        ['a NaN second point', { axis: [0, Number.NaN, 0] }],
+        ['a motor', { motorMax: 5 }],
+        ['limits that exclude zero', { limits: [0.1, 1] }],
+        ['limits past 1e4 m', { limits: [-2e4, 1] }],
+    ])('is refused with %s', (_, change) => {
+        expect(() => reacherParams({ ...rod, ...change })).toThrow(RangeError);
+    });
+
+    it('is the only kind that may go without limits', () => {
+        expect(() => reacherParams({ ...REACHER, limits: null })).toThrow(/limits/);
+        expect(() => reacherParams({ ...REACHER, kind: 'slider', limits: null })).toThrow(/limits/);
     });
 });
 

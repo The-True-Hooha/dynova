@@ -1,5 +1,5 @@
 /**
- * The arm scene on the GPU: one static pivot, one dynamic link on a hinge or a slider with a motor and limits, gravity, per-step damping. One invocation steps one world.
+ * The arm scene on the GPU: one static pivot, one dynamic link on a hinge, a slider or a distance joint, with a motor and limits (a distance joint has no motor), gravity, per-step damping. One invocation steps one world.
  * The structure follows the CPU solver in `core/src/physics.rs` and `core/src/physics/joints.rs` (sequential impulses, warm start, split-impulse
  * correction of the angular rows: the hinge axis, or a slider's orientation), minus everything the scene never uses.
  * An optional static floor box adds the core's contact between the link and it: the box_box manifold, friction on a disc, restitution, split-impulse recovery of
@@ -23,7 +23,7 @@ struct Params {
     ref_a: vec4<f32>,
     ref_b: vec4<f32>,
     qa: vec4<f32>,
-    // pivot position, joint kind (0 hinge, 1 slider)
+    // pivot position, joint kind (0 hinge, 1 slider, 2 distance)
     pa: vec4<f32>,
     // floor box position and whether there is one, floor half extents and friction, floor rotation, link half extents and friction, restitution of the link and of the floor
     fp: vec4<f32>,
@@ -384,7 +384,10 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
     let p2 = cross(aa, p1);
     let ua = rot(P.qa, P.ref_a.xyz);
     let max_iters = u32(P.s.y);
-    let slider = P.pa.w != 0.0;
+    let slider = P.pa.w == 1.0;
+    let rod = P.pa.w == 2.0;
+    let rod_len = P.axis_a.w;
+    let ranged = P.axis_b.w != 0.0;
     let nlin = select(3u, 2u, slider);
 
     for (var sub_i = 0u; sub_i < substeps; sub_i++) {
@@ -524,6 +527,26 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
         dir[7] = aa;
         want_v[7] = select(-clamp(k_bias * gap_hi, -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL), -gap_hi / dt, gap_hi >= 0.0);
         corr[7] = 0.0; lo[7] = 0.0; hi[7] = BIG; slot[7] = 8u; is_lin[7] = slider;
+        if (rod) {
+            // One row along the line between the two anchors, a point row when it is a rod and the two limit rows when it is a rope. A row with lo = hi = 0 never acts and its impulse stays 0.
+            let dist = length(anchor_err);
+            let line = select(vec3<f32>(0.0, 1.0, 0.0), anchor_err / dist, dist > 1e-6);
+            let stretch = dist - rod_len;
+            for (var i = 0u; i < ROWS; i++) {
+                dir[i] = line; want_v[i] = 0.0; corr[i] = 0.0; lo[i] = 0.0; hi[i] = 0.0; is_lin[i] = true;
+            }
+            if (ranged) {
+                let rope_lo = stretch - P.lim.x;
+                let rope_hi = P.lim.y - stretch;
+                dir[7] = -line;
+                want_v[6] = select(-clamp(k_bias * rope_lo, -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL), -rope_lo / dt, rope_lo >= 0.0);
+                want_v[7] = select(-clamp(k_bias * rope_hi, -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL), -rope_hi / dt, rope_hi >= 0.0);
+                hi[6] = BIG; hi[7] = BIG;
+            } else {
+                want_v[0] = -clamp(k_bias * stretch, -MAX_JOINT_BIAS_VEL, MAX_JOINT_BIAS_VEL);
+                lo[0] = -BIG; hi[0] = BIG;
+            }
+        }
 
         var denom: array<f32, 8>;
         for (var i = 0u; i < ROWS; i++) {
@@ -715,7 +738,14 @@ fn step_world(@builtin(global_invocation_id) id: vec3<u32>) {
     let ub_end = rot(q, P.ref_b.xyz);
     let rb_end = rot(q, P.lb.xyz);
     let err_end = (P.pa.xyz + ra) - (pos + rb_end);
-    obs[world * 2u] = select(atan2_det(dot(cross(ua, ub_end), aa), dot(ua, ub_end)), -dot(err_end, aa), slider);
-    obs[world * 2u + 1u] = select(dot(w, aa), dot(v + cross(w, rb_end), aa), slider);
+    var coord_end = select(atan2_det(dot(cross(ua, ub_end), aa), dot(ua, ub_end)), -dot(err_end, aa), slider);
+    var rate_end = select(dot(w, aa), dot(v + cross(w, rb_end), aa), slider);
+    if (rod) {
+        let dist_end = length(err_end);
+        coord_end = dist_end - rod_len;
+        rate_end = -dot(v + cross(w, rb_end), select(vec3<f32>(0.0, 1.0, 0.0), err_end / dist_end, dist_end > 1e-6));
+    }
+    obs[world * 2u] = coord_end;
+    obs[world * 2u + 1u] = rate_end;
 }
 `;

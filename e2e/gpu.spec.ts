@@ -16,7 +16,11 @@ for (const [name, query] of [['a driven arm', 'n=64&amp=3'], ['an arm driven int
     ['an arm bouncing off a tilted, bouncy floor', 'n=64&floor=slope&amp=3&kick=3&bounce=1'],
     ['an arm that comes to rest on a floor and sleeps', 'n=64&floor=tip&sleep=1&ticks=600&kick=1'],
     ['an arm that comes to rest on a tilted floor and sleeps', 'n=64&floor=slope&sleep=1&ticks=600&kick=2'],
-    ['an arm driven against a post', 'n=64&floor=block&amp=3']]) {
+    ['an arm driven against a post', 'n=64&floor=block&amp=3'],
+    ['a rod from the pivot to a point off the link centre, kicked so the link spins and swings', 'n=64&joint=rod&kick=2'],
+    ['a rope that goes slack, hits its short stop and snaps taut', 'n=64&joint=rope&kick=1'],
+    ['a rod whose link turns about its anchor point and dips a corner into a floor', 'n=64&joint=rod&floor=deck&kick=2'],
+    ['a rope whose slack link falls back onto a floor', 'n=64&joint=rope&floor=deck&kick=0.85']]) {
     test(`${name} on the GPU stays within tolerance of the CPU worlds`, async ({ page }, info) => {
         test.setTimeout(180_000);
         await page.goto(`/gpu.html?${query}`);
@@ -41,11 +45,18 @@ for (const [name, query] of [['a driven arm', 'n=64&amp=3'], ['an arm driven int
             for (const c of r.checks.slice(-2)) expect(c.cpuFrozenGpuAwake, 'and wakes none the CPU has put to sleep').toBe(0);
             // Links kicked differently fall asleep at different ticks: a sleep rule that is off by a substep shows as a position gap.
             if (query.includes('kick=1') && !query.includes('skew') && !floored) expect(r.checks.some((c: any) => c.asleep > 0 && c.asleep < 64)).toBe(true);
+        } else if (query.includes('joint=r')) {
+            // A rod or rope has no motor, so a link that settles on the floor may sleep: the GPU must agree with the CPU on which ones, tick by tick.
+            expect(r.checks.every((c: any) => c.gpuAsleepCpuMoving === 0), 'the GPU never sleeps a link the CPU still moves').toBe(true);
         } else {
             expect(r.checks.every((c: any) => c.asleep === 0), 'a driven link never sleeps').toBe(true);
         }
         // The scene has to reach what the kernel must get right.
-        if (!floored) expect(r.widest).toBeGreaterThan(sleeps ? 0.1 : query.includes('slider') ? 0.35 : query.includes('skew') ? 0.5 : 1.5);
+        if (query.includes('joint=rope')) {
+            expect(r.widest, 'the rope went slack').toBeGreaterThan(0.1);
+            expect(r.atLimit, 'and reached its short stop in some worlds').toBeGreaterThan(20);
+        }
+        if (!floored && !query.includes('joint=r')) expect(r.widest).toBeGreaterThan(sleeps ? 0.1 : query.includes('slider') ? 0.35 : query.includes('skew') ? 0.5 : 1.5);
         expect(r.guards).toEqual({ concurrentReadsAgree: true, readIsASnapshot: true, nanMotor: true, hugeMotor: true, nanKick: true, staticLink: true, resetObs: true, usedAfterDestroy: true });
         if (!sleeps && !floored && (query.includes('amp=9') || query.includes('kick=100') || query.includes('slider'))) expect(r.atLimit).toBeGreaterThan(20);
     });
